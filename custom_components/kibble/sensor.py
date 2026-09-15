@@ -22,7 +22,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import CloudState, FeederState
+from .api import ClipInfo, CloudState, FeederState
 from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
@@ -197,6 +197,7 @@ async def async_setup_entry(
     entities.append(KibbleLastSeenPetSensor(coordinator))
     entities.append(KibbleIdentificationScoreSensor(coordinator))
     entities.append(KibblePendingFacesSensor(coordinator))
+    entities.append(KibbleClipsSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -436,3 +437,26 @@ class KibblePendingFacesSensor(KibbleEntity, SensorEntity):
     @property
     def native_value(self) -> int:
         return self.coordinator.data.pending_face_count
+
+
+class KibbleClipsSensor(KibbleEntity, SensorEntity):
+    """How many audio clips are stored on the feeder (`kibble.save_clip`/`kibble.record_clip`),
+    with each clip's name and encoded size as an attribute -- diagnostic (house rule 4:
+    disabled by default)."""
+
+    _attr_translation_key = "clips"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "clips")
+
+    @property
+    def native_value(self) -> int:
+        return len(self.coordinator.data.clips)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, list[dict[str, Any]]]:
+        clips: tuple[ClipInfo, ...] = self.coordinator.data.clips
+        return {"clips": [{"name": c.name, "bytes": c.bytes} for c in clips]}

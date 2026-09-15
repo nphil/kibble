@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import voluptuous as vol
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
@@ -9,11 +11,12 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import KibbleClient, KibbleError
+from .api import KibbleClient, KibbleError, KibbleSpeakerBusyError
 from .const import (
     ATTR_AMOUNT,
     ATTR_CAT,
     ATTR_CAT_NAME,
+    ATTR_CLIP_NAME,
     ATTR_CROP_ID,
     ATTR_ENABLED,
     ATTR_ENTRIES,
@@ -22,7 +25,9 @@ from .const import (
     ATTR_HOPPER,
     ATTR_HOPPER1_G,
     ATTR_HOPPER2_G,
+    ATTR_MEDIA_CONTENT_ID,
     ATTR_PASSWORD,
+    ATTR_SECONDS,
     ATTR_SSID,
     ATTR_TIME,
     CONF_HOST,
@@ -31,15 +36,20 @@ from .const import (
     HOPPER_BOTH,
     HOPPERS,
     MAX_AMOUNT,
+    MAX_CLIP_SECONDS,
     MAX_SCHEDULE_AMOUNT,
     MAX_SCHEDULE_ENTRIES,
     MIN_AMOUNT,
+    MIN_CLIP_SECONDS,
     MIN_SCHEDULE_AMOUNT,
     SERVICE_ADD_CAT,
     SERVICE_CANCEL_FEED,
     SERVICE_FEED,
     SERVICE_IDENTIFY,
     SERVICE_LABEL_FACE,
+    SERVICE_PLAY_CLIP,
+    SERVICE_RECORD_CLIP,
+    SERVICE_SAVE_CLIP,
     SERVICE_SCHEDULE_ADD,
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
@@ -53,6 +63,7 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.CAMERA,
     Platform.IMAGE,
+    Platform.MEDIA_PLAYER,
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
@@ -144,6 +155,41 @@ ADD_CAT_SCHEMA = vol.Schema(
 )
 
 IDENTIFY_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
+
+_CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _valid_clip_name(value: str) -> str:
+    """Mirrors `agent/src/clips.rs`'s `valid_name` so a bad name fails fast in HA with a clear
+    voluptuous error instead of a generic agent 400."""
+    if value in (".", "..") or not _CLIP_NAME_RE.match(value):
+        raise vol.Invalid(
+            "must be 1-64 characters: letters, digits, '-', '_', '.' only, and not '.' or '..'"
+        )
+    return value
+
+
+SAVE_CLIP_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CLIP_NAME): vol.All(cv.string, _valid_clip_name),
+        vol.Required(ATTR_MEDIA_CONTENT_ID): cv.string,
+    }
+)
+
+RECORD_CLIP_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CLIP_NAME): vol.All(cv.string, _valid_clip_name),
+        vol.Required(ATTR_SECONDS): vol.All(
+            vol.Coerce(float), vol.Range(min=MIN_CLIP_SECONDS, max=MAX_CLIP_SECONDS)
+        ),
+    }
+)
+
+PLAY_CLIP_SCHEMA = vol.Schema(
+    {vol.Required("device_id"): cv.string, vol.Required(ATTR_CLIP_NAME): cv.string}
+)
 
 
 def _entry_payload(entry: dict) -> dict:
@@ -291,6 +337,33 @@ def _async_register_services(hass: HomeAssistant) -> None:
             "source": result.source,
         }
 
+    async def handle_save_clip(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_save_clip(
+                call.data[ATTR_CLIP_NAME], call.data[ATTR_MEDIA_CONTENT_ID]
+            )
+        except KibbleError as err:
+            raise HomeAssistantError(f"Save clip failed: {err}") from err
+
+    async def handle_record_clip(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_record_clip(
+                call.data[ATTR_CLIP_NAME], call.data[ATTR_SECONDS]
+            )
+        except KibbleError as err:
+            raise HomeAssistantError(f"Record clip failed: {err}") from err
+
+    async def handle_play_clip(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_play_clip(call.data[ATTR_CLIP_NAME])
+        except KibbleSpeakerBusyError as err:
+            raise HomeAssistantError(f"The feeder's speaker is already in use: {err}") from err
+        except KibbleError as err:
+            raise HomeAssistantError(f"Play clip failed: {err}") from err
+
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
     hass.services.async_register(
@@ -320,6 +393,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
         IDENTIFY_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
+    hass.services.async_register(DOMAIN, SERVICE_SAVE_CLIP, handle_save_clip, SAVE_CLIP_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_RECORD_CLIP, handle_record_clip, RECORD_CLIP_SCHEMA
+    )
+    hass.services.async_register(DOMAIN, SERVICE_PLAY_CLIP, handle_play_clip, PLAY_CLIP_SCHEMA)
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: KibbleConfigEntry) -> None:

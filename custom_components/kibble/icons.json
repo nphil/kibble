@@ -30,7 +30,12 @@
       "cancel_feed": { "default": "mdi:stop-circle-outline" }
     },
     "image": {
-      "pending_face": { "default": "mdi:image-search-outline" }
+      "pending_face": { "default": "mdi:image-search-outline" },
+      "dish_before": { "default": "mdi:image-outline" },
+      "dish_after": { "default": "mdi:image-check-outline" }
+    },
+    "media_player": {
+      "speaker": { "default": "mdi:speaker" }
     },
     "number": {
       "feed_amount": { "default": "mdi:counter" },
@@ -89,7 +94,8 @@
       },
       "last_seen_pet": { "default": "mdi:cat" },
       "identification_score": { "default": "mdi:percent-outline" },
-      "pending_faces": { "default": "mdi:image-multiple-outline" }
+      "pending_faces": { "default": "mdi:image-multiple-outline" },
+      "clips": { "default": "mdi:folder-music-outline" }
     },
     "select": {
       "wifi": { "default": "mdi:access-point-network" },
@@ -115,6 +121,9 @@
     "wifi_connect": "mdi:wifi-plus",
     "label_face": "mdi:tag-outline",
     "add_cat": "mdi:cat",
-    "identify": "mdi:magnify-scan"
+    "identify": "mdi:magnify-scan",
+    "save_clip": "mdi:content-save-outline",
+    "record_clip": "mdi:microphone-outline",
+    "play_clip": "mdi:play-circle-outline"
   }
 }

@@ -1,23 +1,25 @@
-"""The face crop for Nitin to label next.
-
-The oldest pending crop awaiting a label, or the most recently labelled one once the queue is
-empty (`agent/src/faces.rs`'s `review_target`) -- so the picture is never blank once caught up.
-Paired with `select.cat_feeder_label_face`, which acts on the same crop.
-"""
+"""Image entities for Kibble: the pending-face crop to label next, and the before/after dish
+snapshot pair from the most recent feed cycle (`agent/src/feed_capture.rs`)."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from datetime import datetime
 from urllib.parse import quote
 
+from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import ReviewFace
+from .api import FeedRecord, ReviewFace
 from .const import CONF_HOST, CONF_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -25,7 +27,13 @@ async def async_setup_entry(
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([KibblePendingFaceImage(hass, entry)])
+    async_add_entities(
+        [
+            KibblePendingFaceImage(hass, entry),
+            KibbleDishImage(hass, entry, "before"),
+            KibbleDishImage(hass, entry, "after"),
+        ]
+    )
 
 
 def _image_url(entry: KibbleConfigEntry, review: ReviewFace) -> str | None:
@@ -44,7 +52,9 @@ def _image_url(entry: KibbleConfigEntry, review: ReviewFace) -> str | None:
 
 
 class KibblePendingFaceImage(KibbleEntity, ImageEntity):
-    """The crop for Nitin to label next."""
+    """The oldest pending crop awaiting a label, or the most recently labelled one once the
+    queue is empty (`agent/src/faces.rs`'s `review_target`) -- so the picture is never blank
+    once caught up. Paired with `select.cat_feeder_label_face`, which acts on the same crop."""
 
     _attr_translation_key = "pending_face"
 
@@ -71,3 +81,99 @@ class KibblePendingFaceImage(KibbleEntity, ImageEntity):
         if review.cat is not None:
             attrs["cat"] = review.cat
         return attrs
+
+
+def _latest_dish_snapshot(
+    feeds: tuple[FeedRecord, ...], side: str
+) -> tuple[str | None, datetime | None]:
+    """The most recent feed cycle's `side` ('before'/'after') snapshot filename and its real
+    capture timestamp -- `(None, None)` if nothing has ever been captured for that half of the
+    pair. Both dish entities key off the *same* latest record (never independently "the latest
+    record that happens to have my side"), so a mismatched pair -- one entity showing feed #10's
+    shot next to the other showing feed #7's -- can't happen."""
+    if not feeds:
+        return None, None
+    record = feeds[-1]  # GET /feeds is oldest-first (agent/src/feed_capture.rs's list_records)
+    name = record.before if side == "before" else record.after
+    if name is None:
+        return None, None
+    return name, dt_util.utc_from_timestamp(record.ts)
+
+
+def _feed_snapshot_url(entry: KibbleConfigEntry, name: str) -> str:
+    host = entry.data[CONF_HOST]
+    port = entry.data[CONF_PORT]
+    return f"http://{host}:{port}/feeds/{quote(name, safe='')}"
+
+
+def _h264_to_jpeg_args(url: str) -> tuple[list[str], str, str]:
+    """The exact ffmpeg invocation shape for `_h264_keyframe_to_jpeg`, split out so its
+    parameter selection is testable without a real ffmpeg binary. `-f h264` must be on the
+    *input* side -- the agent's URL has no file extension/container for ffmpeg's prober to key
+    off -- which is why this can't just call `ffmpeg.async_get_image` (its `extra_cmd` only
+    lands after `-i`); this drives `HAFFmpeg` directly instead, the exact primitive
+    `async_get_image` is itself built on."""
+    return ["-frames:v", "1", "-c:v", "mjpeg"], f"-f h264 -i {url}", "-f image2pipe -"
+
+
+async def _h264_keyframe_to_jpeg(hass: HomeAssistant, url: str) -> bytes | None:
+    """One `GET /feeds/<name>` H.264 keyframe (SPS+PPS+IDR access unit -- `agent/src/
+    feed_capture.rs`) decoded to a JPEG via HA's own ffmpeg helper, per that module's own doc
+    comment ("Home Assistant ... decodes them to a displayable image"). Returns `None` (not an
+    exception) on any ffmpeg failure -- an image entity degrading to "no picture right now" is
+    the normal, supported outcome, the same as `ImageEntity`'s own built-in URL fetch already
+    does for a bad response."""
+    manager = get_ffmpeg_manager(hass)
+    decoder = HAFFmpeg(manager.binary)
+    cmd, input_source, output = _h264_to_jpeg_args(url)
+    if not await decoder.open(cmd=cmd, input_source=input_source, output=output):
+        _LOGGER.warning("ffmpeg could not open %s", url)
+        return None
+    try:
+        async with asyncio.timeout(15):
+            jpeg, _stderr = await decoder.process.communicate()
+    except (TimeoutError, ValueError):
+        _LOGGER.warning("ffmpeg timed out decoding %s", url)
+        decoder.kill()
+        return None
+    finally:
+        await decoder.close(0)
+    return jpeg or None
+
+
+class KibbleDishImage(KibbleEntity, ImageEntity):
+    """One half (`side`: 'before'/'after') of the dish snapshot pair for the most recent feed
+    cycle. Sourced from a raw H.264 keyframe, not a ready-made image -- `async_image` decodes
+    it on demand via `_h264_keyframe_to_jpeg` rather than `ImageEntity`'s own built-in URL
+    fetch, which requires the URL to directly return a recognized image content type."""
+
+    _attr_content_type = "image/jpeg"
+
+    def __init__(self, hass: HomeAssistant, entry: KibbleConfigEntry, side: str) -> None:
+        KibbleEntity.__init__(self, entry.runtime_data, f"dish_{side}")
+        ImageEntity.__init__(self, hass)
+        self._entry = entry
+        self._side = side
+        self._attr_translation_key = f"dish_{side}"
+        self._name, self._attr_image_last_updated = _latest_dish_snapshot(
+            entry.runtime_data.data.feeds, side
+        )
+        self._jpeg: bytes | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        name, last_updated = _latest_dish_snapshot(self.coordinator.data.feeds, self._side)
+        if name != self._name:
+            self._name = name
+            self._attr_image_last_updated = last_updated
+            self._jpeg = None
+        super()._handle_coordinator_update()
+
+    async def async_image(self) -> bytes | None:
+        if self._name is None:
+            return None
+        if self._jpeg is None:
+            self._jpeg = await _h264_keyframe_to_jpeg(
+                self.hass, _feed_snapshot_url(self._entry, self._name)
+            )
+        return self._jpeg

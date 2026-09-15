@@ -33,6 +33,21 @@ class KibbleConnectionError(KibbleError):
     """The agent could not be reached."""
 
 
+class KibbleSpeakerBusyError(KibbleError):
+    """The speaker already has a writer: another kibbled-internal playback session, or (per
+    `audioout.rs`'s `SpeakerOwner`) the vendor app's own call. `POST /speak` and
+    `POST /clips/<name>/play` both 409 for exactly this reason -- raised distinctly so a
+    caller can give a clear, specific message instead of a generic `KibbleError`."""
+
+
+class KibbleMediaError(KibbleError):
+    """A local failure resolving or converting HA media *before* ever reaching the agent --
+    ffmpeg couldn't be started, timed out, or produced nothing; HA's own media-source
+    resolution failing raises its own `HomeAssistantError` directly and never reaches this.
+    Still just a `KibbleError` to every existing catch site, so a caller doesn't need a second
+    `except` clause to tell "HA couldn't prepare this audio" from "the agent rejected it"."""
+
+
 @dataclass(frozen=True, slots=True)
 class FeederState:
     """One snapshot of the feeder, as reported by `GET /state`."""
@@ -264,6 +279,50 @@ class ReviewFace:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ClipInfo:
+    """One stored audio clip, as reported by `GET /clips` (`agent/src/clips.rs`'s own
+    `ClipInfo`) -- already normalized and AAC-encoded on the agent side; `bytes` is the
+    encoded size, not the original PCM's."""
+
+    name: str
+    bytes: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ClipInfo:
+        return cls(name=str(data.get("name", "")), bytes=int(data.get("bytes") or 0))
+
+
+@dataclass(frozen=True, slots=True)
+class FeedRecord:
+    """One feed cycle's before/after dish-snapshot pair, as reported by `GET /feeds`
+    (`agent/src/feed_capture.rs`'s own `FeedRecord`). `before`/`after` are filenames for
+    `GET /feeds/<name>`'s raw H.264 keyframe bytes -- `None` if that half of the pair was
+    never captured (no cached keyframe available at that exact instant)."""
+
+    ts: int
+    id: str
+    amount1: int | None
+    amount2: int | None
+    manual: bool
+    before: str | None
+    after: str | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> FeedRecord:
+        amount1 = data.get("amount1")
+        amount2 = data.get("amount2")
+        return cls(
+            ts=int(data.get("ts") or 0),
+            id=str(data.get("id", "")),
+            amount1=None if amount1 is None else int(amount1),
+            amount2=None if amount2 is None else int(amount2),
+            manual=bool(data.get("manual")),
+            before=data.get("before"),
+            after=data.get("after"),
+        )
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -277,18 +336,33 @@ class KibbleClient:
         method: str,
         path: str,
         payload: dict | None = None,
+        *,
+        data: bytes | None = None,
         timeout: ClientTimeout | None = None,
     ) -> Any:
+        """`payload` is sent as a JSON body; `data`, if given instead, is sent raw -- `/speak`
+        and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
+        (mutually exclusive with `payload`; nothing here needs both at once)."""
         async with self._lock:
             try:
                 async with self._session.request(
-                    method, f"{self._base}{path}", json=payload, timeout=timeout or TIMEOUT
+                    method,
+                    f"{self._base}{path}",
+                    json=payload if data is None else None,
+                    data=data,
+                    timeout=timeout or TIMEOUT,
                 ) as resp:
                     if resp.status == 404:
                         raise KibbleError(f"{path} not supported by this agent version")
                     body = await resp.json(content_type=None)
                     if resp.status >= 400:
                         detail = body.get("error", body) if isinstance(body, dict) else body
+                        # The speaker's exclusive-owner arbitration (`audioout.rs`'s
+                        # `SpeakerOwner`) surfaces as 409 on exactly `/speak` and
+                        # `/clips/<name>/play` -- distinct from every other rejected write so a
+                        # caller can tell "busy, retry" from "malformed request".
+                        if resp.status == 409:
+                            raise KibbleSpeakerBusyError(str(detail))
                         raise KibbleError(str(detail))
                     # `GET /wifi/scan` returns a bare JSON array, every other endpoint an
                     # object -- only substitute the empty-object default for a truly absent
@@ -430,3 +504,28 @@ class KibbleClient:
         """The exact inverse of `label_face` -- moves a labelled crop back to pending and
         corrects the centroid. A full re-label is this followed by another `label_face`."""
         await self._request("POST", "/faces/unlabel", {"name": crop_id, "cat": cat})
+
+    async def clips(self) -> list[ClipInfo]:
+        return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips")]
+
+    async def feeds(self) -> list[FeedRecord]:
+        return [FeedRecord.from_json(f) for f in await self._request("GET", "/feeds")]
+
+    async def speak(self, pcm: bytes) -> dict:
+        """`POST /speak`: plays `pcm` (raw signed-16-bit-LE/mono/16kHz, no container -- exactly
+        `agent/src/main.rs`'s `pcm_from_body`) once through the speaker. Returns immediately
+        with `{"samples","estimated_ms"}`; the agent runs the actual playback on its own
+        spawned thread. Raises `KibbleSpeakerBusyError` (409) if the speaker already has a
+        writer."""
+        return await self._request("POST", "/speak", data=pcm)
+
+    async def save_clip(self, name: str, pcm: bytes) -> dict:
+        """`PUT /clips/<name>`: same raw PCM format as `speak`; the agent normalizes,
+        AAC-encodes and stores it under `name`. Never 409s -- storing doesn't touch the
+        speaker."""
+        return await self._request("PUT", f"/clips/{quote(name, safe='')}", data=pcm)
+
+    async def play_clip(self, name: str) -> dict:
+        """`POST /clips/<name>/play`: plays an already-stored, already-encoded clip. Raises
+        `KibbleSpeakerBusyError` (409) if the speaker already has a writer."""
+        return await self._request("POST", f"/clips/{quote(name, safe='')}/play")

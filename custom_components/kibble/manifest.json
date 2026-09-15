@@ -16,6 +16,7 @@
   "version": "0.1.0",
   "dependencies": [
     "bluetooth",
-    "ffmpeg"
+    "ffmpeg",
+    "media_source"
   ]
 }

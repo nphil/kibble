@@ -79,3 +79,23 @@ CAT_LABEL_SKIP = "Skip"
 CAT_LABEL_NOT_A_CAT = "Not a cat"
 CAT_BUCKET_SKIP = "other"
 CAT_BUCKET_NOT_A_CAT = "not_a_cat"
+
+SERVICE_SAVE_CLIP = "save_clip"
+SERVICE_RECORD_CLIP = "record_clip"
+SERVICE_PLAY_CLIP = "play_clip"
+
+ATTR_CLIP_NAME = "name"
+ATTR_MEDIA_CONTENT_ID = "media_content_id"
+ATTR_SECONDS = "seconds"
+
+# `media_player.*.volume_level` is HA's own 0.0-1.0 (shown as 0-100% in the UI); the device's
+# own writable range is `agent/src/settings.rs`'s "volume" setting (`Kind::Int{min:0,max:9}`),
+# the exact same `config["volume"]` number.py's `KibbleVolumeNumber` already reads/writes
+# through `POST /config`. Not `GET /state`'s own (different config_shm offset, currently
+# unused by this integration) `volume` field.
+MAX_DEVICE_VOLUME = 9
+
+# A "clip" is a short prompt/announcement, not a recording -- bounds `record_clip`'s capture
+# length. Not a device-confirmed limit, an integration-side sanity bound.
+MIN_CLIP_SECONDS = 1
+MAX_CLIP_SECONDS = 30

@@ -2,30 +2,45 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
+from homeassistant.components.media_player import async_process_play_media_url
+from homeassistant.components.media_source import async_resolve_media, is_media_source_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
     CatInfo,
+    ClipInfo,
     CloudState,
     FeederState,
+    FeedRecord,
     IdentifyResult,
     KibbleClient,
     KibbleError,
+    KibbleMediaError,
     ReviewFace,
     ScheduleState,
     WifiNetwork,
     WifiState,
 )
 from .ble_fallback import async_feed_with_fallback
-from .const import CONF_BLE_ADDRESS, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import (
+    CONF_BLE_ADDRESS,
+    CONF_HOST,
+    CONF_STREAM_URL,
+    DEFAULT_RTSP_PATH,
+    DEFAULT_RTSP_PORT,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,8 +52,9 @@ class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
     device-settings snapshot, the Petkit-cloud kill switch's status, the current Wi-Fi
     association plus a fresh scan (`agent/src/wifi.rs`), every enrolled cat, the classifier's
-    current identification, and the crop the pending-face image entity is showing
-    (`agent/src/faces.rs`'s `Gallery`/`review_target`/`identify_target`)."""
+    current identification, the crop the pending-face image entity is showing
+    (`agent/src/faces.rs`'s `Gallery`/`review_target`/`identify_target`), every stored audio
+    clip, and every before/after dish-snapshot record (`agent/src/feed_capture.rs`)."""
 
     state: FeederState
     schedule: ScheduleState
@@ -50,6 +66,75 @@ class KibbleData:
     identify: IdentifyResult
     review_face: ReviewFace
     pending_face_count: int
+    clips: tuple[ClipInfo, ...]
+    feeds: tuple[FeedRecord, ...]
+
+
+def _rtsp_url(entry: KibbleConfigEntry) -> str:
+    """The feeder's live RTSP source for anything that needs its audio/video, honoring the
+    same single-consumer rule `camera.py` documents: Scrypted's rebroadcast if configured
+    (one video consumer only -- opening a second direct session costs the SoC a thread and a
+    TCP writer it doesn't have to spare), otherwise the device's own substream directly."""
+    configured = entry.options.get(CONF_STREAM_URL)
+    if configured:
+        return configured
+    host = entry.data[CONF_HOST]
+    return f"rtsp://{host}:{DEFAULT_RTSP_PORT}{DEFAULT_RTSP_PATH}"
+
+
+def _pcm_convert_args(*, duration: float | None = None) -> list[str]:
+    """ffmpeg output-side args that turn whatever `-i` decoded into raw signed 16-bit little-
+    endian mono 16kHz PCM -- exactly what `POST /speak`/`PUT /clips/<name>` both take as a raw
+    body (`agent/src/main.rs`'s `pcm_from_body`). `duration` bounds how much of a *live* source
+    to keep (`record_clip`'s RTSP capture, as an ffmpeg output-side `-t`); omitted for a
+    one-shot URL/file fetch that already ends on its own."""
+    args = ["-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le"]
+    if duration is not None:
+        args = [*args, "-t", f"{duration:.3f}"]
+    return args
+
+
+async def _pcm_from_ffmpeg(
+    hass: HomeAssistant, source: str, *, duration: float | None = None
+) -> bytes:
+    """Runs `source` (a URL or RTSP mount ffmpeg fetches/demuxes/decodes itself -- never
+    pre-downloaded by this integration, same "let ffmpeg do the protocol work" approach
+    `camera.py`'s snapshot path already uses) through HA's own ffmpeg helper and returns raw
+    PCM. `duration` is `record_clip`'s capture length; a generous fixed margin on top bounds
+    the one-shot download path against a stalled/slow server."""
+    manager = get_ffmpeg_manager(hass)
+    runner = HAFFmpeg(manager.binary)
+    is_open = await runner.open(
+        cmd=_pcm_convert_args(duration=duration), input_source=source, output="-"
+    )
+    if not is_open:
+        raise KibbleMediaError(f"ffmpeg could not open {source!r}")
+    try:
+        async with asyncio.timeout((duration or 0) + 20):
+            pcm, _stderr = await runner.process.communicate()
+    except (TimeoutError, ValueError) as err:
+        runner.kill()
+        raise KibbleMediaError(f"ffmpeg timed out reading {source!r}") from err
+    finally:
+        await runner.close(0)
+    if not pcm:
+        raise KibbleMediaError(f"ffmpeg produced no audio from {source!r}")
+    return pcm
+
+
+async def _resolve_media_to_pcm(hass: HomeAssistant, media_content_id: str) -> bytes:
+    """Turns an HA media reference -- a media-source URI (what `tts.speak` produces, among
+    others) or a plain music URL -- into raw PCM. `media_source.async_resolve_media` first
+    (the same boilerplate every core media_player integration uses for this exact step);
+    `async_process_play_media_url` after, so a same-instance URL (a local TTS/media file)
+    picks up HA's own auth signature before ffmpeg fetches it over plain HTTP with no HA
+    session of its own. A bad/unresolvable reference raises `Unresolvable`, already a
+    `HomeAssistantError` -- left to propagate as-is rather than rewrapped."""
+    if is_media_source_id(media_content_id):
+        played = await async_resolve_media(hass, media_content_id)
+        media_content_id = played.url
+    url = async_process_play_media_url(hass, media_content_id)
+    return await _pcm_from_ffmpeg(hass, url)
 
 
 class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
@@ -83,6 +168,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             identify = await self.client.identify()
             review_face = await self.client.review_face()
             pending_face_count = len(await self.client.pending_faces())
+            clips = tuple(await self.client.clips())
+            feeds = tuple(await self.client.feeds())
             return KibbleData(
                 state=state,
                 schedule=schedule,
@@ -94,6 +181,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 identify=identify,
                 review_face=review_face,
                 pending_face_count=pending_face_count,
+                clips=clips,
+                feeds=feeds,
             )
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
@@ -203,3 +292,55 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         result = await self.client.identify()
         await self.async_request_refresh()
         return result
+
+    async def async_speak(self, pcm: bytes) -> dict:
+        """Plays already-prepared `pcm` once through the speaker. Refreshes on any outcome --
+        a 409 can't change device state, and a successful speak doesn't show up in any polled
+        field either (there is no "is speaking" flag anywhere in `GET /state`) -- kept only for
+        the same "always reconcile" shape every other write in this coordinator follows.
+        Propagates `KibbleSpeakerBusyError`/`KibbleError` to the caller uncaught, same as every
+        other `async_*` write here."""
+        try:
+            return await self.client.speak(pcm)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_resolve_and_convert(self, media_content_id: str) -> bytes:
+        """Turns an HA media reference into raw PCM -- the shared first half of both
+        `async_play_media_content` (posts it to `/speak`) and `async_save_clip` (puts it to
+        `/clips/<name>`)."""
+        return await _resolve_media_to_pcm(self.hass, media_content_id)
+
+    async def async_play_media_content(self, media_content_id: str) -> dict:
+        """Resolves an HA media reference to PCM and plays it once via `async_speak`. Returns
+        the agent's `{"samples","estimated_ms"}` so the caller (the media_player entity) can
+        track the transient "playing" state honestly, from the agent's own real duration for
+        the exact bytes just sent -- not a guess."""
+        pcm = await self.async_resolve_and_convert(media_content_id)
+        return await self.async_speak(pcm)
+
+    async def async_save_clip(self, name: str, media_content_id: str) -> None:
+        pcm = await self.async_resolve_and_convert(media_content_id)
+        try:
+            await self.client.save_clip(name, pcm)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_record_clip(self, name: str, seconds: float) -> None:
+        """Records `seconds` from the feeder's own live RTSP mic track and stores it as a
+        named clip. Shortest reliable path chosen: ffmpeg demuxes/decodes the existing AAC mic
+        track directly off the already-published RTSP mount (`-t` bounds the capture) -- no
+        separate record-then-convert step, no new agent endpoint, the same "let ffmpeg do the
+        protocol work" approach this module's own download path and `camera.py`'s snapshot
+        path both already use."""
+        pcm = await _pcm_from_ffmpeg(self.hass, _rtsp_url(self.entry), duration=seconds)
+        try:
+            await self.client.save_clip(name, pcm)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_play_clip(self, name: str) -> None:
+        try:
+            await self.client.play_clip(name)
+        finally:
+            await self.async_request_refresh()

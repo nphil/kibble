@@ -92,6 +92,17 @@
     "image": {
       "pending_face": {
         "name": "Pending face"
+      },
+      "dish_before": {
+        "name": "Dish before feed"
+      },
+      "dish_after": {
+        "name": "Dish after feed"
+      }
+    },
+    "media_player": {
+      "speaker": {
+        "name": "Speaker"
       }
     },
     "number": {
@@ -202,6 +213,9 @@
       },
       "pending_faces": {
         "name": "Pending faces"
+      },
+      "clips": {
+        "name": "Stored clips"
       }
     },
     "switch": {
@@ -389,6 +403,56 @@
         "device_id": {
           "name": "Feeder",
           "description": "The feeder to identify."
+        }
+      }
+    },
+    "save_clip": {
+      "name": "Save clip",
+      "description": "Download audio from an HA media source or URL, convert it, and store it on the feeder as a named clip.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to save a clip on."
+        },
+        "name": {
+          "name": "Clip name",
+          "description": "Letters, digits, '-', '_', '.' only (max 64 characters)."
+        },
+        "media_content_id": {
+          "name": "Media",
+          "description": "A media-source reference (e.g. from tts.speak) or a direct audio URL."
+        }
+      }
+    },
+    "record_clip": {
+      "name": "Record clip",
+      "description": "Record from the feeder's own microphone and store it on the feeder as a named clip.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to record from."
+        },
+        "name": {
+          "name": "Clip name",
+          "description": "Letters, digits, '-', '_', '.' only (max 64 characters)."
+        },
+        "seconds": {
+          "name": "Duration",
+          "description": "How many seconds to record."
+        }
+      }
+    },
+    "play_clip": {
+      "name": "Play clip",
+      "description": "Play an already-stored clip through the feeder's speaker.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to play a clip on."
+        },
+        "name": {
+          "name": "Clip name",
+          "description": "The stored clip's name, from sensor.cat_feeder_clips's attributes or GET /clips."
         }
       }
     }
