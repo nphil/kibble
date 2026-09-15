@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import voluptuous as vol
@@ -15,11 +16,13 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import KibbleClient, KibbleConnectionError, KibbleError
-from .const import CONF_HOST, CONF_PORT, CONF_STREAM_URL, DEFAULT_PORT, DOMAIN
+from .const import CONF_BLE_ADDRESS, CONF_HOST, CONF_PORT, CONF_STREAM_URL, DEFAULT_PORT, DOMAIN
 
 SCHEMA = vol.Schema(
     {vol.Required(CONF_HOST): str, vol.Optional(CONF_PORT, default=DEFAULT_PORT): int}
 )
+
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
 class KibbleConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -58,10 +61,15 @@ class KibbleConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class KibbleOptionsFlow(OptionsFlow):
-    """Where the camera entity should take its video from.
+    """Video source and BLE fallback address, both filled in after initial setup.
 
-    The feeder serves video to one consumer only (Scrypted); this is the rebroadcast URL the
-    camera entity consumes instead of hitting the device a second time. Empty = use the device.
+    `stream_url`: the feeder serves video to one consumer only (Scrypted); this is the
+    rebroadcast URL the camera entity consumes instead of hitting the device a second time.
+    Empty = use the device.
+
+    `ble_address`: the feeder's BLE MAC, once a Bluetooth proxy has actually seen it advertise
+    (`docs/25-ble-feed-frame.md`). Empty = `kibble.feed` reports "unreachable" instead of
+    trying a BLE fallback when the agent's HTTP API can't be reached.
     """
 
     async def async_step_init(
@@ -69,17 +77,33 @@ class KibbleOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         if user_input is not None:
             url = (user_input.get(CONF_STREAM_URL) or "").strip()
+            address = (user_input.get(CONF_BLE_ADDRESS) or "").strip().upper()
+            errors: dict[str, str] = {}
             if url and not url.startswith(("rtsp://", "rtsps://")):
+                errors[CONF_STREAM_URL] = "not_rtsp"
+            if address and not _MAC_RE.match(address):
+                errors[CONF_BLE_ADDRESS] = "not_mac"
+            if errors:
                 return self.async_show_form(
-                    step_id="init",
-                    data_schema=self._schema(url),
-                    errors={CONF_STREAM_URL: "not_rtsp"},
+                    step_id="init", data_schema=self._schema(url, address), errors=errors
                 )
-            return self.async_create_entry(data={CONF_STREAM_URL: url})
+            return self.async_create_entry(
+                data={CONF_STREAM_URL: url, CONF_BLE_ADDRESS: address}
+            )
 
-        current = self.config_entry.options.get(CONF_STREAM_URL, "")
-        return self.async_show_form(step_id="init", data_schema=self._schema(current))
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self._schema(
+                options.get(CONF_STREAM_URL, ""), options.get(CONF_BLE_ADDRESS, "")
+            ),
+        )
 
     @staticmethod
-    def _schema(current: str) -> vol.Schema:
-        return vol.Schema({vol.Optional(CONF_STREAM_URL, default=current): str})
+    def _schema(stream_url: str, ble_address: str) -> vol.Schema:
+        return vol.Schema(
+            {
+                vol.Optional(CONF_STREAM_URL, default=stream_url): str,
+                vol.Optional(CONF_BLE_ADDRESS, default=ble_address): str,
+            }
+        )

@@ -63,6 +63,14 @@
           "blocked": "mdi:cloud-lock-outline",
           "unreachable": "mdi:cloud-alert-outline"
         }
+      },
+      "control_path": {
+        "default": "mdi:transit-connection-variant",
+        "state": {
+          "wifi": "mdi:wifi",
+          "bluetooth": "mdi:bluetooth",
+          "unreachable": "mdi:lan-disconnect"
+        }
       }
     },
     "switch": {

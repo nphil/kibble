@@ -171,6 +171,14 @@
           "blocked": "Blocked",
           "unreachable": "Unreachable"
         }
+      },
+      "control_path": {
+        "name": "Control path",
+        "state": {
+          "wifi": "Wi-Fi",
+          "bluetooth": "Bluetooth",
+          "unreachable": "Unreachable"
+        }
       }
     },
     "switch": {
@@ -297,15 +305,17 @@
   "options": {
     "step": {
       "init": {
-        "title": "Video source",
-        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.",
+        "title": "Video source & Bluetooth fallback",
+        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.",
         "data": {
-          "stream_url": "Rebroadcast RTSP URL"
+          "stream_url": "Rebroadcast RTSP URL",
+          "ble_address": "Feeder BLE MAC address"
         }
       }
     },
     "error": {
-      "not_rtsp": "Must be an rtsp:// URL."
+      "not_rtsp": "Must be an rtsp:// URL.",
+      "not_mac": "Must be a MAC address, e.g. AA:BB:CC:DD:EE:FF."
     }
   }
 }
