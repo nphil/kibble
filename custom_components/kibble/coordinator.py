@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import FeederState, KibbleClient, KibbleError, ScheduleState
+from .api import CloudState, FeederState, KibbleClient, KibbleError, ScheduleState
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,12 +21,13 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 @dataclass(frozen=True, slots=True)
 class KibbleData:
-    """Everything one poll cycle fetches: feeder telemetry, the schedule cache, and the
-    live device-settings snapshot."""
+    """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
+    device-settings snapshot, and the Petkit-cloud kill switch's status."""
 
     state: FeederState
     schedule: ScheduleState
     config: dict[str, int]
+    cloud: CloudState
 
 
 class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
@@ -49,7 +50,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             state = await self.client.state()
             schedule = await self.client.schedule()
             config = await self.client.config()
-            return KibbleData(state=state, schedule=schedule, config=config)
+            cloud = await self.client.cloud()
+            return KibbleData(state=state, schedule=schedule, config=config, cloud=cloud)
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -84,3 +86,13 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     async def async_schedule_set_enabled(self, entry_id: str, enabled: bool) -> None:
         await self.client.set_schedule_entry_enabled(entry_id, enabled)
         await self.async_request_refresh()
+
+    async def async_set_cloud(self, enabled: bool) -> None:
+        """Flip the Petkit-cloud kill switch. A disable can fail safe and roll itself back
+        (`agent/src/cloud.rs`) -- this always refreshes, even when `set_cloud` raises, so the
+        switch reflects the actual outcome (including a rollback's `last_error`) immediately
+        instead of waiting for the next poll."""
+        try:
+            await self.client.set_cloud(enabled)
+        finally:
+            await self.async_request_refresh()

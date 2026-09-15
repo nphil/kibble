@@ -48,7 +48,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities(KibbleSettingSwitch(coordinator, d) for d in SWITCHES)
+    entities: list[SwitchEntity] = [KibbleSettingSwitch(coordinator, d) for d in SWITCHES]
+    entities.append(KibbleCloudSwitch(coordinator))
+    async_add_entities(entities)
 
 
 class KibbleSettingSwitch(KibbleEntity, SwitchEntity):
@@ -79,3 +81,42 @@ class KibbleSettingSwitch(KibbleEntity, SwitchEntity):
             raise HomeAssistantError(
                 f"Set {self.entity_description.key} failed: {err}"
             ) from err
+
+
+class KibbleCloudSwitch(KibbleEntity, SwitchEntity):
+    """The Petkit-cloud kill switch (`agent/src/cloud.rs`): routes everything but the LAN
+    through a kernel route blackhole instead of the vendor's real default route, leaving
+    Home Assistant, Scrypted and the router untouched. Enabled by default and CONFIG, not
+    disabled-by-default like the settings switches above -- this is the privacy control the
+    integration exists for, so it ships visible, matching the device's own out-of-the-box
+    (cloud-enabled) behaviour."""
+
+    _attr_translation_key = "cloud"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "cloud")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.cloud.enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        cloud = self.coordinator.data.cloud
+        attrs: dict[str, Any] = {"routes": list(cloud.routes)}
+        if cloud.last_error:
+            attrs["last_error"] = cloud.last_error
+        return attrs
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._async_write(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_write(False)
+
+    async def _async_write(self, enabled: bool) -> None:
+        try:
+            await self.coordinator.async_set_cloud(enabled)
+        except KibbleError as err:
+            raise HomeAssistantError(f"Set Petkit cloud failed: {err}") from err

@@ -71,9 +71,18 @@
       "tone_range_from": { "name": "Do-not-disturb hours start" },
       "tone_range_till": { "name": "Do-not-disturb hours end" },
       "surplus_control": { "name": "Leftover food detection state" },
-      "surplus_standard": { "name": "Leftover food threshold" }
+      "surplus_standard": { "name": "Leftover food threshold" },
+      "cloud_connection": {
+        "name": "Cloud connection",
+        "state": {
+          "connected": "Connected",
+          "blocked": "Blocked",
+          "unreachable": "Unreachable"
+        }
+      }
     },
     "switch": {
+      "cloud": { "name": "Petkit cloud" },
       "night": { "name": "Night vision" },
       "light": { "name": "Status LED" },
       "microphone": { "name": "Microphone" }

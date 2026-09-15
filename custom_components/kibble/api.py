@@ -98,6 +98,38 @@ class ScheduleState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CloudConnection:
+    """One non-LAN TCP socket with a real remote peer, as reported by `GET /cloud`."""
+
+    remote: str
+    state: str
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> CloudConnection:
+        return cls(remote=str(data.get("remote", "")), state=str(data.get("state", "")))
+
+
+@dataclass(frozen=True, slots=True)
+class CloudState:
+    """One snapshot of the Petkit-cloud kill switch, as reported by `GET /cloud`
+    (`agent/src/cloud.rs`)."""
+
+    enabled: bool
+    last_error: str | None
+    routes: tuple[str, ...]
+    connections: tuple[CloudConnection, ...]
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> CloudState:
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            last_error=data.get("last_error"),
+            routes=tuple(str(r) for r in data.get("routes", [])),
+            connections=tuple(CloudConnection.from_json(c) for c in data.get("connections", [])),
+        )
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -183,4 +215,17 @@ class KibbleClient:
             await self._request(
                 "POST", "/schedule/entry/enabled", {"id": entry_id, "enabled": enabled}
             )
+        )
+
+    async def cloud(self) -> CloudState:
+        return CloudState.from_json(await self._request("GET", "/cloud"))
+
+    async def set_cloud(self, enabled: bool) -> CloudState:
+        """Flip the Petkit-cloud kill switch. The agent fails safe (`agent/src/cloud.rs`): a
+        disable that can't prove LAN reachability rolls itself back to enabled *and* returns
+        an error for this request -- `KibbleError` here, same as any other rejected write.
+        `GET /cloud` (via the next poll) reflects the rollback either way: `enabled: true`
+        with `last_error` set to why."""
+        return CloudState.from_json(
+            await self._request("POST", "/cloud", {"enabled": enabled})
         )
