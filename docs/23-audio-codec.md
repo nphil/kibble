@@ -1209,3 +1209,196 @@ construction:
 
 This is a design, not an implementation -- no code written against it this session, per standing
 instruction. Awaiting Main's go/no-go before touching `agent/src/audioout.rs`'s writer again.
+
+## 17.12 §17.11 implemented and deployed; lock exclusion proven live; consumption still not
+   achieved -- root cause narrowed to a reset/bookmark race, not disproven, not fully proven
+
+Author: AudioPublish. Implemented the §17.11 design in `agent/src/audioout.rs` (`publish`,
+`lock_ring_mutex`/`unlock_ring_mutex`, `WritableRegistry`), built and deployed it live with full
+md5 discipline, and ran two supervised consumption tests. **Net result: the vendor's mutex
+protocol is now correctly implemented and independently proven to provide real cross-process
+exclusion (not just "didn't crash") -- but `SndFrm` still did not move on either test.** The two
+tests, plus live counter readings taken while chasing the first negative result, point at a
+specific, plausible new failure mode (a counter-reset race against `audio_out_thread`'s bookmark)
+that this session found but could not fully confirm or fix live. Every claim below is tagged
+[HIGH] (directly observed this session), [MED] (strong circumstantial evidence, not fully
+isolated), or **[UNPROVEN -- FLAGGED]** (believed likely, explicitly not confirmed) per Main's
+standing instruction to separate those clearly.
+
+### 17.12.1 Two discrepancies resolved before writing any code [HIGH]
+
+1. **`ring::DATA_START` (1024) is not the vendor's own address origin.** §17.8 already flagged
+   `read_ring_bytes`'s disassembly-confirmed `0x3e8` (1000) as "24 bytes below `DATA_START`,
+   ...not re-derived further." Resolved by arithmetic, not new disassembly: §17.2's independently
+   disassembly-confirmed segment capacity (`0x800000` exactly) plus `0x3e8` equals `ring.rs`'s own
+   live-measured total file size (`RING_LEN` = 8,389,608) *exactly* (`0x800000 + 0x3e8 ==
+   8_389_608`). `DATA_START` is a safe scan-start seed for the read side's self-resyncing walker
+   (harmless to be off, since `find_next_header` corrects for it) but is the wrong constant for
+   byte-exact writer addressing. `publish()` uses `0x3e8` (`VENDOR_DATA_ORIGIN` in code).
+2. **musl calling glibc's mutex would have been a silent, undetectable correctness bug.** Fetched
+   and read musl's actual `pthread_mutex_timedlock`/`unlock`/`__timedwait` source: musl decides
+   private-vs-shared futex mode from its own `_m_type` field, at a musl-specific struct offset.
+   glibc's `pthread_mutex_t` (fetched and read glibc 2.25's actual `nptl`/`sysdeps/nptl` source)
+   lays out `__kind`/`__lock`/etc. differently. Calling musl's own `pthread_mutex_lock`-family
+   functions on this already-glibc-initialized mutex would read garbage where musl expects its own
+   pshared flag, most likely misdetecting the mutex as process-*private* and using the private
+   futex path -- no error, just zero real cross-process exclusion. `agent/src/audioout.rs` instead
+   hand-rolls the lock directly against the known-correct offset-0 word using always-non-private
+   raw `futex(2)` syscalls (`SYS_futex`=240, confirmed against the kernel's own
+   `arch/arm/tools/syscall.tbl` for ARM EABI), implementing glibc's exact 3-state (0/1/2) algorithm
+   (verified against glibc 2.25's actual `lowlevellock.h`/`lowlevellock.c`, not from memory).
+
+### 17.12.2 Lock exclusion independently verified live, before touching `kibbled` at all [HIGH]
+
+Built a throwaway verification binary (`src/bin/locktest.rs`, deleted after use, never committed)
+implementing the identical lock/unlock algorithm standalone. Pushed to `/tmp`, ran directly against
+the live mutex:
+
+- **Realistic-to-generous range (1 ms - 700 ms hold, six runs: 1/5/20/100/300/700 ms).** Sampled
+  `ring_base->0x18` and the mutex word *from inside the held critical section itself* every
+  100-200 us (228+ samples total across all six runs). **Zero exceptions**: `seq_advanced_during_
+  hold=false` on every single run, including the full 700 ms run (39x longer than this session's
+  own `LOCK_TIMEOUT`=200 ms, and many orders of magnitude longer than `publish()`'s actual hold,
+  which is a handful of memory operations with no syscalls). The word correctly read `2`
+  (locked-with-waiters) once holds exceeded the ~15-20 ms video/mic write interval, proving real
+  vendor threads were contending and correctly blocking, not merely "some bit happened to be set."
+- **Adversarial range (1.5-2+ s hold).** Word spuriously read back to `0` and `seq` resumed
+  advancing *while the test process had not yet called its own unlock* -- i.e., something else
+  released a lock this process still believed it held. This is a real anomaly, not a measurement
+  artifact (confirmed with precise `CLOCK_MONOTONIC` timestamps and in-process sampling, ruling out
+  the cross-process timing-correlation error the first, cruder version of this test suffered from).
+  **[MED] working theory, not confirmed further**: the vendor's own `publish()` uses
+  `pthread_mutex_trylock` then a **1-second** `pthread_mutex_timedlock` fallback (§17.10.2 step 2)
+  before giving up; this anomaly appears only past that same ~1 s boundary, consistent with an
+  edge case in how a pile of glibc waiters that individually time out at 1s clean up the shared
+  "waiters" state under sustained multi-second contention -- a scenario this project's own writer
+  never creates (hold time: microseconds; `LOCK_TIMEOUT`: 200 ms, both far short of 1 s). Not
+  re-derived via disassembly of glibc's `__lll_timedlock_wait` this session; flagged, not chased
+  further, because it does not appear reachable by the real code path.
+- Ruled out `/tmp/slot7mon` (AudioAnnounce's still-running passive sampler) as a confound: its own
+  prior documentation states it is structurally `O_RDONLY`+`PROT_READ`-only, independently
+  confirmed by simple physics (a `PROT_READ` mapping cannot write, so it cannot be the source of
+  any mutex-word change regardless of anything else).
+
+### 17.12.3 Deployment [HIGH]
+
+Backup `kibbled.pre-audiopublish`, md5 `1b4e1e3570ccba0bca6d28db380a5adf` (the binary that was
+live going into this session). New binary md5 `c87501c8f4ad8ac671c6dd8437f45980`, byte-verified
+on-device after transfer, byte-verified again as still-running at session end. Both reported to
+Main before and after, per standing instruction. Health gate before AND after every device
+interaction this session (initial deploy, both `/speak` tests): all 7 vendor PIDs continuous
+accumulated CPU time throughout (`media` 5h55 -> 6h03+ across the session, never reset), `aenc`
+idle 3-line banner every time, RTSP `/main` serving live h264+aac via `ffprobe` every time. No
+vendor process ever touched, killed, or restarted. `kibbled` itself was killed once (by design,
+the only way to pick up a new binary under this device's `app_init.sh` supervisor loop) and came
+back on its own supervisor-managed restart within its normal ~5s cycle, verified by PID change and
+immediate re-confirmation of every health-gate item.
+
+### 17.12.4 Two consumption tests, both `SndFrm` delta = 0 against a predicted +125 [HIGH]
+
+Clip: 8.000 s / 128,000 samples / exactly 125 frames, 440 Hz, 50 ms fade in/out, sent via
+`POST /speak` (not the vendor's feed-prompt sound). `SndFrm` baseline 1867, confirmed stable
+across multiple reads spanning several minutes before either test.
+
+- **Test 1** (predicted and pinged to Main before sending): HTTP 200,
+  `{"ok":true,"samples":128000,"estimated_ms":8000}`. Waited 18.5 s (> clip duration + encode
+  overhead). `SndFrm` before=1867, after=1867. **Delta 0, not +125.**
+- **Test 2** (re-seed retest, Main-authorized, no audible confirmation needed -- `SndFrm` movement
+  alone is the acceptance bar): same clip, same result. Waited 30.3 s. `SndFrm` before=1867,
+  after=1867. **Delta 0 again.**
+- Neither test regressed the health gate (§17.12.3). Case (c) (published+consumed but inaudible,
+  e.g. a volume/routing problem) is therefore ruled out for both tests: the counter that would
+  prove consumption never moved at all.
+
+### 17.12.5 The reset/bookmark-race hypothesis: the evidence, and exactly what is NOT proven
+
+While chasing test 1's negative result, direct reads of `ring_base`'s registry fields (raw byte
+dumps via `dd`/`od` over telnet, no new binary needed) found:
+
+- Shortly after test 1: `ring_base->0x18` (the global sequence, i.e. `audio_out_thread`'s gate
+  counter) read **8973** -- far below the ~305,000+ range this same counter was in minutes earlier,
+  during §17.12.2's lock-verification runs. **[HIGH, directly read]**
+- Confirmed the counter was not stuck: two reads 3 s apart (13,665 -> 13,882) gave a rate of
+  **72.3/s**, matching the documented ~70 Hz video/mic write rate exactly. The writer side is
+  healthy; it is simply counting up from a much lower baseline than before. **[HIGH]**
+- A second pair of reads, taken after test 2, found the counter **had dropped again**: 4,005 ->
+  4,146 over 2 s (rate 70.5/s, again healthy). **[HIGH]** This means at least two resets occurred
+  during this session's own testing window, not one.
+
+**[MED] hypothesis, partially tested, not confirmed**: §17.10.2 step 3 describes an
+advisory-only overflow check the real `publish()` runs on every call, which zeros
+`ring_base->0x18/0x1c/0x20/0x24/0x28` back to 0 if a running-total threshold is exceeded --
+explicitly a *normal*, vendor-designed, harmless-to-video/mic mechanism, not a bug. If
+`audio_out_thread` is spawned (via `speak_start`) and seeds its bookmark from the counter
+*before* such a reset fires, then the counter is zeroed *after*, the gate
+(`ring_base->0x18 >= slot->0x14`) can only be satisfied once the (now near-zero) counter climbs
+back past the old, much higher bookmark -- at ~70/s, over an hour for a ~300,000 gap. This would
+fully explain zero consumption independent of whether `publish()` itself is correct.
+
+**This session's own lock-hold stress testing (§17.12.2, six runs holding the real mutex for up
+to 700 ms, each followed by a burst of queued writers all landing at once) is the most likely
+trigger for at least the first reset, and very plausibly primed the ring for the second one too --
+say this plainly, as instructed: a diagnostic side effect of proving the lock is very likely what
+broke the very counter the subsequent audible test depended on.** This is offered as the most
+plausible explanation, not a proven causal chain -- no threshold constant was disassembled or
+directly observed being crossed.
+
+**What this hypothesis predicts, and where the prediction failed:** if a stale pre-reset bookmark
+were the *whole* story, re-sending `speak_start` *after* the reset (letting the previous, never-
+timed-out-yet, but never-consuming thread's own 5 s idle timeout lapse, then a fresh `/speak` call)
+should re-seed the bookmark from the current, healthy, climbing counter and fix consumption on the
+next test. **Test 2 was exactly this retest, authorized by Main specifically because it needed no
+audible confirmation -- and it also returned delta 0.** Two explanations remain open, and this
+session could not distinguish between them before being told to stop:
+
+(a) **[UNPROVEN -- FLAGGED]** A *third* reset happened during test 2's own ~8 s playback window
+    (plausible: the confirmed second reset's timing overlaps test 2's send time, and 8 s is a long
+    window if resets are currently happening every 1-5 minutes -- itself possibly elevated by test
+    2's own 125-record write burst on top of already-disturbed state from testing). If so, the
+    ordering fix is directionally correct but insufficient alone while the ring is in this
+    unusually reset-prone state; consumption may well work correctly once tested against an
+    undisturbed ring (e.g., after a device reboot clears whatever accumulated state is driving the
+    elevated reset frequency).
+(b) **[UNPROVEN -- FLAGGED]** `publish()` itself is not correctly writing consumable records (a
+    real bug in this session's new code, separate from the reset story entirely). This session
+    could **not** rule this out directly: the one planned direct check -- pulling a chunk of the
+    ring's raw bytes back off the device to confirm 125 well-formed `chan=2` records physically
+    exist where `publish()` should have placed them -- failed for tooling reasons (a device-
+    initiates-outbound `nc` push timed out; this project's own proven pattern, used successfully
+    elsewhere in this session, is the *device listens, host connects in* direction instead, e.g.
+    `recv.py`'s approach). Not retried, per the explicit instruction to stop rather than start
+    anything new. **`publish()`'s correctness was verified by compilation, by the unmodified,
+    passing `build_record`/`find_append_target` unit tests, and by the mutex-exclusion proof in
+    §17.12.2 -- but never by reading back an actual record it wrote to the live ring.** This is the
+    single most important gap in this session's evidence and should be the next session's first
+    check, before any further audible test.
+
+### 17.12.6 Also flagged, not investigated this session [UNPROVEN -- FLAGGED]
+
+- **Volume mapping.** `/state` reportedly shows a `volume` of `20`; `/config`'s documented scale
+  (per a separate, HA-side finding this session did not independently verify) is `0`-`9`. If the
+  device is ever handed an out-of-range value, or `20` maps to something near-silent, a fully
+  successful publish-and-consume could still be inaudible (case (c) from Main's framing) --
+  worth a direct check *before* concluding a future non-zero `SndFrm` result means "audible."
+- **`/tmp/kibbled.log` stopped being useful mid-session.** It predates this session (its visible
+  content was RTSP session lines from before any restart here) and is not written by the
+  `app_init.sh`-supervised `kibbled` process, which redirects both stdout and stderr to
+  `/dev/null`. `PlaybackStats.frames_written` and any `SpeakError` from a `/speak` call are
+  therefore invisible in the current deployment, which is exactly the gap that left test 1's
+  "did the write even happen" question open. Next session should arrange a real log sink (a
+  file `kibbled` itself opens and writes to, not a shell redirect that only exists for as long as
+  someone manually launches it that way) before running another live test.
+
+### 17.12.7 State at handoff
+
+`kibbled` running (fresh restart, PID confirmed, md5 `c87501c8f4ad8ac671c6dd8437f45980`), all
+vendor processes undisturbed, health gate clean, telnet session released. Branch `audio-publish`
+pushed to origin, not merged, per standing instruction. The `publish()` implementation is real,
+compiled, deployed, and its locking is independently proven exclusive on real hardware -- genuine
+progress over §17.11's "design, not implemented" state -- but audible/consumption proof is still
+not achieved, and the honest reason why is narrowed to two candidate explanations (§17.12.5) that
+the next session should resolve in this order: (1) fix the ring-readback tooling and directly
+confirm or refute that `publish()` writes valid records, independent of any consumption question;
+(2) if writes are confirmed good, retest consumption against a freshly-rebooted (not just
+freshly-restarted) device to remove the elevated-reset-frequency confound entirely; (3) only then,
+if `SndFrm` still fails to move, revisit the gate model itself.
