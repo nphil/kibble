@@ -6,13 +6,14 @@
 //! compressed bitstream), then a true byte-continuous circular buffer of records -- a 56-byte
 //! header immediately followed by `length` bytes of H.264 Annex-B payload, back-to-back with zero
 //! padding. A keyframe record is one access unit bundling SPS+PPS+IDR; an interframe record
-//! carries one P-slice. `chan` 8 is the 1152x720@25fps "sub" stream this module serves.
+//! carries one P-slice. `chan` 4 is the 1728x1080 "main" stream and `chan` 8 is the
+//! 1152x720@25fps "sub" stream; both are served over RTSP (see `rtsp.rs`).
 //!
 //! There is no new-frame signal (the vendor creates `sem.media_buffer_reader_6` but never posts
 //! to it), so this is a poller: a background thread walks the ring, validates each record (sane
-//! length, known channel, global sequence exactly previous+1), and republishes new sub-channel
-//! records into a `VideoFeed` the RTSP server reads from. On any validation failure it resyncs by
-//! scanning forward for the next Annex-B start code.
+//! length, known channel, global sequence exactly previous+1), and republishes new main/sub
+//! records into that channel's `VideoFeed`. On any validation failure it resyncs by scanning
+//! forward for the next Annex-B start code.
 //!
 //! Whether the vendor ever splits a single record's bytes across the ring's physical end
 //! (`len`) is not confirmed either way by anything we've read from the device or its binaries.
@@ -23,7 +24,19 @@
 //!
 //! We map the ring read-only and never write it -- we're a passive third reader alongside
 //! `agora` and `cloud`, using the same plain POSIX shm+mmap protocol they do.
+//!
+//! ## Fan-out to multiple RTSP clients
+//!
+//! `VideoFeed` used to be a single-slot "latest wins" hand-off, correct only because exactly one
+//! RTSP client was ever connected at a time. Now that several can be (Scrypted's own prebuffer
+//! plus a human debugging with `ffprobe`, per stream), it's a small pub/sub hub instead: one
+//! `publish()` call per ring record (the poller never polls more than once per record, regardless
+//! of how many clients are attached) fans out to every attached [`Subscriber`]'s own bounded
+//! queue. See [`Subscriber::push`] for the per-client backpressure policy, and
+//! [`VideoFeed::subscribe`] for the session-count cap that keeps a client count fixed to a small
+//! ceiling instead of unbounded.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::os::raw::{c_int, c_void};
@@ -39,7 +52,7 @@ const DATA_START: usize = 1024;
 const HDR: usize = 56;
 
 /// Channel field values (record header offset 34).
-const CHAN_MAIN: u8 = 4;
+pub const CHAN_MAIN: u8 = 4;
 pub const CHAN_SUB: u8 = 8;
 const CHAN_THUMB: u8 = 16;
 const CHAN_AUDIO: u8 = 1;
@@ -56,6 +69,8 @@ const STALL_RESYNC_AFTER: Duration = Duration::from_millis(400);
 const ADVISE_CHUNK: usize = 512 * 1024;
 /// Poll cadence when the walker has drained everything currently available.
 const POLL_SLEEP: Duration = Duration::from_millis(10);
+/// Averaging window for each stream's observed fps (`GET /streams`, see `FpsWindow`).
+const FPS_WINDOW: Duration = Duration::from_secs(2);
 
 extern "C" {
     fn mmap(
@@ -139,6 +154,8 @@ struct Header {
     pts_us: u32,
     frame_type: u8,
     chan: u8,
+    width: u16,
+    height: u16,
 }
 
 /// Parse and structurally validate a record header from `buf[off..]`: in-bounds header, sane
@@ -155,6 +172,11 @@ fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     let pts_us = u32::from_le_bytes(b[16..20].try_into().unwrap());
     let frame_type = b[32];
     let chan = b[34];
+    // Video width/height (offset 46/48); repurposed as bits-per-sample/sample-rate on audio
+    // records, but nothing here reads those two fields for audio, so no harm in always parsing
+    // them the same way (see docs/19-frame-ring.md's per-record header table).
+    let width = u16::from_le_bytes(b[46..48].try_into().unwrap());
+    let height = u16::from_le_bytes(b[48..50].try_into().unwrap());
     if !(1..=2_000_000).contains(&length) {
         return None;
     }
@@ -164,7 +186,7 @@ fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     if off + HDR + length as usize > buf.len() {
         return None;
     }
-    Some(Header { seq, length, pts_us, frame_type, chan })
+    Some(Header { seq, length, pts_us, frame_type, chan, width, height })
 }
 
 /// Scan forward from `from` for the next byte offset that starts with an Annex-B start code
@@ -283,7 +305,7 @@ impl Walker {
     }
 }
 
-/// One access unit from the sub channel: exactly the bytes stored in the record's payload
+/// One access unit from a video channel: exactly the bytes stored in the record's payload
 /// (Annex-B, start-code prefixed), copied out of the mmap so it can outlive the poller's next
 /// step.
 #[derive(Clone)]
@@ -293,77 +315,234 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-struct FeedInner {
-    generation: u64,
-    latest: Option<Frame>,
-    latest_keyframe: Option<Frame>,
+/// Tracks a stream's observed frame rate as a simple windowed average: count every `tick()`,
+/// and once `FPS_WINDOW` of wall-clock time has actually elapsed, turn that count into a rate and
+/// start counting again. Takes `now` as a parameter rather than calling `Instant::now()` itself so
+/// it's testable with synthetic timestamps.
+struct FpsWindow {
+    count: u32,
+    window_start: Instant,
+    fps: f64,
 }
 
-/// Hand-off point between the ring-poller thread and the RTSP server thread. Deliberately
-/// "latest frame wins": if the RTSP thread is busy writing to a slow client when two new frames
-/// arrive, it sees only the second on its next check. For a live view that's the right trade --
-/// bounded memory, never blocks the poller, at worst skips a P-frame under backpressure.
+impl FpsWindow {
+    fn new(now: Instant) -> Self {
+        FpsWindow { count: 0, window_start: now, fps: 0.0 }
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.count += 1;
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= FPS_WINDOW {
+            self.fps = self.count as f64 / elapsed.as_secs_f64();
+            self.count = 0;
+            self.window_start = now;
+        }
+    }
+}
+
+/// A single client's inbox: fed by [`VideoFeed::publish`] from the one poller thread, drained by
+/// that client's own RTSP session thread via [`Subscription::recv`]. Bounded so a stalled client
+/// can never grow without limit or block the poller.
+struct Subscriber {
+    id: u64,
+    /// The client's `ip:port`, exactly as `TcpStream::peer_addr` reported it -- carried here
+    /// purely for `GET /streams` diagnostics (`VideoFeed::snapshot`), not used for any control
+    /// decision.
+    peer: String,
+    queue: Mutex<VecDeque<Frame>>,
+    changed: Condvar,
+    cap: usize,
+}
+
+impl Subscriber {
+    /// Enqueue `frame`, applying the eviction policy if already at `cap`. The invariant this
+    /// maintains: never let an interframe sit in the queue without the keyframe it decodes
+    /// against actually still being there to be delivered first -- either both survive, or
+    /// neither does.
+    ///
+    /// - If `frame` is itself a keyframe: it is a complete, self-contained resync point
+    ///   (SPS+PPS+IDR) that makes everything buffered before it moot -- an interframe still
+    ///   queued at this point references a keyframe the client hasn't been sent yet, so keeping
+    ///   it while dropping that keyframe would hand the client an undecodable frame. Clear the
+    ///   whole queue and start clean from this keyframe.
+    /// - Otherwise (another interframe arrived while already full): keep any keyframe already
+    ///   queued -- it is the client's only resync point -- and drop the oldest *interframe*
+    ///   instead. An interframe after a dropped predecessor is already useless to a decoder, so
+    ///   dropping older ones costs nothing beyond what the stall already cost.
+    ///
+    /// This runs on the poller thread (via `publish`), so it must never block on anything but
+    /// this one subscriber's own short-held mutex.
+    fn push(&self, frame: Frame) {
+        let mut q = self.queue.lock().unwrap();
+        if q.len() >= self.cap {
+            if frame.keyframe {
+                q.clear();
+            } else {
+                match q.iter().position(|f| !f.keyframe) {
+                    Some(i) => {
+                        q.remove(i);
+                    }
+                    None => {
+                        // Every queued frame is a keyframe (degenerate cap==1 case) -- nothing
+                        // else to drop.
+                        q.pop_front();
+                    }
+                }
+            }
+        }
+        q.push_back(frame);
+        self.changed.notify_one();
+    }
+
+    fn recv(&self, timeout: Duration) -> Option<Frame> {
+        let q = self.queue.lock().unwrap();
+        let (mut q, _) = self.changed.wait_timeout_while(q, timeout, |q| q.is_empty()).unwrap();
+        q.pop_front()
+    }
+}
+
+struct FeedInner {
+    latest_keyframe: Option<Frame>,
+    next_id: u64,
+    subscribers: Vec<Arc<Subscriber>>,
+    width: u16,
+    height: u16,
+    fps: FpsWindow,
+}
+
+/// Snapshot of one stream's state for `GET /streams`: what the ring is actually producing (so a
+/// resolution/fps mismatch is visible) and exactly who is attached right now.
+pub struct StreamSnapshot {
+    pub width: u16,
+    pub height: u16,
+    pub fps: f64,
+    pub sessions: Vec<String>,
+}
+
+/// Fan-out point between the ring-poller thread and however many RTSP sessions are currently
+/// playing this stream. One poll of the ring (see `poll_loop`) feeds every subscriber; each
+/// subscriber has its own small bounded queue (see `Subscriber::push`) so a slow client only ever
+/// drops its own frames and never blocks the poller or any other client.
 pub struct VideoFeed {
     inner: Mutex<FeedInner>,
-    changed: Condvar,
+}
+
+/// A live subscription to a [`VideoFeed`], held for the lifetime of one RTSP PLAY session and
+/// counting against that feed's session cap until dropped.
+pub struct Subscription {
+    feed: Arc<VideoFeed>,
+    sub: Arc<Subscriber>,
+}
+
+impl Subscription {
+    /// Block up to `timeout` for this client's next queued frame. `None` on timeout with nothing
+    /// queued -- callers use that to go check their socket for incoming client requests
+    /// (GET_PARAMETER, TEARDOWN) without a dedicated thread per connection.
+    pub fn recv(&self, timeout: Duration) -> Option<Frame> {
+        self.sub.recv(timeout)
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut inner = self.feed.inner.lock().unwrap();
+        inner.subscribers.retain(|s| s.id != self.sub.id);
+    }
 }
 
 impl VideoFeed {
     pub fn new() -> Arc<VideoFeed> {
         Arc::new(VideoFeed {
-            inner: Mutex::new(FeedInner { generation: 0, latest: None, latest_keyframe: None }),
-            changed: Condvar::new(),
+            inner: Mutex::new(FeedInner {
+                latest_keyframe: None,
+                next_id: 0,
+                subscribers: Vec::new(),
+                width: 0,
+                height: 0,
+                fps: FpsWindow::new(Instant::now()),
+            }),
         })
     }
 
-    fn publish(&self, frame: Frame) {
+    fn publish(&self, frame: Frame, width: u16, height: u16) {
         let mut inner = self.inner.lock().unwrap();
+        inner.width = width;
+        inner.height = height;
+        inner.fps.tick(Instant::now());
         if frame.keyframe {
             inner.latest_keyframe = Some(frame.clone());
         }
-        inner.latest = Some(frame);
-        inner.generation = inner.generation.wrapping_add(1);
-        self.changed.notify_all();
+        for sub in &inner.subscribers {
+            sub.push(frame.clone());
+        }
     }
 
-    /// The most recently seen keyframe, if any, plus the generation it was read at (so a caller
-    /// can seed `wait_next`'s `last_seen` without racing a frame published between two separate
-    /// calls). Used to start a newly-connected RTSP client immediately instead of making it wait
-    /// out the ~4 s GOP for the next one.
-    pub fn latest_keyframe(&self) -> (u64, Option<Frame>) {
-        let inner = self.inner.lock().unwrap();
-        (inner.generation, inner.latest_keyframe.clone())
+    /// The most recently seen keyframe, if any. Used by DESCRIBE to build SDP without consuming a
+    /// session slot.
+    pub fn latest_keyframe(&self) -> Option<Frame> {
+        self.inner.lock().unwrap().latest_keyframe.clone()
     }
 
-    /// Block up to `timeout` for a frame newer than `last_seen`, updating `last_seen` and
-    /// returning it if one arrives. `None` on timeout with nothing new -- callers use that to go
-    /// check their socket for incoming client requests (GET_PARAMETER, TEARDOWN) without a
-    /// dedicated thread per connection.
-    pub fn wait_next(&self, last_seen: &mut u64, timeout: Duration) -> Option<Frame> {
+    /// Register a new session, seeded with the current keyframe (if any) so it can start decoding
+    /// immediately instead of waiting out the ~4s GOP for the next one -- unless `max_sessions`
+    /// are already active, in which case this returns `None` and the caller must refuse the
+    /// client (RTSP `453 Not Enough Bandwidth`) rather than let it hang. On success, also returns
+    /// the number of sessions now active (including this one) so the caller can tell whether this
+    /// was the spare slot beyond the expected one client.
+    pub fn subscribe(
+        self: &Arc<Self>,
+        peer: String,
+        max_sessions: usize,
+        queue_cap: usize,
+    ) -> Option<(Subscription, usize)> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.subscribers.len() >= max_sessions {
+            return None;
+        }
+        let id = inner.next_id;
+        inner.next_id += 1;
+        let mut queue = VecDeque::with_capacity(queue_cap);
+        if let Some(kf) = &inner.latest_keyframe {
+            queue.push_back(kf.clone());
+        }
+        let sub = Arc::new(Subscriber { id, peer, queue: Mutex::new(queue), changed: Condvar::new(), cap: queue_cap });
+        inner.subscribers.push(Arc::clone(&sub));
+        let active = inner.subscribers.len();
+        Some((Subscription { feed: Arc::clone(self), sub }, active))
+    }
+
+    /// Current state for `GET /streams`: see [`StreamSnapshot`].
+    pub fn snapshot(&self) -> StreamSnapshot {
         let inner = self.inner.lock().unwrap();
-        let (inner, _) = self
-            .changed
-            .wait_timeout_while(inner, timeout, |i| i.generation == *last_seen)
-            .unwrap();
-        if inner.generation != *last_seen {
-            *last_seen = inner.generation;
-            inner.latest.clone()
-        } else {
-            None
+        StreamSnapshot {
+            width: inner.width,
+            height: inner.height,
+            fps: inner.fps.fps,
+            sessions: inner.subscribers.iter().map(|s| s.peer.clone()).collect(),
         }
     }
 }
 
-fn poll_loop(ring: Ring, feed: Arc<VideoFeed>) {
+fn poll_loop(ring: Ring, main_feed: Arc<VideoFeed>, sub_feed: Arc<VideoFeed>) {
     let mut w = Walker::new();
     w.seed(ring.as_bytes());
     loop {
         let mut made_progress = false;
         while let Some((h, payload_off)) = w.step(ring.as_bytes()) {
             made_progress = true;
-            if h.chan == CHAN_SUB {
+            let feed = match h.chan {
+                CHAN_MAIN => Some(&main_feed),
+                CHAN_SUB => Some(&sub_feed),
+                _ => None,
+            };
+            if let Some(feed) = feed {
                 let data = ring.as_bytes()[payload_off..payload_off + h.length as usize].to_vec();
-                feed.publish(Frame { pts_us: h.pts_us, keyframe: h.frame_type == FRAME_KEYFRAME, data });
+                feed.publish(
+                    Frame { pts_us: h.pts_us, keyframe: h.frame_type == FRAME_KEYFRAME, data },
+                    h.width,
+                    h.height,
+                );
             }
         }
         w.maybe_advise(&ring);
@@ -373,12 +552,14 @@ fn poll_loop(ring: Ring, feed: Arc<VideoFeed>) {
     }
 }
 
-/// Open the ring and spawn the background poller thread that feeds `feed`. The only fallible
-/// step is the initial open (bad path, too-small file, mmap failure); the poll loop itself never
-/// stops on its own.
-pub fn spawn(feed: Arc<VideoFeed>) -> io::Result<thread::JoinHandle<()>> {
+/// Open the ring and spawn the background poller thread that feeds both `main_feed` (chan
+/// `CHAN_MAIN`) and `sub_feed` (chan `CHAN_SUB`) from a single walk through the ring -- one poll,
+/// two writers, regardless of how many RTSP clients either feed ends up fanning out to. The only
+/// fallible step is the initial open (bad path, too-small file, mmap failure); the poll loop
+/// itself never stops on its own.
+pub fn spawn(main_feed: Arc<VideoFeed>, sub_feed: Arc<VideoFeed>) -> io::Result<thread::JoinHandle<()>> {
     let ring = Ring::open()?;
-    Ok(thread::spawn(move || poll_loop(ring, feed)))
+    Ok(thread::spawn(move || poll_loop(ring, main_feed, sub_feed)))
 }
 
 #[cfg(test)]
@@ -403,11 +584,15 @@ mod tests {
     fn parse_header_reads_known_fields() {
         let mut buf = ring_prefix();
         buf.extend(make_record(7, CHAN_SUB, 1, b"\x00\x00\x00\x01payload"));
+        buf[DATA_START + 46..DATA_START + 48].copy_from_slice(&1152u16.to_le_bytes());
+        buf[DATA_START + 48..DATA_START + 50].copy_from_slice(&720u16.to_le_bytes());
         let h = parse_header(&buf, DATA_START).expect("valid header");
         assert_eq!(h.seq, 7);
         assert_eq!(h.chan, CHAN_SUB);
         assert_eq!(h.frame_type, 1);
         assert_eq!(h.length as usize, b"\x00\x00\x00\x01payload".len());
+        assert_eq!(h.width, 1152);
+        assert_eq!(h.height, 720);
     }
 
     #[test]
@@ -528,5 +713,150 @@ mod tests {
         let (upto, range) = advise_plan(RING_LEN - 100, DATA_START + 5, RING_LEN);
         assert_eq!(upto, DATA_START);
         assert_eq!(range, Some((RING_LEN - 100, RING_LEN)));
+    }
+
+    fn frame(pts_us: u32, keyframe: bool) -> Frame {
+        Frame { pts_us, keyframe, data: vec![] }
+    }
+
+    fn new_subscriber(cap: usize) -> Subscriber {
+        Subscriber { id: 0, peer: "test:0".into(), queue: Mutex::new(VecDeque::new()), changed: Condvar::new(), cap }
+    }
+
+    fn queue_pts(sub: &Subscriber) -> Vec<u32> {
+        sub.queue.lock().unwrap().iter().map(|f| f.pts_us).collect()
+    }
+
+    #[test]
+    fn subscriber_queue_drops_oldest_interframe_and_keeps_the_keyframe_when_full() {
+        let sub = new_subscriber(3);
+        sub.push(frame(1, true));
+        sub.push(frame(2, false));
+        sub.push(frame(3, false)); // full: [kf1, i2, i3]
+        sub.push(frame(4, false)); // must drop the oldest *interframe* (i2), not the keyframe
+        assert_eq!(queue_pts(&sub), vec![1, 3, 4]);
+        assert!(sub.queue.lock().unwrap().front().unwrap().keyframe);
+    }
+
+    #[test]
+    fn subscriber_queue_drops_true_oldest_when_no_keyframe_is_buffered() {
+        let sub = new_subscriber(2);
+        sub.push(frame(1, false));
+        sub.push(frame(2, false)); // full: [1, 2]
+        sub.push(frame(3, false)); // no keyframe to protect -> drop true oldest
+        assert_eq!(queue_pts(&sub), vec![2, 3]);
+    }
+
+    #[test]
+    fn subscriber_queue_clears_and_restarts_from_a_fresh_keyframe_under_pressure() {
+        let sub = new_subscriber(2);
+        sub.push(frame(1, true));
+        sub.push(frame(2, false)); // full: [kf1, i2]
+        // A fresh keyframe arriving while full must not leave i2 (which decodes against kf1)
+        // queued behind a dropped kf1 -- that would hand the client an undecodable frame. The
+        // whole queue is cleared and restarted from this keyframe instead.
+        sub.push(frame(3, true));
+        assert_eq!(queue_pts(&sub), vec![3]);
+        assert!(sub.queue.lock().unwrap().front().unwrap().keyframe);
+    }
+
+    #[test]
+    fn subscriber_queue_does_not_evict_anything_while_under_capacity() {
+        let sub = new_subscriber(3);
+        sub.push(frame(1, true));
+        sub.push(frame(2, false));
+        sub.push(frame(3, true)); // reaches cap exactly via ordinary pushes, nothing to evict
+        assert_eq!(queue_pts(&sub), vec![1, 2, 3], "room was available; nothing needed to be dropped");
+    }
+
+    #[test]
+    fn subscriber_recv_returns_none_on_timeout_with_an_empty_queue() {
+        let sub = new_subscriber(3);
+        assert!(sub.recv(Duration::from_millis(5)).is_none());
+    }
+
+    #[test]
+    fn subscriber_recv_drains_in_fifo_order() {
+        let sub = new_subscriber(3);
+        sub.push(frame(1, true));
+        sub.push(frame(2, false));
+        assert_eq!(sub.recv(Duration::from_millis(10)).unwrap().pts_us, 1);
+        assert_eq!(sub.recv(Duration::from_millis(10)).unwrap().pts_us, 2);
+        assert!(sub.recv(Duration::from_millis(5)).is_none());
+    }
+
+    #[test]
+    fn feed_subscribe_refuses_past_the_session_cap() {
+        let feed = VideoFeed::new();
+        let (a, n1) = feed.subscribe("peer-a:1".into(), 2, 3).expect("first session admitted");
+        assert_eq!(n1, 1);
+        let (b, n2) = feed.subscribe("peer-b:2".into(), 2, 3).expect("second session admitted");
+        assert_eq!(n2, 2, "second session is the spare slot");
+        assert!(feed.subscribe("peer-c:3".into(), 2, 3).is_none(), "third session must be refused, not hang");
+        drop(a);
+        let (_c, n3) = feed.subscribe("peer-c:3".into(), 2, 3).expect("dropping a session frees its slot");
+        assert_eq!(n3, 2);
+        drop(b);
+    }
+
+    #[test]
+    fn feed_subscribe_seeds_the_new_session_with_the_latest_keyframe() {
+        let feed = VideoFeed::new();
+        feed.publish(frame(1, false), 1152, 720); // no keyframe yet
+        feed.publish(frame(2, true), 1152, 720);
+        let (sub, _) = feed.subscribe("peer:1".into(), 2, 3).expect("admitted");
+        let first = sub.recv(Duration::from_millis(10)).expect("seeded frame");
+        assert!(first.keyframe);
+        assert_eq!(first.pts_us, 2);
+    }
+
+    #[test]
+    fn feed_publish_fans_out_to_every_subscriber_independently() {
+        let feed = VideoFeed::new();
+        let (a, _) = feed.subscribe("peer-a:1".into(), 2, 3).unwrap();
+        let (b, _) = feed.subscribe("peer-b:2".into(), 2, 3).unwrap();
+        feed.publish(frame(5, true), 1728, 1080);
+        assert_eq!(a.recv(Duration::from_millis(10)).unwrap().pts_us, 5);
+        assert_eq!(b.recv(Duration::from_millis(10)).unwrap().pts_us, 5);
+    }
+
+    #[test]
+    fn feed_snapshot_reports_resolution_and_connected_peers() {
+        let feed = VideoFeed::new();
+        feed.publish(frame(1, true), 1152, 720);
+        let (_a, _) = feed.subscribe("10.0.0.5:4001".into(), 2, 3).unwrap();
+        let (_b, _) = feed.subscribe("10.0.0.9:55000".into(), 2, 3).unwrap();
+        let snap = feed.snapshot();
+        assert_eq!((snap.width, snap.height), (1152, 720));
+        assert_eq!(snap.sessions, vec!["10.0.0.5:4001".to_string(), "10.0.0.9:55000".to_string()]);
+    }
+
+    #[test]
+    fn feed_snapshot_drops_peers_whose_session_ended() {
+        let feed = VideoFeed::new();
+        let (a, _) = feed.subscribe("gone:1".into(), 2, 3).unwrap();
+        drop(a);
+        assert!(feed.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn fps_window_reports_nothing_until_a_full_window_elapses() {
+        let t0 = Instant::now();
+        let mut w = FpsWindow::new(t0);
+        for i in 1..=10u32 {
+            w.tick(t0 + Duration::from_millis(40 * i as u64)); // 25fps cadence, 400ms total
+        }
+        assert_eq!(w.fps, 0.0, "the 2s window hasn't elapsed yet");
+    }
+
+    #[test]
+    fn fps_window_computes_rate_once_the_window_elapses() {
+        let t0 = Instant::now();
+        let mut w = FpsWindow::new(t0);
+        // 25fps cadence (40ms/frame) for 2.0s -> 50 ticks, the 50th lands exactly on the window.
+        for i in 1..=50u32 {
+            w.tick(t0 + Duration::from_millis(40 * i as u64));
+        }
+        assert!((w.fps - 25.0).abs() < 0.5, "expected ~25fps, got {}", w.fps);
     }
 }
