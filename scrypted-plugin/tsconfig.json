@@ -1,0 +1,15 @@
+{
+    "extends": "./node_modules/@scrypted/sdk/tsconfig.plugin.json",
+    "compilerOptions": {
+        "module": "Node16",
+        "lib": ["ES2021", "ESNext"],
+        "types": ["node"],
+        "skipLibCheck": true,
+        "strict": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": false
+    },
+    "include": [
+        "src/**/*"
+    ]
+}
