@@ -55,11 +55,12 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
-use std::os::raw::{c_int, c_long};
+use std::os::raw::{c_int, c_long, c_void};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -509,15 +510,17 @@ fn open_ring_for_write() -> Result<File, SpeakError> {
 }
 
 struct AppendTarget {
-    offset: usize,
     global_seq: u32,
     chan2_seq: u32,
 }
 
-/// Locates the ring's current tail (see module doc, "Writer-side ring synchronization") by
-/// seeding from `tail`'s last snapshot and walking forward over any records the background
-/// poller hasn't observed yet, re-reading fresh bytes at every step rather than trusting a single
-/// stale buffer.
+/// Derives `chan2_seq` -- the per-channel bookkeeping [`publish`] cannot get any other way, since
+/// the vendor's own publish protocol only manages the *global* sequence (`docs/23-audio-codec.md`
+/// §17.10.2) -- by seeding from `tail`'s last snapshot and walking forward over any records the
+/// background poller hasn't observed yet, re-reading fresh bytes at every step rather than
+/// trusting a single stale buffer. `global_seq` is also returned but is now a stale, provisional
+/// value: `publish` overwrites it with the *real* `ring_base->0x18`-derived sequence under the
+/// lock (see `publish`'s own doc comment) before anything is written.
 fn find_append_target(ring_file: &File, tail: &TailCursor) -> Result<AppendTarget, String> {
     let Some((mut pos, mut global_seq, mut chan2_seq)) = tail.snapshot() else {
         return Err("ring poller has not seeded yet".into());
@@ -534,7 +537,7 @@ fn find_append_target(ring_file: &File, tail: &TailCursor) -> Result<AppendTarge
         let mut window = vec![0u8; window_len];
         ring_file.read_exact_at(&mut window, pos as u64).map_err(|e| e.to_string())?;
         match ring::parse_header(&window, 0) {
-            None => return Ok(AppendTarget { offset: pos, global_seq, chan2_seq }),
+            None => return Ok(AppendTarget { global_seq, chan2_seq }),
             Some(h) => {
                 if h.chan == ring::CHAN_AUDIO_OUT {
                     chan2_seq = h.chan_seq;
@@ -572,16 +575,241 @@ fn build_record(target: &AppendTarget, payload: &[u8]) -> Vec<u8> {
     rec
 }
 
-/// Finds the current append target and writes one record there. `Ok(false)` (not an error) means
-/// the record was dropped because it would have straddled the ring's physical wrap seam -- see
-/// `find_append_target` and the module doc; self-healing, same as any other torn write.
+/// Finds the current per-channel bookkeeping state (`find_append_target`'s only remaining job in
+/// this path) and publishes one record there via the vendor's own real protocol ([`publish`]).
+/// `Ok(false)` (not an error) means the record was dropped because it would have straddled the
+/// ring's physical wrap seam -- self-healing, same as any other torn write the ring tolerates.
 fn write_frame(ring_file: &File, tail: &TailCursor, adts_frame: &[u8]) -> Result<bool, String> {
     let target = find_append_target(ring_file, tail)?;
-    if target.offset + ring::HDR + adts_frame.len() > ring::RING_LEN {
+    let mut record = build_record(&target, adts_frame);
+    publish(&mut record)
+}
+
+/// True origin of the ring's cursor-relative addressing (`ring_base + VENDOR_DATA_ORIGIN +
+/// cursor`), confirmed by exact arithmetic rather than new disassembly: `docs/23-audio-codec.md`
+/// §17.2's disassembly-confirmed segment size (`0x800000` exactly) plus this value equals
+/// `ring.rs`'s own live-measured `RING_LEN` (8_389_608) to the byte: `0x800000 + 0x3e8 ==
+/// 8_389_608`. This is *not* the same as `ring::DATA_START` (1024): that value is merely a safe
+/// scan-start seed for the read side's self-resyncing walker (harmless to be 24 bytes off, since
+/// `find_next_header` corrects for it), but is 24 bytes off the vendor's own byte-exact writer
+/// addressing -- `docs/23-audio-codec.md` §17.8 flags this discrepancy explicitly and leaves it
+/// unreconciled for "any future attempt" at touching `ring_base->0x28` directly. This is that
+/// attempt; the arithmetic above is the reconciliation.
+const VENDOR_DATA_ORIGIN: usize = 0x3e8;
+/// Wrap modulus for `ring_base->0x28`'s cursor value (`docs/23-audio-codec.md` §17.2/§17.10.2):
+/// the segment's real 8 MiB data capacity, distinct from `ring::RING_LEN` (the *file's* total
+/// size, registry prefix included).
+const VENDOR_WRAP_MODULUS: u32 = 0x0080_0000;
+
+/// Byte offsets of registry "slot 0" fields, relative to the mmap base (`docs/23-audio-codec.md`
+/// §17.2/§17.10.2) -- the same coordinate system `VENDOR_DATA_ORIGIN` uses.
+const OFF_MUTEX: usize = 0x00;
+const OFF_GLOBAL_SEQ: usize = 0x18;
+const OFF_SECOND_COUNTER: usize = 0x1c;
+const OFF_RUNNING_TOTAL: usize = 0x20;
+const OFF_WRITE_CURSOR: usize = 0x28;
+
+/// How long a publish attempt waits for the vendor's shared ring mutex before giving up.
+/// Deliberately short relative to the vendor's own 1s fallback (`docs/23-audio-codec.md`
+/// §17.10.2 step 2): kibbled has no real-time deadline pressure the way the video/mic encoder
+/// path does, so there is no reason to wait as long, and every extra millisecond here is a
+/// millisecond a wedged or merely slow holder could be masked instead of surfaced as a normal,
+/// retryable [`SpeakError`] (`docs/23-audio-codec.md` §17.11 step 2: "never indefinitely").
+const LOCK_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// A *second*, `PROT_WRITE` mapping of the same shm segment `ring::Ring` maps read-only -- two
+/// mappings of one file are ordinary, coherent POSIX behavior. Opened once and kept for the
+/// process's lifetime (mirrors `ring::Ring`'s own "open at startup, never close" lifecycle), so
+/// there is no per-publish mmap cost or failure mode in the hot path -- only the one-time setup
+/// in [`writable_registry`] can fail.
+struct WritableRegistry {
+    base: *mut u8,
+}
+
+// Stable for the process's lifetime; every access is through the atomic/locked helpers below.
+unsafe impl Send for WritableRegistry {}
+unsafe impl Sync for WritableRegistry {}
+
+impl WritableRegistry {
+    /// A registry "slot 0" field (the mutex, or one of the `u32` counters) as an atomic
+    /// reference, for the plain, non-private futex protocol in [`lock_ring_mutex`]/
+    /// [`unlock_ring_mutex`] and the ordinary atomic loads/stores in [`publish`].
+    fn field(&self, offset: usize) -> &AtomicU32 {
+        unsafe { &*(self.base.add(offset) as *const AtomicU32) }
+    }
+}
+
+fn writable_registry() -> Result<&'static WritableRegistry, SpeakError> {
+    static REGISTRY: LazyLock<Result<WritableRegistry, String>> = LazyLock::new(|| {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(ring::RING_PATH)
+            .map_err(|e| format!("open {} for mmap: {e}", ring::RING_PATH))?;
+        let len = f
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", ring::RING_PATH))?
+            .len() as usize;
+        if len < ring::RING_LEN {
+            // Matches `ring::Ring::open`'s own pre-mmap size check exactly: never map more than
+            // the file actually backs, so an access near the ring's own claimed capacity cannot
+            // fault (SIGBUS) mid-lock -- the one failure mode this design cannot make safe by
+            // construction, so it is refused here up front instead.
+            return Err(format!(
+                "{} is {len} bytes, expected at least {}",
+                ring::RING_PATH,
+                ring::RING_LEN
+            ));
+        }
+        let p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                ring::RING_LEN,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        if p as isize == -1 {
+            return Err(format!("mmap {}: {}", ring::RING_PATH, io::Error::last_os_error()));
+        }
+        Ok(WritableRegistry { base: p as *mut u8 })
+    });
+    REGISTRY.as_ref().map_err(|e| SpeakError::Ring(e.clone()))
+}
+
+/// Bounded-timeout acquire of the vendor's shared, `PTHREAD_PROCESS_SHARED`, non-robust mutex at
+/// `ring_base+0x00` (`docs/23-audio-codec.md` §17.2/§17.10.1): the exact same 3-state (0 = free,
+/// 1 = locked, 2 = locked-with-waiters) futex protocol glibc's own NPTL uses for this mutex kind
+/// on this device (verified directly against glibc 2.25's `nptl`/`sysdeps/nptl` sources -- the
+/// version this device runs -- not from memory). Deliberately **not** musl's own
+/// `pthread_mutex_lock`/`_timedlock`: musl's mutex type/pshared detection reads a `_m_type`-style
+/// field at a musl-specific struct offset that does not correspond to how glibc laid out this
+/// already-initialized mutex, so calling musl's own function on it could silently decide the
+/// mutex is process-*private* and take the private futex path -- no error, just zero actual
+/// cross-process exclusion, which is exactly the corruption risk taking this lock exists to
+/// prevent. Operating directly on the known-correct offset-0 word via raw, always-non-private
+/// `futex(2)` calls (required for a `PTHREAD_PROCESS_SHARED` futex, and independent of either
+/// libc's internal struct layout) sidesteps that ambiguity entirely. Never blocks past `timeout`.
+fn lock_ring_mutex(word: &AtomicU32, timeout: Duration) -> Result<(), SpeakError> {
+    if word.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        return Ok(()); // uncontended fast path
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SpeakError::Ring("ring mutex: timed out waiting for the lock".into()));
+        }
+        if word.swap(2, Ordering::Acquire) == 0 {
+            return Ok(()); // acquired; word now reads 2, which is still correctly "locked"
+        }
+        let ts = Timespec {
+            tv_sec: remaining.as_secs() as c_long,
+            tv_nsec: remaining.subsec_nanos() as c_long,
+        };
+        // Sleep while the word is still 2. A real unlock's FUTEX_WAKE, a spurious wake, or our
+        // own timeout all just fall through to re-check the loop's deadline/CAS above -- this
+        // call's return value is deliberately never inspected.
+        unsafe {
+            syscall(
+                SYS_FUTEX,
+                word.as_ptr() as usize as c_long,
+                FUTEX_WAIT,
+                2,
+                &ts as *const Timespec as usize as c_long,
+                0,
+            );
+        }
+    }
+}
+
+/// Releases the mutex [`lock_ring_mutex`] acquired, waking one waiter iff the word shows any
+/// (mirrors glibc's own `__lll_unlock` exactly: unconditionally clear to `0`, wake only if the
+/// prior value indicated a possible waiter).
+fn unlock_ring_mutex(word: &AtomicU32) {
+    if word.swap(0, Ordering::Release) > 1 {
+        unsafe {
+            syscall(SYS_FUTEX, word.as_ptr() as usize as c_long, FUTEX_WAKE, 1, 0, 0);
+        }
+    }
+}
+
+/// Publishes one already-built record (see [`build_record`]) into the ring using the vendor's own
+/// protocol (`docs/23-audio-codec.md` §17.10.2 steps 4-9, byte-for-byte), so `audio_out_thread`
+/// (and any other real reader) sees it exactly as it would a genuine `media`-internal write.
+/// `record[0..4]` (the seq field [`build_record`] already stamped from a stale, scan-derived
+/// guess) is overwritten with the freshly-bumped *real* global sequence inside the lock; nothing
+/// else about `record`'s bytes changes here.
+///
+/// Steps 1-2 of `docs/23-audio-codec.md` §17.11 (bounds-check, encode, build everything) already
+/// happened in the caller before this is reached. From [`lock_ring_mutex`] succeeding to
+/// [`unlock_ring_mutex`]: no allocation, no logging, no panicking indexing, no `.unwrap()`/
+/// `.expect()`, no syscalls beyond the lock/unlock's own futex calls and the plain memory
+/// reads/writes below -- audited line by line, per the standing instruction.
+///
+/// Deliberately skips `docs/23-audio-codec.md` §17.10.2's step 3 (an advisory-only overflow/reset
+/// check) and step 11 (the notify-semaphore loop): the real writer's own frequent video/mic
+/// traffic already exercises step 3 whenever the threshold is actually reached, so occasional
+/// kibbled writes not *also* performing that reset costs nothing but deferring it to the next
+/// real write (guaranteed within tens of milliseconds); step 11 is real vendor behavior but not
+/// required for `audio_out_thread`'s own poll-based consumption (§17.10.3), and every extra
+/// `sem_open`/`sem_post` inside the lock is one more fallible thing to avoid per step 3 above.
+/// Also skips step 10 (a keyframe-only side effect): this writer's `frame_type` is always `0`
+/// (never `1`, see `build_record`), so that condition can never fire for a record built here.
+fn publish(record: &mut [u8]) -> Result<bool, String> {
+    if record.len() > VENDOR_WRAP_MODULUS as usize {
+        // Mirrors §17.10.2 step 1's own pre-lock bounds check; unreachable for one audio frame
+        // (a few hundred bytes) against an 8 MiB ring, kept as a direct, cheap mirror rather than
+        // assumed away.
+        return Err("record larger than the ring's own capacity".into());
+    }
+    let reg = writable_registry().map_err(|e| e.to_string())?;
+    let mutex = reg.field(OFF_MUTEX);
+    lock_ring_mutex(mutex, LOCK_TIMEOUT).map_err(|e| e.to_string())?;
+
+    // ----- locked section: audited, see the doc comment above -----
+    let global_seq = reg.field(OFF_GLOBAL_SEQ);
+    let running_total = reg.field(OFF_RUNNING_TOTAL);
+    let write_cursor = reg.field(OFF_WRITE_CURSOR);
+
+    let cursor = write_cursor.load(Ordering::Relaxed);
+    let advance = record.len() as u32;
+    if u64::from(cursor) + u64::from(advance) > u64::from(VENDOR_WRAP_MODULUS) {
+        // Would straddle the ring's physical wrap seam -- same conservative policy this writer
+        // has always used (module doc, "Writer-side ring synchronization"): the vendor's own
+        // wrap-splitting write is not something this project can safely replicate (unconfirmed
+        // reader handling), so skip cleanly with zero side effects rather than guess at it.
+        unlock_ring_mutex(mutex);
         return Ok(false);
     }
-    let record = build_record(&target, adts_frame);
-    ring_file.write_all_at(&record, target.offset as u64).map_err(|e| e.to_string())?;
+
+    // Step 4: bump the global counter first, and stamp the value it becomes into the record.
+    let new_seq = global_seq.load(Ordering::Relaxed).wrapping_add(1);
+    global_seq.store(new_seq, Ordering::Relaxed);
+    record[0..4].copy_from_slice(&new_seq.to_le_bytes());
+
+    // Step 5: bootstrap edge case, replicated exactly though never observed live on a ring
+    // that's been under continuous video/mic traffic (running_total reads 0 only immediately
+    // after a fresh ring init or a step-3 reset, neither of which this session ever triggers).
+    if running_total.load(Ordering::Relaxed) == 0 {
+        reg.field(OFF_SECOND_COUNTER).store(new_seq, Ordering::Relaxed);
+    }
+
+    // Steps 6-8: header+payload as one contiguous copy (already assembled into one buffer by
+    // build_record) at the real vendor address -- equivalent to the vendor's own two separate
+    // writes, since both happen under the same held lock either way and no reader can observe a
+    // difference (§17.10.3: readers hold this same mutex across their own header+payload read).
+    let dest = unsafe { reg.base.add(VENDOR_DATA_ORIGIN + cursor as usize) };
+    unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), dest, record.len()) };
+    write_cursor.store(cursor.wrapping_add(advance) % VENDOR_WRAP_MODULUS, Ordering::Relaxed);
+
+    // Step 9: monotonic running total, deliberately never wrapped (matches the vendor exactly).
+    running_total.store(running_total.load(Ordering::Relaxed).wrapping_add(advance), Ordering::Relaxed);
+
+    unlock_ring_mutex(mutex);
+    // ----- end locked section -----
     Ok(true)
 }
 
@@ -593,7 +821,22 @@ struct Timespec {
 
 extern "C" {
     fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
+    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+    fn syscall(number: c_long, a1: c_long, a2: c_long, a3: c_long, a4: c_long, a5: c_long) -> c_long;
 }
+
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_SHARED: c_int = 1;
+/// ARM EABI syscall number for `futex` (`docs/23-audio-codec.md`: this device is armv7l) --
+/// verified directly against the kernel's own `arch/arm/tools/syscall.tbl` (`240 common futex`),
+/// not assumed from another architecture.
+const SYS_FUTEX: c_long = 240;
+const FUTEX_WAIT: c_long = 0;
+/// Deliberately never OR'd with `FUTEX_PRIVATE_FLAG` (128) anywhere in this file: this word is
+/// `PTHREAD_PROCESS_SHARED`, and using the private futex variant on a shared mutex would silently
+/// stop cross-process wakeups from working, with no error to indicate it.
+const FUTEX_WAKE: c_long = 1;
 
 const CLOCK_MONOTONIC: c_int = 1;
 
@@ -665,7 +908,7 @@ mod tests {
 
     #[test]
     fn build_record_places_every_field_at_its_confirmed_offset() {
-        let target = AppendTarget { offset: 0, global_seq: 41, chan2_seq: 9 };
+        let target = AppendTarget { global_seq: 41, chan2_seq: 9 };
         let payload = vec![0xAAu8; 20];
         let rec = build_record(&target, &payload);
         assert_eq!(rec.len(), ring::HDR + payload.len());
@@ -685,7 +928,7 @@ mod tests {
     fn a_record_built_by_build_record_parses_back_via_ring_parse_header() {
         // End-to-end sanity: whatever this module writes must be exactly what ring.rs's own
         // reader (and by extension every real reader using the same protocol) accepts.
-        let target = AppendTarget { offset: 0, global_seq: 5, chan2_seq: 0 };
+        let target = AppendTarget { global_seq: 5, chan2_seq: 0 };
         let payload = vec![0x12u8; 100];
         let rec = build_record(&target, &payload);
         let mut buf = vec![0u8; ring::DATA_START];
