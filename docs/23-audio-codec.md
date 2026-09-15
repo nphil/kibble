@@ -915,3 +915,63 @@ running) the same mutex-protected registry reads every other consumer already pe
 concurrently. **It will not, by itself, produce audible output against the current writer** --
 that gap is §17.3's, not this one's -- so the live test in §17.8/§17.9 is scoped to proving the
 thread-lifecycle mechanics and gathering real `SndFrm` numbers, not to claiming sound.
+
+## 17.8 Correction, prompted by Main's review: §17.3/§17.7's "will not produce sound" claim was overreaching
+
+Main caught a real gap before any message was sent: video/mic writers bump `ring_base->0x18`
+50-70 times/sec, so if `audio_out_thread` were alive during AudioAnnounce's 26/26 write test, the
+gate (`ring_base->0x18 >= slot->0x14`) should have passed within ~20ms of every single write --
+`SndFrm` staying at 0 across 26 writes is not what §17.3's gate model alone predicts. Re-checked
+against every prior session's own yield: **`speak_start` has never been sent, by anyone, in any
+prior test** (AudioAnnounce's own yield: "no bus message sent to media... none was sent";
+AudioFinish/AudioBuild never mention it either). **`audio_out_thread` was simply never running
+during any of the writer tests.** That alone fully explains every negative result to date, with no
+need to invoke the gate at all -- §17.3's gate mechanics are real (directly disassembled, not
+retracted) but were not the operative cause of anything observed so far, and §17.3/§17.7's framing
+overstated how confidently "will not produce sound" could be predicted for a test that, for the
+first time, actually spawns the thread.
+
+Re-examined the channel-selection step (`0x32ea2`-`0x32eaa`) that was left an open question in
+§17.3.1, since it bears directly on whether the currently-implemented writer has any chance of
+being picked up. Resolved **[HIGH]**: `audio_out_thread` makes a *second* setup call right after
+opening its slot (`0x3078e bl 0x32930`, second argument `2`, i.e. the same "chan=2" convention
+`docs/23-audio-codec.md` uses throughout) which does exactly one thing --
+`slot->0x12 = 2` (`0x3294a`). The per-record filter is a bitwise bitmask test:
+`tst record_header[0x22:0x24], slot->0x12` -- nonzero means "process", zero means "skip, just
+advance the bookmark past it". `record_header+0x22` is the exact halfword `audioout.rs`'s
+`build_record` writes `rec[34] = ring::CHAN_AUDIO_OUT` into (low byte only; the high byte, offset
+35, is left `0` by the zero-initialized buffer) -- if `CHAN_AUDIO_OUT == 2` (matching every other
+chan=2 reference in this project), kibbled's existing, unmodified record format already satisfies
+this bitmask **with zero code changes needed on the filter side**.
+
+Traced the "process" branch (`0x32ed0`-`0x32fa4`) to its end: resizes the slot's scratch buffer
+(`+0x1c`/`+0x20`) if needed, does a bookmark/gap check (`slot->0x14 + 1 == record.seq`, logging if
+not), then **copies the payload (header skipped, `+0x38`) into the scratch buffer via the same
+`read_ring_bytes` helper, writes the buffer pointer into the caller's output parameter, advances
+`slot->0x18` past the whole record, and returns success** -- the outer function then builds the
+`AX_ADEC_SendStream` struct from exactly this pointer (§17.1). This is a complete, coherent,
+plausible-to-work path from "kibbled writes a `chan=2` record" through to `AX_AO_SendFrame`,
+**given the thread is alive and its walk actually reaches that record**.
+
+**What remains genuinely unresolved, and cannot be resolved further by static analysis**: both
+`slot->0x14` and `slot->0x18` are seeded once, at thread-open, from `ring_base->0x18`/`0x28`
+respectively (§17.1). This session found no code anywhere that writes `ring_base->0x28` after its
+one-time zero-init at segment creation (a 19-reference full-binary scan of every `ring_base` use
+turned up nothing) -- if nothing else updates it either, every thread-open seeds the byte cursor
+to `0` (the very start of the ring's data region), which, on a ring that has been wrapping
+continuously for a long uptime, is stale/arbitrary relative to current content, not "the oldest
+unread record" in any meaningful sense. Whether the walk from there behaves sanely (skips through
+real, well-formed records until it catches up) or reads a few torn/garbled records first (which
+the ring's readers are documented elsewhere to tolerate and resync from, but not verified for
+*this specific* consumer's gap-handling path) is exactly the kind of question a live, health-gated
+test answers and static analysis cannot. **Going into the live test genuinely uncertain, not
+expecting zero, per Main's instruction.**
+
+**Also noted, not yet reconciled**: `read_ring_bytes`'s constant (`0x3e8` = 1000, disassembly-
+confirmed byte-exact) is 24 bytes below `ring.rs`'s own `DATA_START` (1024, established
+separately by live byte-density analysis of the real file). Not load-bearing for the approved
+test (which does not write `slot->0x14`/`0x18`), but matters for any future attempt at §17.3.1:
+`slot->0x18`'s coordinate origin is `ring_base+1000` in `media`'s own addressing, not
+`ring_base+1024`/`DATA_START`, so a naive `target.offset - DATA_START` translation would be
+off by 24 bytes. Not re-derived further this session (would need either tracing the real
+video/mic writer's own append path or a live comparison against `ring.rs`'s own scanner).
