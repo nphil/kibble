@@ -57,9 +57,22 @@ polls at a few-second cadence; a framework would cost more RAM than the whole ag
 
 ## Read path
 
-`config_shm` is mapped read-only. Reads are plain loads. We never write it: the vendor guards it
-with `flock(/tmp/config.lock)` and caches values in-process, so a poked byte would be both racy
-and ignored. Settings change by sending the owning process the same message `ctrl` would.
+`config_shm` is mapped read-only for `/state` reads. Reads are plain loads.
+
+## Settings write path (v0.2)
+
+Settings are the one place `kibbled` *does* write `config_shm` — under
+`flock(/tmp/config.lock, LOCK_EX)`, exactly the discipline the vendor's own `config_save()` uses
+(`docs/15-settings-write.md` §4), for the ~40 keys `docs/15-settings-write.md` §3 mapped to exact
+offsets. It does **not** persist through the vendor's own `/opt/user.conf`: that file's content is
+confirmed AES-encrypted with a key this repo never recovered (`docs/21-config-encryption.md`), so
+hand-writing it would risk silently corrupting every other setting and credential in the file.
+Instead `kibbled` keeps its own plaintext desired-state record (`agent/src/desired.rs`,
+`/opt/kibble/settings.json`) and a background thread re-applies it — once at startup, gated on
+`config_shm`'s own `loaded` flag, and continuously afterward — so a value the vendor path or the
+(still-enabled) Petkit cloud sync reverts is corrected rather than silently lost. See
+`agent/src/persist.rs` for the implementation and the project report for live durability
+measurements.
 
 ## Watchdog
 
@@ -68,16 +81,22 @@ The stock watchdog checks five one-byte liveness toggles in `config_shm` (`ble`,
 toggles. When it later replaces `ctrl`/`cloud`/`agora`, it flips their three bytes every 2 s and
 the watchdog is none the wiser.
 
-## API (v0.1)
+## API (v0.2)
 
 ```
 GET  /state              {"serial","firmware","ble_firmware","volume","desiccant_days",
                           "feeding","bowl_fill":[h1|null,h2|null],"event_counter"}
-POST /feed               {"hopper":1|2|"both","amount":1..20,"id":"optional"}
+GET  /config              every mapped setting's current value, flat {"key": value, ...}
+POST /config              {"key": "volume", "value": 5} — verified-writable keys only, others 400
+POST /feed                {"hopper":1|2|"both","amount":1..20,"id":"optional"}
 POST /feed/cancel
 ```
 
 `bowl_fill` reads `null` while the vendor has the value invalidated mid-feed (`0xffffffff`).
+`GET /state`'s own `"volume"` field predates the settings study and reads a different, unconfirmed
+offset (4664) than the settings table's disassembly-proven one (3752, `docs/15-settings-write.md`
+§3) — left as-is since fixing it is outside the settings feature's scope, but `GET /config`'s
+`"volume"` is the value to trust.
 
 ## Persistence (designed, not yet installed)
 
@@ -113,7 +132,12 @@ Safety properties, in order of importance:
 ## Not yet
 
 * schedule read/write (MCU-owned; `0x101a` reads it, write path still to recover)
-* settings (~45 keys; msg ids to recover per key)
+* settings: read/write implemented for the ~37 keys `docs/15-settings-write.md` §3 resolved to an
+  exact offset (4 keys' writes independently verified live — see the project report; the rest ship
+  read-only). Still missing: the multi-range arrays' full stride/count beyond entry 0
+  (`lightMultiRange`/`toneMultiRange`/`detectMultiRange`), `foodWarnRange` (base offset never
+  pinned), and the sensitivity settings' derived-threshold-triple writes (`moveSensitivity` et al.
+  write their own raw field but not the mapped triple `ctrl` also computes, so they ship read-only)
 * events with images (attach as a reader of `media_buffer_frame_buf`)
 * ONVIF + RTSP with G.711 backchannel for Scrypted (see scrypted-onboarding.md)
 * BLE fallback (handle `0x100a` payloads once `kibbled` replaces `ctrl`)

@@ -2,6 +2,9 @@
 //!
 //! What it does today:
 //!   GET    /state                   live telemetry from the shared config
+//!   GET    /config                  current value of every device setting this study has mapped
+//!   POST   /config                  {"key": "volume", "value": 5}  change one setting, verified
+//!                                   subset only
 //!   POST   /feed                    {"hopper": 1|2|"both", "amount": N, "id": "..."}  dispense
 //!   POST   /feed/cancel             stop a dispense in progress
 //!   GET    /schedule                kibbled's cached copy of the feed schedule (the MCU has no
@@ -13,15 +16,22 @@
 //!   POST   /schedule/entry/enabled  {"id": "...", "enabled": bool}  enable/disable one entry
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
-//! flash outside `/opt/kibble`. It sits beside the stock firmware and speaks its internal bus.
+//! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
+//! `/opt/kibble`. It sits beside the stock firmware, speaks its internal bus, and keeps its own
+//! settings record in `/opt/kibble/` — see `persist.rs` and `docs/21-config-encryption.md`.
 
 mod bus;
+mod desired;
 mod http;
+mod md5;
+mod persist;
 mod schedule;
+mod settings;
 mod state;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bus::{msg, FeedCtrl, Peer, Sender};
@@ -40,6 +50,9 @@ fn main() {
     let bind = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_BIND.to_string());
 
     let shm = Shm::open().unwrap_or_else(|e| die(&format!("open {}: {e}", state::SHM_PATH)));
+    // Shared, not leaked: the request-handling closure below borrows it for the life of the
+    // (never-returning) `http::serve` call, and the reconciler owns its own clone of the `Arc`.
+    let shm = Arc::new(shm);
     let ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
     let mut schedule = Schedule::load(PathBuf::from(schedule::CACHE_PATH))
@@ -47,6 +60,7 @@ fn main() {
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
     eprintln!("kibbled: listening on {bind}");
 
+    persist::spawn_reconciler(Arc::clone(&shm));
     let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule));
 }
 
@@ -59,6 +73,8 @@ fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule) -> Res
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
         ("GET", "/state") => Response::Json(shm.snapshot().to_json()),
+        ("GET", "/config") => Response::Json(settings::to_json(shm)),
+        ("POST", "/config") => config_write(req),
         ("POST", "/feed") => feed(req, ble),
         ("POST", "/feed/cancel") => send_feed(
             ble,
@@ -75,6 +91,32 @@ fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule) -> Res
         ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble),
         ("POST", "/schedule/entry/enabled") => post_schedule_entry_enabled(req, schedule, ble),
         _ => Response::NotFound,
+    }
+}
+
+fn config_write(req: &Request) -> Response {
+    let key = match json_field(&req.body, "key") {
+        Some(k) if !k.is_empty() => k,
+        _ => return Response::BadRequest(r#""key" is required"#.into()),
+    };
+    let value: u32 = match json_field(&req.body, "value").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return Response::BadRequest(r#""value" must be a non-negative integer"#.into()),
+    };
+    match persist::write_setting(key, value) {
+        Ok(outcome) => Response::Json(format!(
+            r#"{{"ok":true,"key":"{}","value":{},"notified":{}}}"#,
+            outcome.setting.key,
+            value,
+            match outcome.notified {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "null",
+            }
+        )),
+        Err(persist::WriteError::UnknownKey) => Response::NotFound,
+        Err(e @ persist::WriteError::Io(_)) => Response::Error(e.to_string()),
+        Err(e) => Response::BadRequest(e.to_string()),
     }
 }
 

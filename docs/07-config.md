@@ -96,6 +96,14 @@ buffers) — no field-count vs. struct-size contradiction.
   also purely live (re-initialized to 0 each boot) or partially checkpointed to a file was not
   confirmed.
 
+**Update 2026-09-15, live-confirmed (`21-config-encryption.md`):** the AES-256 imports noted
+above are not merely present but in active use — `/opt/user.conf`'s content (everything after its
+32-byte MD5-hex header) measures 7.915/8.0 bits/byte of Shannon entropy against a live pull and
+has zero byte-level correspondence to `config_shm` at any offset, confirming it is encrypted, not
+a plaintext copy of the `usr.*` section this document infers it persists. The key/IV (Open
+Question 5, §8 below) remain unrecovered; see `21-config-encryption.md` for the full measurement
+and its consequence for anyone implementing settings persistence.
+
 ## 4. `flock(/tmp/config.lock)` usage
 
 - All four binaries import `flock` and reference the literal path `/tmp/config.lock` in `.rodata`.
@@ -213,7 +221,11 @@ scanning than a 4-byte one). **This is the single biggest open item** — see Op
 6. **dev.conf/user.conf ↔ struct-section mapping** (§3) is a naming-convention inference, not
    confirmed by disassembling the actual serialization routine (their AES-256 encryption meant even
    locating a plaintext boundary in the persisted files, which weren't part of this dump anyway, was
-   out of scope).
+   out of scope). **Update 2026-09-15:** `21-config-encryption.md` confirms live that there is no
+   plaintext boundary to locate — `user.conf`'s content is genuinely encrypted end to end (7.915/8.0
+   bits/byte entropy, zero correspondence to any `config_shm` offset), not partially plaintext. The
+   section-mapping question is now moot for any settings-persistence use case; it would only still
+   matter to someone pursuing the AES key itself.
 
 ## 9. Local cleanup
 

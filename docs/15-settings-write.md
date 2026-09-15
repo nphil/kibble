@@ -329,6 +329,17 @@ project-wide, not a one-off.
   on `ctrl`'s own next unrelated `config_save()` call (which would overwrite it back from its still-stale
   in-memory copy the moment it next saves for an unrelated reason) — this option is a dead end unless Kibble
   also reimplements persistence per the paragraph above.
+- **Update 2026-09-15, live-confirmed (`21-config-encryption.md`):** option (a) above is now known
+  to be blocked, not just AES-key-shaped speculation — a live pull of `/opt/user.conf` measures its
+  content at 7.915/8.0 bits/byte Shannon entropy with zero byte-level correspondence to `config_shm`
+  at any offset (checked down to 4-byte windows for values already confirmed correct, e.g. `volume`'s
+  live value of 6 matching this document's own §3 cited ground truth). Option (b)'s local entry point
+  remains unconfirmed-reachable (§5.3) and was not pursued either, given the risk of malformed input
+  reaching a live vendor process. **Kibble's actual answer is neither (a) nor (b):** write
+  `config_shm` directly (this paragraph's own finding that the value takes effect immediately still
+  holds) plus keep Kibble's own plaintext desired-state record (`agent/src/desired.rs`,
+  `/opt/kibble/settings.json`) and a reconciler that continuously re-applies it, so a value that
+  reverts is corrected rather than lost — see `21-config-encryption.md` §5 and `agent/src/persist.rs`.
 
 ---
 
@@ -422,7 +433,11 @@ schedule-set outbound msg_id if it's a `ctrl→ble` send analogous to `0x6004`/`
 5. **AES key/IV for `/opt/user.conf`/`/opt/dev.conf`** — needed only if Kibble chooses option (a) in §4.1
    (reimplement persistence itself rather than keeping `ctrl` alive). `STUDY-config.md` §3 already flags this
    as open; this pass did not attempt it (would need to trace `AES_set_encrypt_key`'s key-material argument
-   back to its source, at minimum 0x81e98 and whatever calls it).
+   back to its source, at minimum 0x81e98 and whatever calls it). **Update 2026-09-15:** Kibble did not end
+   up needing this — `21-config-encryption.md` confirms the content really is encrypted (closing the "MEDIUM
+   confidence" hedge this document's own §4 step 6 left open) and Kibble's settings feature ships against
+   its own `/opt/kibble/settings.json` desired-state store instead of the vendor's encrypted file. This item
+   stays open only for a future feature that genuinely needs to write through the vendor's own persistence.
 6. **`web_property_set_recv_parse`'s actual reachability** (§5.3) — is there a live-listening local HTTP
    server outside of initial-WiFi-setup mode? This would change the answer to "must Kibble keep cloud
    connectivity, or just `ctrl` itself, alive for settings writes" and deserves a follow-up pass in `ctrl`'s
