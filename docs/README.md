@@ -51,6 +51,7 @@ be recovered, that is stated rather than guessed — read those gaps as gaps.
 - [design-agent.md](design-agent.md) — `kibbled`'s design and budget
 - [scrypted-onboarding.md](scrypted-onboarding.md) — what the camera must implement for Scrypted + HomeKit
 - [20-two-way-audio.md](20-two-way-audio.md) — how HA does camera two-way audio, and what the agent must implement
+- [22-rebroadcast-two-way.md](22-rebroadcast-two-way.md) — Scrypted's rebroadcast is one-way (cited); the split video/talkback design
 
 **Appendices** — [inventory](appendix-inventory.md), [prior art](appendix-prior-art.md),
 [Localkit's cloud protocol](appendix-localkit.md), [NPU research](appendix-npu-research.md),
