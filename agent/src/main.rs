@@ -4,12 +4,16 @@
 //!   GET  /state          live telemetry from the shared config
 //!   POST /feed           {"hopper": 1|2|"both", "amount": N, "id": "..."}  dispense
 //!   POST /feed/cancel    stop a dispense in progress
+//!   RTSP :8554/<path>    live H.264 video (ring's "sub" channel, 1152x720@25fps), zero re-encode
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
-//! flash. It sits beside the stock firmware and speaks its internal bus.
+//! flash. It sits beside the stock firmware and speaks its internal bus (and, for video, its
+//! shared-memory frame ring).
 
 mod bus;
 mod http;
+mod ring;
+mod rtsp;
 mod state;
 
 use std::net::TcpListener;
@@ -17,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bus::{msg, FeedCtrl, Peer, Sender};
 use http::{json_field, Request, Response};
+use ring::VideoFeed;
 use state::Shm;
 
 /// `src` we stamp on bus messages. Stock `ctrl` is 1; replies to our feed land in its queue,
@@ -25,6 +30,7 @@ use state::Shm;
 const SRC_AS_CTRL: u16 = Peer::Ctrl as u16;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8765";
+const RTSP_BIND: &str = "0.0.0.0:8554";
 
 fn main() {
     let bind = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_BIND.to_string());
@@ -33,7 +39,14 @@ fn main() {
     let ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
-    eprintln!("kibbled: listening on {bind}");
+
+    let feed = VideoFeed::new();
+    let _poller = ring::spawn(feed.clone()).unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
+    let rtsp_listener =
+        TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
+    let _rtsp = rtsp::spawn(rtsp_listener, feed);
+
+    eprintln!("kibbled: listening on {bind}, rtsp on {RTSP_BIND} (chan {})", ring::CHAN_SUB);
 
     let _ = http::serve(listener, |req| route(req, &shm, &ble));
 }
