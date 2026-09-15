@@ -647,3 +647,271 @@ of the encoder, on-device execution of the encoder, live RTSP ffprobe/ffmpeg dec
 track, and live telnet read-back of writer output). The one gap -- real audible playback through
 the vendor's speaker -- is narrowed to a single, precisely-located, unrecovered detail: how a
 writer announces new data via registry slot 7, which this session chose not to guess at live.
+
+---
+
+# `audio_out_thread` fully disassembled: root cause of "`SndFrm` never moves" identified
+
+Author: AudioStart (successor to AudioAnnounce). Method: static disassembly only, same
+capstone+pyelftools pipeline as prior sessions, against `/app/bin/media` pulled by AudioCodec's
+session (`/tmp/kibble_audio/media`, 348,116 B) -- re-verified byte-identical to the live device's
+copy this session (`md5sum` over telnet, one short read-only command, matches exactly:
+`f9e74f321a2bb7693f495598d816386a`). Zero writes to the device this session until the very end
+(§17.8, gated on Main's approval). Every claim below is a directly-disassembled, address-cited
+fact unless tagged `[INFERENCE]`.
+
+**Correction to the prior session's PLT-resolution method**: the ARM PLT in this binary does
+*not* use a uniform 12-byte stub stride (the assumption both this session initially made and the
+prior AudioAnnounce/AudioCodec sessions implicitly relied on for early-table symbols only) --
+stub sizes vary starting around index 21. Re-derived correctly this session by disassembling the
+*entire* `.plt` section and symbolically simulating each stub's `ADD/ADD/LDR` register chain
+per-stub (not by fixed offset math), then pairing the resulting 257 stub addresses 1:1 with
+`.rel.plt`'s 257 relocations **in file order** (guaranteed by the ARM ABI, and independently
+confirmed three ways: `aacEncOpen`'s call site still resolves to the documented `0x15740`;
+`mq_receive` now has **exactly one** call site, at `0x3319c`, inside the documented
+`dispatch_mqueue_read` range `0x33171`-`0x33389`; `AX_AO_SendFrame` now has **exactly three** call
+sites, at `0x305f0`/`0x30e00`/`0x30f84`, matching §6's independently-documented count and range
+precisely) **[HIGH]**. The mis-resolution this fixed had briefly (mid-session, caught before being
+relied on) mislabeled `AX_SYS_LogPrint` as `AX_ISP_Create` for one stub -- flagging in case any
+earlier session's notes used raw PLT addresses instead of symbol names from a similar table.
+
+## 17.1 `0x30764` is `audio_out_thread` -- confirmed, not inferred
+
+Independently re-derived media's full 27-entry `msg_id -> handler` table from scratch (same
+method `docs/24-onboard-ai.md` proved: walk the registrar's `bl register()` call sites, backward-
+resolve each one's `r0`=msg_id immediate and `r1`=handler address via its GOT-indirect literal
+load) rather than trusting the prior session's remembered addresses. Result matches on every
+count (27/27) but lands on **different, more precise handler addresses** than the prior summary
+(e.g. `0xa`'s real handler is `0x31750`, not directly `0x30765` -- the prior summary's own
+"10-byte trampoline" description was correct, just imprecise on the intermediate address).
+
+- `msg_id 0xa` (`speak_start`) registers a 10-byte trampoline at `0x31b20`
+  (`push {r3,lr}; bl 0x31750; movs r0,#0; pop {r3,pc}`) **[HIGH]**.
+- `0x31750` (the real handler): loads a guard flag from a fixed global, **byte-resolved this
+  session as `0x767f0`**; if already `1`, returns `-1` immediately via one of two paths (one with
+  an `AX_SYS_LogPrint` call gated on a *different* global, `0x76b5c`) without touching the thread
+  or the flag -- **idempotent, confirmed by full disassembly of both return paths, not assumed**
+  **[HIGH]**. If not already started: sets the flag to `1`, then calls
+  `pthread_create(thread=&0x76ca8, attr=NULL, start=0x30765, arg=NULL)` at `0x317de` -- every one
+  of these four argument values independently re-derived from raw instruction bytes (GOT-indirect
+  literal resolution, not pattern-matching), and every one matches the prior session's memory
+  exactly **[HIGH]**.
+- `0x30765`/`0x30764` (thumb-bit-adjusted): confirmed this is the *only* `pthread_create` start
+  routine reachable from `speak_start`, a single ~2KB function (`push.w {r4-fp,lr}` at `0x30764`
+  through its return paths in the `0x30940`-`0x31254` range) that:
+  - Calls `pthread_self` + `pthread_detach` immediately (self-detaching, matches a fire-and-forget
+    worker thread) **[HIGH]**.
+  - Opens the ring's registry slot **by name** -- literally passes the C string `"auido-out"`
+    (byte-read from `.rodata` at `0x4ddd3`, exact match to the vendor's own typo already
+    documented in §6.1/§13.1) to a generic `open_or_create_named_slot(name, seed_from_global)`
+    helper at `0x32894` **[HIGH]**. This is new and matters: **the slot is found by string match
+    at runtime, not addressed by a hardcoded index anywhere in this thread's code.** "Slot 7" /
+    absolute offset `0x134` is this *specific device's current* array position for that name
+    (array position 7 because `7 * 44 = 0x134` exactly, confirmed against the registry geometry
+    below), stable only because `media`'s own startup registers things in the same fixed order
+    every boot -- not a protocol constant.
+  - Calls the same helper for a second, differently-parameterized open, then polls in a loop
+    (§17.3) that ultimately calls `AX_ADEC_SendStream` (`0x309b4`, `0x30bb0`) ->
+    `AX_ADEC_GetFrame` (`0x30d98`, `0x30f26`) -> **`AX_AO_SendFrame`** (`0x30e00`, `0x30f84`),
+    the decoder's own output buffer passed straight through to the speaker call unmodified in
+    both cases (`r2`/`sl` identical across the `GetFrame`/`SendFrame` pair) -- i.e. this thread
+    really does decode AAC and play PCM, using the exact same hardware primitives §6 already
+    call-graph-confirmed for the canned-prompt path, but as its *own*, separate function (not
+    shared code with `dispatch_handler_play_aac_file`, which sits just before it at `0x30400`-
+    `0x30764` and has its own, separate `SendStream`/`GetFrame`/`SendFrame` call sites) **[HIGH]**.
+
+## 17.2 Registry geometry, fully resolved
+
+The mmap+init code for `media_buffer_frame_buf` (`0x321f6`/`0x32318`, retry-on-failure pair;
+success path continues at `0x32274`) disassembles cleanly and resolves every open question
+`docs/11-media.md §4` and `docs/19-frame-ring.md §1` flagged **[HIGH, every value below is a
+directly-disassembled immediate or literal, not inferred]**:
+
+- The segment is **exactly `0x800000` (8 MiB)**, confirmed independently by both the `ftruncate`
+  size at segment-creation and a hard `cmp.w r4,#0x800000` bounds check in the ring-byte-read
+  helper (§17.3).
+- **Byte 0 of the segment is a real `pthread_mutex_t`** (24 bytes, offset `0x00`-`0x17`),
+  initialized at creation with `pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)`
+  before `pthread_mutex_init` -- a genuine **cross-process** shared mutex, not a private
+  in-process one, not a semaphore. This is what `audio_out_thread` takes (`pthread_mutex_trylock`
+  first, falling back to a 1-second `pthread_mutex_timedlock`, both in a small helper at
+  `0x31d58`) before reading *any* registry or sequence state.
+- Immediately following the mutex, still within this same 44-byte "slot 0": `+0x18` = the ring's
+  global sequence counter (upgrades `docs/11-media.md`'s prior **[HIGH]** live-correlation finding
+  to a from-source confirmation: zeroed at creation, read/compared throughout `audio_out_thread`).
+  `+0x1c` = a second counter, also zeroed at creation, also read as a gate value (§17.3) --
+  `docs/23-audio-codec.md §13.1`'s "second, related count" is confirmed real, just not yet named.
+  `+0x24`/`+0x28` = a *third* pair, also zeroed at creation; `+0x28`'s role is pinned down below.
+- **Slots 1-19 follow at a uniform 44-byte stride from the same base** (confirmed two independent
+  ways: the `open_or_create_named_slot` linear scan loop at `0x328c0`-`0x3290e`, bounds
+  `ring_base+0x2c` through `ring_base+0x39c`; and a *separate* function's all-slots scan loop at
+  `0x32700`-`0x32728`, `mla r2,r6(=0x2c),r3,r0` against the identical base, bound `0x14`=20). So
+  "slot 7" = `ring_base + 7*44 = ring_base + 0x134` **exactly**, matching `docs/11-media.md`'s
+  live-observed absolute offset -- self-consistently, from an entirely different derivation.
+
+### 17.2.1 Every trailing field of the live-captured "auido-out" slot now matches source, byte-for-byte
+
+`docs/23-audio-codec.md §13.1` captured slot 7 live as (slot-relative offsets):
+`+0x00` name, `+0x10` = `06 00 02 00`, `+0x14` = `0x000ba97d`, `+0x18` = `0x0001f7e1`,
+`+0x1c` = `0x00000400`, `+0x20` = `0xadc4a2b0`, `+0x24` = `0x00000001`, `+0x28` = `0x00000000`.
+`open_or_create_named_slot`'s claim-a-slot path (`0x328c6`-`0x32908`) writes, in order:
+`strncpy(slot, name, 15)`; `slot->0x24 = 1` (refcount/in-use); `slot->0x1c = 0x400` (**a fixed
+1024-byte constant**, not a counter); `slot->0x20 = malloc(0x400)` (a scratch decode buffer,
+explaining the plausible-heap-pointer-looking value); `slot->0x12 = 0`; `slot->0x14 = 0` and
+`slot->0x18 = 0`, **then conditionally overwritten** (the second, `seed_from_global=1` open
+kibbled's target thread makes) with `slot->0x14 = ring_base->0x18` (current global seq) and
+`slot->0x18 = ring_base->0x28` (the third counter). Four of these six fields are exact,
+non-coincidental byte matches to the live capture (`0x1c`=1024, `0x24`=1, `0x28`=0, and `0x10`
+structurally = idx/gen written by the same claim path); the other two (`0x14`, `0x20`) are
+point-in-time values that necessarily differ between the source-derivation and the live capture
+(a monotonically-changing seq snapshot and a heap address respectively) but match in *kind*
+exactly as predicted. This is about as strong a static/live cross-check as this project's method
+can produce, and it retroactively explains why AudioAnnounce's own announce-write test saw
+`slot7+0x14` track their writes' seq values 292/292 -- **that field is simply whatever the last
+writer (real or ours) put there; nothing downstream ever reads it back** (§17.3).
+
+## 17.3 Root cause: consumption is gated on the *global* sequence counter, which `kibbled` never touches
+
+This is the section the assignment asked for directly. `audio_out_thread`'s poll body (`0x32d1c`,
+called in a loop from the outer function) does, in order, every step directly disassembled:
+
+1. Take the shared mutex (`0x31d58`, above).
+2. Compare `ring_base->0x1c` against the slot's own `+0x14` (a secondary, less-strict gate; only
+   emits a "falling behind" log if failed, does not block).
+3. **The real gate**: `ldr r1,[slot,#0x14]; ldr r0,[ring_base,#0x18]; cmp r0,r1; bge consume` --
+   i.e. *consume iff `ring_base->0x18 (global seq) >= slot->0x14 (this consumer's bookmark)`*.
+4. On consume: read one 56-byte record header via a byte-exact-confirmed `read_ring_bytes(dest,
+   offset, len)` helper at `0x31cdc` (`src = ring_base + 0x3e8 + offset`, wraps modulo `0x800000`,
+   tail-calls `memcpy` -- **`offset` is a real, byte-proven ring offset here**, resolving the
+   assignment's open question about the `0x18` field's meaning: it *is* used as a ring byte
+   offset, but that use is **`slot->0x18` acting as `audio_out_thread`'s own self-advancing read
+   cursor** (`new_offset = (old_offset + 56 + header.payload_len) mod 0x800000`, computed at
+   `0x32eb2`-`0x32ebc` from the just-read record's own `+4` length field -- byte-exact match to
+   `audioout.rs`'s own `build_record`, which also places payload length at header offset 4), **not
+   a value a writer announces**. It starts from whatever `ring_base->0x28` held at thread-open
+   time and then walks forward under the consumer's own control; nothing about it invites a
+   writer to "point" the thread at a specific record.
+5. After each record, `slot->0x14 += 1` and the loop re-checks step 3 against the (possibly
+   advanced) global counter, repeating until caught up.
+
+**`ring_base->0x18` is a single, mutex-protected, all-channel counter** -- confirmed by
+`docs/11-media.md`'s prior live correlation against kibbled's *own* read-only poller's tracked
+`(seq, next_pos)`, which necessarily counts every channel (video + mic + audio-out) to match. A
+full-binary scan for every reference to the `ring_base` global this session (19 total references)
+found all of them clustered inside this one audio-out-consumer subsystem (`0x31c00`-`0x330fe`) --
+the actual multi-channel record-append code that increments `0x18` lives elsewhere (video/mic
+encoder callbacks), out of this session's scope, and is the same "no known, safely
+reverse-engineerable atomic claim primitive for this ring's write side" gap `audioout.rs`'s own
+module doc already flags as unrecovered from an earlier session.
+
+**This fully explains AudioAnnounce's negative result.** `agent/src/audioout.rs`'s `write_frame`
+places correct record bytes and (per the prior session) correct-looking `slot->0x14`/`0x18`
+values, but never touches `ring_base->0x18`. Since kibbled's writer is the only thing that would
+need to advance that counter for the thread to notice new data, and it never does, step 3 above
+never newly turns true on kibbled's account -- the byte-correct record simply ages out of the
+ring untouched, exactly as observed (`SndFrm` delta 0, zero `chan=2` records found by
+`dumpchanring` after ordinary turnover).
+
+### 17.3.1 A lower-risk path forward, identified but **not attempted this session**
+
+Touching `ring_base->0x18` directly would mean taking a `PTHREAD_PROCESS_SHARED` mutex this
+project has never touched and mutating a counter the live video/mic path also depends on --
+exactly the class of risk this project's standing instructions single out. A narrower option
+**[INFERENCE, untested]**: since `ring_base->0x18` already increments continuously from ordinary
+video/mic traffic (~50-70 records/sec per §8), kibbled's writer could instead set *only*
+`slot->0x14` backward (to a value at or below the current `ring_base->0x18`, which requires no
+mutex -- a plain racy write, the same risk class as the ring byte writes already proven safe) and
+`slot->0x18` forward to the exact byte offset of its own freshly-written record. The very next
+ordinary video/mic frame would then satisfy step 3 "for free" and the thread would walk forward
+from kibbled's chosen offset. This depends on one thing this session could not confirm: whether
+the per-record consume path filters by channel before calling `AX_ADEC_SendStream` (a candidate
+bitmask check, record header `+0x22` against a *different*, seemingly-unrelated function's
+per-slot `+0x3e` mask, was seen once at `0x326e2`-`0x32718` but not confirmed to be on
+`audio_out_thread`'s own call path) -- if it does not filter, pointing the thread at a
+kibbled-written record this way would be safe (chan-mismatched frames already can't reach here
+because the walk starts exactly at the offset kibbled supplies); if it does not exist at all, an
+unfiltered walk driven by ordinary video traffic could feed non-audio bytes into
+`AX_ADEC_SendStream` before ever reaching kibbled's record, which the decoder would most likely
+reject harmlessly (wrong format) but was not verified. **Flagged as the concrete next step, not
+guessed at further or implemented.**
+
+## 17.4 `speak_stop` (`0xb`): clears the guard flag; does **not** stop the thread
+
+`0xb`'s handler (`0x31b2c`) is a small trampoline (`time()`, stash it, `bl 0x318ec`) exactly as
+the prior session described. `0x318ec` disassembles cleanly: if the guard flag (`0x767f0`,
+resolved this session via the identical GOT-indirect literal chain as §17.1 and confirmed
+**byte-identical** to the address `speak_start` sets) is already `0`, it logs (gated on the same
+`0x76b5c` state global) and returns `-1` -- calling stop when nothing is running is harmless. If
+the flag is `1`: **it is set to `0`** (`0x31964`) and the function returns `0`. That's the entire
+effect on shared state.
+
+**`audio_out_thread`'s own ~2KB body never reads or writes `0x767f0`** -- confirmed by two
+independent full scans this session (every `ldr`-literal resolving to that address, and every
+literal-computed address the thread's body touches at all, 154 total references, none of them
+this flag). **The thread does not learn that `speak_stop` was called and does not exit because of
+it.** It exits **only** via its own idle timeout (§17.5). This means:
+
+- `speak_stop` is not required for the thread to stop -- it will stop on its own regardless.
+- `speak_stop` **is** required to keep the guard flag truthful. If kibbled ever calls
+  `speak_start` and the thread later self-times-out (which, per §17.3, is the *expected* outcome
+  of every kibbled-initiated call under the current writer) without a matching `speak_stop`, the
+  flag is left stuck at `1` forever (nothing else clears it) -- every subsequent `speak_start`,
+  from kibbled **or from a real Petkit app talkback if it shares this same handler** (architecture
+  consistent with §6.1's "`agora` is the current writer of `auido-out` during an app-driven call",
+  not independently re-traced into `agora`'s own binary this session -- **[MED]**, not proven),
+  would then return `-1` with no thread actually running. This makes an RAII/`Drop`-guaranteed
+  `speak_stop` call (mirroring the existing `OwnerGuard` pattern) a hard requirement for any
+  `kibbled`-side caller of `speak_start`, on every exit path including errors/panics -- not an
+  optional cleanup nicety.
+
+## 17.5 The idle-exit timeout: milliseconds, not microseconds; two gates, not one
+
+A dedicated helper (`0x33054`) reads `CLOCK_MONOTONIC` and returns a 64-bit **millisecond** count
+(`tv_sec*1000 + tv_nsec/1000000`, confirmed via the exact magic-multiply-constant compiler idiom
+for that arithmetic, not inferred from behavior) -- correcting the prior session's "microsecond
+delta" note. The thread samples this once at entry and again on each poll iteration, computes
+`elapsed = now - start`, and checks it against **two** thresholds, both directly disassembled:
+`elapsed >= 1000` (ms) gates a warmup/housekeeping branch (self-notifies via `dispatch_send_msg`,
+msg `0xd`, `dst=self`); `elapsed >= 4999` (ms, `movw r2,#0x1387`, a 64-bit unsigned compare)
+branches to the thread's cleanup/exit path -- matching `media`'s own
+`"not recv audio-out data over 5s, exist audio_out_thread"` string almost exactly (4999 ms vs. a
+nominal 5000 ms, the 1 ms gap consistent with a `>=` vs `>` fencepost, not a different unit).
+
+## 17.6 Two-owner safety, evidenced
+
+- **Double-spawn**: impossible by construction -- `speak_start` is idempotent (§17.1), verified by
+  disassembling both its "already started" return paths, not assumed from the guard-flag's mere
+  existence.
+- **Kibbled calling `speak_start` while a real app talkback is already active**: harmless --
+  returns `-1` immediately, same idempotent path, does not disturb the live thread or its data.
+- **Kibbled calling `speak_start` first, then a real app talkback starting**: **[MED, architecture
+  inference]** if the app's own talkback path also arrives via this same `msg_id 0xa`, it too
+  would see the flag already `1` and return `-1` **without spawning its own thread** -- meaning
+  the *existing* thread (kibbled's) would need to still be alive and would need to be the one
+  servicing the real call, which it cannot do on its own (it only reads whatever is in the ring at
+  the offset it's walking). This is not a corruption risk (nothing double-writes), but could
+  plausibly manifest as **a real user's pet-call talkback silently not working** for up to ~5s
+  after any kibbled-initiated `speak_start`/`speak_stop` cycle finishes, until the guard flag is
+  next in a state that allows the real path through. Combined with §17.4's "stuck flag" risk, this
+  is the strongest argument in this whole trace for keeping any kibbled-initiated `speak_start`
+  window as short as strictly necessary and always paired with `speak_stop`.
+- **Ring-byte collision during concurrent writing** (the risk `call_active()`/`SpeakerOwner`
+  already defend against): unchanged by anything in this session's trace -- still the right,
+  already-implemented mitigation, orthogonal to the thread-lifecycle question above.
+
+## 17.7 What sending `speak_start`/`speak_stop` would look like
+
+Exact wire shape, per `bus.rs`'s already-proven envelope (`u16 msg_id | u16 src | payload[]`,
+`dst` selects the queue, never travels on the wire):
+`Sender::open(Peer::Media, src)?.send(0xa, &[])` / `.send(0xb, &[])` -- **empty payload**; neither
+handler reads any bytes past the 4-byte envelope (confirmed: `0xa`'s trampoline never touches the
+handler-convention payload register before calling `0x31750`, and `0x31750` itself never
+dereferences it). `dst = /msg_dispatch_2` (media's queue, `Peer::Media`).
+
+Risk analysis (see §17.8 for the live approval request sent to Main): spawning the thread this way
+is, per every path disassembled above, idempotent, self-cleaning-up on its own within ~5s even if
+kibbled never sends `speak_stop`, and touches no vendor state beyond the one guard flag and (once
+running) the same mutex-protected registry reads every other consumer already performs
+concurrently. **It will not, by itself, produce audible output against the current writer** --
+that gap is §17.3's, not this one's -- so the live test in §17.8/§17.9 is scoped to proving the
+thread-lifecycle mechanics and gathering real `SndFrm` numbers, not to claiming sound.
