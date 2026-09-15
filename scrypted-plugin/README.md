@@ -4,21 +4,31 @@ A Scrypted `MixinProvider` for the Kibble feeder camera (device "Plant Room Feed
 RTSP Camera Plugin). Adds two capabilities on top of that camera:
 
 - **`ObjectDetector`** — relays the agent's (`kibbled`) real on-device detection feed
-  (`GET /events`, `GET /events/stream?since=N`) as Scrypted `ObjectsDetected` events, plus an
+  (short-polls `GET /events` on a gap; see "The starvation incident" below for why it does not use
+  the agent's `GET /events/stream` long-poll) as Scrypted `ObjectsDetected` events, plus an
   optional off-device re-check through this Scrypted instance's own ONNX/OpenVINO detector.
 - **`Intercom`** — a direct, transient RTSP connection to the agent's ONVIF-style backchannel
   (`agent/src/rtsp.rs`/`backchannel.rs`), independent of Scrypted's Rebroadcast plugin (which only
   ever *reads* from the feeder).
 
-> **Status as of this branch: mixin is currently detached from the feeder camera pending
-> clearance.** During this session's live testing, the `ObjectDetector` long-poll
-> (`GET /events/stream`) contributed to `kibbled`'s HTTP server being starved for concurrent
-> requests, which made Home Assistant's own polling of the same device time out (every Kibble
-> entity went `unavailable`). The mixin was detached immediately on report, and
-> `KibbleDetectionFeed.stop()` was hardened to hard-abort (`AbortController`) any in-flight
-> request rather than only skip the next one -- see "A real incident" below. Re-attach only after
-> the device is confirmed stable; the fix is deployed but not re-verified live against the feeder
-> as of this branch.
+## The starvation incident (read this before touching the poll design)
+
+During this branch's live testing, attaching the mixin ran `KibbleDetectionFeed` against the
+agent's `GET /events/stream?since=N` long-poll (a deliberate ~25s server-side hold,
+`ai::LONG_POLL_TIMEOUT`) continuously. `kibbled`'s HTTP server has limited concurrency, and the
+held connection starved Home Assistant's own polling of the same device — every Kibble entity
+went `unavailable` for the whole house until the mixin was detached. Confirmed live:
+`GET /state` on the agent went from 0.19s (uncontended) to 3-of-5 attempts timing out at 10s while
+the long-poll was attached, and recovered to 0.01–0.15s on 4/4 immediately after detaching.
+
+Two independent fixes, both present in this branch:
+1. **The real fix**: `KibbleDetectionFeed` no longer touches `/events/stream` at all. It
+   short-polls the plain, instant `GET /events` snapshot (an in-memory read, no server-side wait)
+   on a 5s gap, comparing `seq` client-side. No single request this feed makes should ever hold
+   the server for more than a fraction of a second, by construction — not "usually," structurally.
+2. **Belt and suspenders**: `stop()` calls `AbortController.abort()` on whatever request is
+   currently in flight, rather than only skipping the next poll iteration, so releasing the mixin
+   can never leave a request hanging regardless of which endpoint is in use.
 
 ## Install
 
@@ -92,11 +102,19 @@ documented UDP→461 fallback, TCP interleaved=4-5, a live PLAY that received re
 simulation. **It proves the negotiation and transport. It does not and cannot prove sound was
 heard** — see "What's blocked" below.
 
+**4. Re-verified after the starvation incident and fix, live, mixin left attached:** re-attached
+to device 238 with the short-poll `GET /events` design; `getObjectTypes()` immediately answered
+correctly again (same merged on-device+ONNX classes as above, proving the mixin instance came
+back up cleanly). Sampled `GET /state` on the agent across two full poll windows afterward: 10 of
+11 samples at 9–48ms, one at 4.6s — a single, brief blip consistent with ordinary shared-device
+contention (other work was concurrently running against the same feeder this session), not the
+sustained 3-of-5-attempts-timing-out-at-10s starvation pattern from before the fix. Left attached.
+
 **Not independently re-observed this session:** a live `ObjectsDetected` event firing from a real
 or file-dropped cat visit. The detection-feed poll loop starts unconditionally in the mixin's
-constructor (the same constructor that successfully answered `getObjectTypes()` above, which
-requires the instance to be fully alive), so it is running; a `face`/`visit`/`eat` event was not
-independently triggered and captured in this session's remaining time. The mechanism itself
+constructor (the same constructor that successfully answered `getObjectTypes()` above both times,
+which requires the instance to be fully alive), so it is running; a `face`/`visit`/`eat` event was
+not independently triggered and captured in this session's remaining time. The mechanism itself
 (`agent/src/main.rs`'s route table, `agent/src/ai.rs`'s poller) is unchanged, existing, and
 already used by other consumers.
 
@@ -126,6 +144,19 @@ reports `"pending"` (i.e., nothing has raced ahead of it) — a documented best-
 guarantee. `visit`/`eat` events have no such queue and get **no** crop; `getDetectionInput` for
 those honestly throws rather than fabricating one. (Flagged to `Main`/`HaMedia` as a real
 agent-side gap — `image.py`/`camera.py` will hit the identical limitation for any full-frame crop.)
+
+## Agent-side TODO (not fixed here — `agent/src/main.rs` belongs to other tasks)
+
+**Add `GET /events/<file>`, serving raw bytes from `EVENTS_DIR` (`/opt/kibble/events/`), matching
+the existing `GET /faces/pending/<name>` pattern** (`main.rs`'s route table, `faces_pending_get`).
+`ai.rs`'s `Detection.image` already names the exact file (`{ts}-{class}.jpg`) that
+`poll_loop` writes there for *every* class (`face`/`visit`/`eat`), but nothing serves that
+directory over HTTP today — only `face`-class crops are separately reachable, indirectly, via
+`GET /faces/current` (a different directory, `faces::PENDING_DIR`, with different filenames, no
+guaranteed 1:1 mapping). Once this route exists, this plugin's `mixin.ts`
+(`tryFetchMatchingCrop`) should be simplified to `GET /events/<image>` directly for every class —
+a straightforward, exact, non-best-effort fetch — instead of the current same-tick
+`/faces/current` heuristic that only covers `face`-class detections.
 
 ## Second pass: did both, for different reasons
 
