@@ -8,6 +8,8 @@ CONF_HOST = "host"
 CONF_PORT = "port"
 
 DEFAULT_PORT = 8765
+DEFAULT_RTSP_PORT = 8554
+DEFAULT_RTSP_PATH = "/sub"
 # kibbled reads /dev/shm/config_shm with plain loads, so polling is nearly free on the
 # device; the limit is the feeder's single-client HTTP server, not the data.
 DEFAULT_SCAN_INTERVAL = 10

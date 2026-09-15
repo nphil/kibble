@@ -42,6 +42,7 @@ from .coordinator import KibbleConfigEntry, KibbleCoordinator
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
+    Platform.CAMERA,
     Platform.NUMBER,
     Platform.SENSOR,
     Platform.SWITCH,
