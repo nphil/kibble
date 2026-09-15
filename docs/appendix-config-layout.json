@@ -1,0 +1,497 @@
+[
+  {
+    "offset": 0,
+    "size": 4,
+    "type": "u32/bool",
+    "key": "loaded",
+    "section": "top",
+    "confidence": "high",
+    "sample_value_redacted": "1"
+  },
+  {
+    "offset": 192,
+    "size": 4,
+    "type": "char[4]",
+    "key": "usr.ali_or_oci",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"ALI\""
+  },
+  {
+    "offset": 213,
+    "size": 12,
+    "type": "char[]",
+    "key": "usr.iot_keys.product_key",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (11-char alnum, Alibaba productKey-shaped)"
+  },
+  {
+    "offset": 234,
+    "size": 22,
+    "type": "char[24]",
+    "key": "usr.iot_keys.device_name",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"d_d4sh_<serial>\" (contains dev.dev_sn)"
+  },
+  {
+    "offset": 267,
+    "size": 33,
+    "type": "char[]",
+    "key": "usr.iot_keys.id_or_device_secret",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "REDACTED (32-hex)"
+  },
+  {
+    "offset": 332,
+    "size": 10,
+    "type": "char[16]",
+    "key": "usr.iot_keys.region_id",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"us-west-1\""
+  },
+  {
+    "offset": 353,
+    "size": 38,
+    "type": "char[64]",
+    "key": "usr.iot_keys.mqttHost",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"iot-<id>.mqtt.iothub.aliyuncs.com\""
+  },
+  {
+    "offset": 440,
+    "size": 7,
+    "type": "char[16]",
+    "key": "usr.p2p_keys.product_id",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"PETKIT\""
+  },
+  {
+    "offset": 461,
+    "size": 10,
+    "type": "char[16]",
+    "key": "usr.p2p_keys.region_or_dup",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "\"us-west-1\" (duplicate region string)"
+  },
+  {
+    "offset": 482,
+    "size": 12,
+    "type": "char[]",
+    "key": "usr.p2p_keys.product_secret",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (11-char alnum)"
+  },
+  {
+    "offset": 503,
+    "size": 22,
+    "type": "char[24]",
+    "key": "usr.p2p_keys.device_name",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"d_d4sh_<serial>\" (same pattern as iot_keys.device_name)"
+  },
+  {
+    "offset": 536,
+    "size": 33,
+    "type": "char[]",
+    "key": "usr.p2p_keys.secret2",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "REDACTED (32-hex)"
+  },
+  {
+    "offset": 601,
+    "size": 38,
+    "type": "char[]",
+    "key": "usr.server_info.servers[0].api_or_mqtt_primary",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"iot-mqtt-primary-prod.petkt.com:33882\""
+  },
+  {
+    "offset": 730,
+    "size": 38,
+    "type": "char[]",
+    "key": "usr.server_info.servers[1].api_or_mqtt_standby",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"iot-mqtt-standby-prod.petkt.com:33882\""
+  },
+  {
+    "offset": 859,
+    "size": 19,
+    "type": "char[]",
+    "key": "usr.server_info.servers[0].ip",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"47.251.2.236:33882\""
+  },
+  {
+    "offset": 924,
+    "size": 18,
+    "type": "char[]",
+    "key": "usr.server_info.servers[1].ip",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"47.88.52.254:33882\""
+  },
+  {
+    "offset": 1072,
+    "size": 3,
+    "type": "char[8]",
+    "key": "usr.iot_keys.type",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "\"IoT\""
+  },
+  {
+    "offset": 1137,
+    "size": 8,
+    "type": "char[]",
+    "key": "usr.wifi.conf.pwd",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (wifi password)"
+  },
+  {
+    "offset": 1240,
+    "size": 12,
+    "type": "char[13]",
+    "key": "usr.wifi.net_inf.mac_or_dev_mac_info",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"94ba06053336\" (matches known device MAC, no colons)"
+  },
+  {
+    "offset": 1253,
+    "size": 17,
+    "type": "char[18]",
+    "key": "usr.wifi.net_inf.mac_colon_form",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "\"<device-mac>\" (colon form, overlapping tail seen at +1253)"
+  },
+  {
+    "offset": 1272,
+    "size": 12,
+    "type": "char[13]",
+    "key": "usr.wifi.net_inf.bssid_or_gwmac",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "\"a205d6571ece\" (AP/gateway MAC candidate, no colons)"
+  },
+  {
+    "offset": 1336,
+    "size": 12,
+    "type": "char[16]",
+    "key": "usr.wifi.net_inf.ipaddr",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"192.168.4.85\""
+  },
+  {
+    "offset": 1400,
+    "size": 13,
+    "type": "char[16]",
+    "key": "usr.wifi.net_inf.mask",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"255.255.255.0\""
+  },
+  {
+    "offset": 2540,
+    "size": 7,
+    "type": "char[16]",
+    "key": "usr.server_info.dns[0].ip",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"8.8.8.8\""
+  },
+  {
+    "offset": 2572,
+    "size": 13,
+    "type": "char[16]",
+    "key": "usr.server_info.dns[1].ip",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"199.85.126.10\""
+  },
+  {
+    "offset": 2604,
+    "size": 13,
+    "type": "char[16]",
+    "key": "usr.server_info.dns[2].ip",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"208.67.222.222\""
+  },
+  {
+    "offset": 2856,
+    "size": 812,
+    "type": "struct[]",
+    "key": "usr.ircut.* + usr.app_conf.{eat,move,pet,vomit}_det.* (packed numeric block)",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "mixed int32/int64 thresholds, sensitivities, alarmInterval/alarmTime seconds (e.g. 3600, 1440, 7500, 30000)"
+  },
+  {
+    "offset": 3168,
+    "size": 288,
+    "type": "int32[]",
+    "key": "usr.app_conf.pet_color[i].{petId,petColor}",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "-1 (0xFFFFFFFF) sentinel repeated ~36x = no pets enrolled"
+  },
+  {
+    "offset": 4384,
+    "size": 4,
+    "type": "float32",
+    "key": "usr.user_info.timezone",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "-4.0 (UTC offset hours, matches EDT for America/New_York in Sept)"
+  },
+  {
+    "offset": 4388,
+    "size": 16,
+    "type": "char[24]",
+    "key": "usr.user_info.timezone_name",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"America/New_York\""
+  },
+  {
+    "offset": 4452,
+    "size": 5,
+    "type": "char[8]",
+    "key": "usr.user_info.locale",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"en_US\""
+  },
+  {
+    "offset": 4468,
+    "size": 16,
+    "type": "char[]",
+    "key": "usr.user_info.userId_hex_or_secondary",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "REDACTED-looking 16-hex value"
+  },
+  {
+    "offset": 4532,
+    "size": 18,
+    "type": "char[24]",
+    "key": "usr.user_info.userId",
+    "section": "usr",
+    "confidence": "high",
+    "sample_value_redacted": "\"0x<16-hex>\" (Alibaba-style hex userId)"
+  },
+  {
+    "offset": 4672,
+    "size": 12,
+    "type": "char[13]",
+    "key": "dev.mac_info.a_STAmac_or_APmac",
+    "section": "dev",
+    "confidence": "high",
+    "sample_value_redacted": "\"94ba06053336\" (device MAC, no colons)"
+  },
+  {
+    "offset": 4712,
+    "size": 12,
+    "type": "char[13]",
+    "key": "dev.mac_info.a_BLEmac",
+    "section": "dev",
+    "confidence": "medium",
+    "sample_value_redacted": "\"a4c138f8f325\" (distinct MAC, BLE radio candidate)"
+  },
+  {
+    "offset": 4768,
+    "size": 14,
+    "type": "char[16]",
+    "key": "dev.dev_sn",
+    "section": "dev",
+    "confidence": "high",
+    "sample_value_redacted": "\"<device-serial>\""
+  },
+  {
+    "offset": 4832,
+    "size": 4,
+    "type": "char[8]",
+    "key": "dev.name",
+    "section": "dev",
+    "confidence": "high",
+    "sample_value_redacted": "\"D4SH\""
+  },
+  {
+    "offset": 4860,
+    "size": 3,
+    "type": "char[16]",
+    "key": "dev.version_info.ota_param.firmwareVer",
+    "section": "dev",
+    "confidence": "high",
+    "sample_value_redacted": "\"895\" (stored as decimal string, not int)"
+  },
+  {
+    "offset": 4876,
+    "size": 4,
+    "type": "int32/int64",
+    "key": "dev.version_info.ota_param.firmware_ble",
+    "section": "dev",
+    "confidence": "high",
+    "sample_value_redacted": "159"
+  },
+  {
+    "offset": 9132,
+    "size": 60,
+    "type": "char[64]",
+    "key": "state.ble.ota.url (inferred sub-field, not in pktool debug table)",
+    "section": "state",
+    "confidence": "high",
+    "sample_value_redacted": "\"http://firmware-us.petkit.cn/<md5>\""
+  },
+  {
+    "offset": 9388,
+    "size": 32,
+    "type": "char[32]",
+    "key": "state.ble.ota.md5 (inferred)",
+    "section": "state",
+    "confidence": "high",
+    "sample_value_redacted": "REDACTED-format md5 (matches known ble.img md5 7e434efec4c7...421e)"
+  },
+  {
+    "offset": 9424,
+    "size": 4,
+    "type": "u32",
+    "key": "state.ble.ota.size (inferred)",
+    "section": "state",
+    "confidence": "high",
+    "sample_value_redacted": "153412 (matches known ble.img byte size exactly)"
+  },
+  {
+    "offset": 9728,
+    "size": 56,
+    "type": "int64[7]",
+    "key": "state.watchdog.{media,ctrl,p2p,agora,cloud,ble,card}_count",
+    "section": "state",
+    "confidence": "medium",
+    "sample_value_redacted": "six 0, one 5 (exact per-process order unresolved)"
+  },
+  {
+    "offset": 9792,
+    "size": 56,
+    "type": "int64[7]",
+    "key": "state.watchdog.{media,ctrl,p2p,agora,cloud,ble,card}_pid",
+    "section": "state",
+    "confidence": "medium",
+    "sample_value_redacted": "five nonzero PIDs (24789/25085/30237/30257/37088) + two 0 (matches: card & p2p have no binary)"
+  },
+  {
+    "offset": 10168,
+    "size": 4,
+    "type": "int32/int64",
+    "key": "usr.trackerLimit_or_trackerInterval_a",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "1000"
+  },
+  {
+    "offset": 10176,
+    "size": 4,
+    "type": "int32/int64",
+    "key": "usr.trackerLimit_or_trackerInterval_b",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "1000"
+  },
+  {
+    "offset": 10184,
+    "size": 4,
+    "type": "int32/int64",
+    "key": "device volume (field name unconfirmed vs pktool table)",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "6 (matches known volume=6)"
+  },
+  {
+    "offset": 4892,
+    "size": 2432,
+    "type": "int64[]",
+    "key": "state.dev_pro.{last_httpMsgTime,last_iotMsgTime,http_online_time_s}-style connectivity counters (structural cluster, not individually resolved)",
+    "section": "state",
+    "confidence": "low",
+    "sample_value_redacted": "6 values in 253300-262700 range, consistent with ~2.9-3.0 day uptime/connectivity seconds counters"
+  },
+  {
+    "offset": 10152,
+    "size": 236,
+    "type": "mixed",
+    "key": "state.dev_pro.* / dev.name variant + small counters + trailing checksum (structural cluster)",
+    "section": "state",
+    "confidence": "low",
+    "sample_value_redacted": "\"D4SH3\" string, several small ints (201,214,269,200,270), trailing 32-bit value resembling a struct checksum (0xa3100bd0)"
+  },
+  {
+    "offset": 11944,
+    "size": 4,
+    "type": "u32/bool",
+    "key": "trailing flag near struct end (name unresolved)",
+    "section": "state",
+    "confidence": "low",
+    "sample_value_redacted": "1"
+  },
+  {
+    "offset": 91,
+    "size": 32,
+    "type": "char[32] (hex-encoded secret)",
+    "key": "usr.id_info.dev_srt (reasoned: 1st of 4 tied hex[32] secrets, matches Table A leaf order within id_info)",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (32 hex chars)"
+  },
+  {
+    "offset": 124,
+    "size": 32,
+    "type": "char[32] (hex-encoded id/secret)",
+    "key": "usr.id_info.chip_id (reasoned: 2nd of 4 tied hex[32] secrets, matches Table A leaf order within id_info)",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (32 hex chars)"
+  },
+  {
+    "offset": 267,
+    "size": 32,
+    "type": "char[32] (hex-encoded secret)",
+    "key": "usr.p2p_keys.product_secret (reasoned: 3rd of 4 tied hex[32] secrets, matches Table A leaf order)",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (32 hex chars)"
+  },
+  {
+    "offset": 536,
+    "size": 32,
+    "type": "char[32] (hex-encoded secret)",
+    "key": "usr.iot_keys.device_secret (reasoned: 4th of 4 tied hex[32] secrets, matches Table A leaf order)",
+    "section": "usr",
+    "confidence": "medium",
+    "sample_value_redacted": "REDACTED (32 hex chars)"
+  },
+  {
+    "offset": 40,
+    "size": 51,
+    "type": "u32/u64 (likely zero at capture time)",
+    "key": "usr.id_info.{dev_id,srt_len} (region only; exact 4/8-byte sub-offset not pinpointed - entire 40-90 span is all-zero, so no distinguishing nonzero value exists to anchor either field individually)",
+    "section": "usr",
+    "confidence": "low",
+    "sample_value_redacted": "all-zero region (0)"
+  }
+]
