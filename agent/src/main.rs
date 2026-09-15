@@ -20,6 +20,7 @@
 //! `/opt/kibble`. It sits beside the stock firmware, speaks its internal bus, and keeps its own
 //! settings record in `/opt/kibble/` — see `persist.rs` and `docs/21-config-encryption.md`.
 
+mod backup;
 mod bus;
 mod desired;
 mod http;
@@ -48,6 +49,18 @@ const DEFAULT_BIND: &str = "0.0.0.0:8765";
 
 fn main() {
     let bind = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_BIND.to_string());
+
+    match backup::backup_once() {
+        Ok(Some((source_md5, backup_md5))) => eprintln!(
+            "kibbled: backed up /opt/user.conf to {} (md5 {source_md5}, backup md5 {backup_md5}, match={})",
+            backup::BACKUP,
+            source_md5 == backup_md5
+        ),
+        Ok(None) => eprintln!("kibbled: {} already exists, leaving it alone", backup::BACKUP),
+        Err(e) => eprintln!(
+            "kibbled: could not back up /opt/user.conf: {e} (continuing — settings writes never touch that file)"
+        ),
+    }
 
     let shm = Shm::open().unwrap_or_else(|e| die(&format!("open {}: {e}", state::SHM_PATH)));
     // Shared, not leaked: the request-handling closure below borrows it for the life of the
