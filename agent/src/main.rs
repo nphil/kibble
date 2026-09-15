@@ -35,6 +35,15 @@
 //!   GET    /feeds                   before/after dish snapshots per feed cycle (see
 //!                                   feed_capture.rs), manual and scheduled alike
 //!   GET    /feeds/<name>            one snapshot's raw H.264 keyframe bytes
+//!   GET    /wifi                    {"ssid","bssid","freq_mhz","band","signal_dbm","ip","state",
+//!                                   "desired_ssid","last_error"} -- current Wi-Fi association
+//!                                   (see wifi.rs)
+//!   GET    /wifi/scan               [{"ssid","bssid","freq_mhz","band","signal_dbm","security"}]
+//!                                   deduped by SSID (strongest kept), hidden SSIDs omitted
+//!   POST   /wifi/connect            {"ssid": "...", "psk": "..."}  fail-safe add+select, with
+//!                                   automatic rollback on failure -- psk never echoed back
+//!   POST   /wifi/forget             {"ssid": "..."}  remove a Kibble-added network (never the
+//!                                   vendor's own)
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
@@ -57,6 +66,7 @@ mod rtsp;
 mod schedule;
 mod settings;
 mod state;
+mod wifi;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -121,6 +131,7 @@ fn main() {
 
     cloud::spawn_reconciler();
     persist::spawn_reconciler(Arc::clone(&shm));
+    wifi::spawn_reconciler();
     let _ =
         http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds, &ai_feed, &capture));
 }
@@ -171,6 +182,10 @@ fn route(
         ("POST", "/faces/label") => faces_label_post(req),
         ("GET", "/feeds") => feeds_list(capture),
         ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
+        ("GET", "/wifi") => Response::Json(wifi::status_json()),
+        ("GET", "/wifi/scan") => Response::Json(wifi::scan_json()),
+        ("POST", "/wifi/connect") => wifi_connect(req),
+        ("POST", "/wifi/forget") => wifi_forget(req),
         _ => Response::NotFound,
     }
 }
@@ -278,6 +293,31 @@ fn cloud_write(req: &Request) -> Response {
     match result {
         Ok(_) => Response::Json(cloud::status_json()),
         Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn wifi_connect(req: &Request) -> Response {
+    let ssid = match json_field(&req.body, "ssid") {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Response::BadRequest(r#""ssid" is required"#.into()),
+    };
+    let psk = json_field(&req.body, "psk").filter(|p| !p.is_empty()).map(str::to_string);
+    match wifi::connect(&ssid, psk.as_deref()) {
+        Ok(_) => Response::Json(wifi::status_json()),
+        Err(e @ wifi::Error::PskRequired) => Response::BadRequest(e.to_string()),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn wifi_forget(req: &Request) -> Response {
+    let ssid = match json_field(&req.body, "ssid") {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Response::BadRequest(r#""ssid" is required"#.into()),
+    };
+    match wifi::forget(&ssid) {
+        Ok(()) => Response::Json(wifi::status_json()),
+        Err(e @ wifi::Error::Command(_)) => Response::Error(e.to_string()),
+        Err(e) => Response::BadRequest(e.to_string()),
     }
 }
 

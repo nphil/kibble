@@ -19,6 +19,8 @@ from .const import (
     ATTR_HOPPER,
     ATTR_HOPPER1_G,
     ATTR_HOPPER2_G,
+    ATTR_PASSWORD,
+    ATTR_SSID,
     ATTR_TIME,
     CONF_HOST,
     CONF_PORT,
@@ -36,6 +38,7 @@ from .const import (
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
+    SERVICE_WIFI_CONNECT,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 
@@ -44,6 +47,7 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.CAMERA,
     Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
 ]
@@ -106,6 +110,14 @@ SCHEDULE_SET_ENABLED_SCHEMA = vol.Schema(
         vol.Required("device_id"): cv.string,
         vol.Required(ATTR_ENTRY_ID): cv.string,
         vol.Required(ATTR_ENABLED): cv.boolean,
+    }
+)
+
+WIFI_CONNECT_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_SSID): cv.string,
+        vol.Optional(ATTR_PASSWORD): cv.string,
     }
 )
 
@@ -214,6 +226,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise HomeAssistantError(f"Schedule set-enabled failed: {err}") from err
 
+    async def handle_wifi_connect(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_wifi_connect(
+                call.data[ATTR_SSID], call.data.get(ATTR_PASSWORD)
+            )
+        except KibbleError as err:
+            raise HomeAssistantError(f"Wi-Fi connect failed: {err}") from err
+
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
     hass.services.async_register(
@@ -230,6 +251,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_SCHEDULE_SET_ENABLED,
         handle_schedule_set_enabled,
         SCHEDULE_SET_ENABLED_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_WIFI_CONNECT, handle_wifi_connect, WIFI_CONNECT_SCHEMA
     )
 
 

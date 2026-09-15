@@ -179,6 +179,12 @@
           "bluetooth": "Bluetooth",
           "unreachable": "Unreachable"
         }
+      },
+      "wifi": {
+        "name": "Wi-Fi network"
+      },
+      "wifi_signal": {
+        "name": "Wi-Fi signal"
       }
     },
     "switch": {
@@ -193,6 +199,11 @@
       },
       "cloud": {
         "name": "Petkit cloud"
+      }
+    },
+    "select": {
+      "wifi": {
+        "name": "Wi-Fi network"
       }
     }
   },
@@ -298,6 +309,24 @@
         "enabled": {
           "name": "Enabled",
           "description": "Whether the entry should be active."
+        }
+      }
+    },
+    "wifi_connect": {
+      "name": "Connect to Wi-Fi network",
+      "description": "Switch the feeder to a different Wi-Fi network, or reconnect to one it already has a saved password for. Fails safe: a wrong password or unreachable network rolls back to the previous connection automatically.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to reconnect."
+        },
+        "ssid": {
+          "name": "Network name (SSID)",
+          "description": "The Wi-Fi network to connect to."
+        },
+        "password": {
+          "name": "Password",
+          "description": "Leave empty to reconnect to a network Kibble already has a saved password for."
         }
       }
     }

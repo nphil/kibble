@@ -19,6 +19,10 @@ from aiohttp import ClientError, ClientTimeout
 _LOGGER = logging.getLogger(__name__)
 
 TIMEOUT = ClientTimeout(total=10)
+# The fail-safe connect sequence (agent/src/wifi.rs) budgets up to ~30s for association plus a
+# DHCP lease before rolling back; this request has to outlive that, not the default 10s every
+# other (near-instant) call uses.
+WIFI_CONNECT_TIMEOUT = ClientTimeout(total=35)
 
 
 class KibbleError(Exception):
@@ -130,6 +134,62 @@ class CloudState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class WifiNetwork:
+    """One scanned Wi-Fi network, as reported by `GET /wifi/scan` -- already deduplicated by
+    SSID (strongest signal kept) and with hidden SSIDs omitted (`agent/src/wifi.rs`)."""
+
+    ssid: str
+    bssid: str
+    freq_mhz: int
+    band: str
+    signal_dbm: int
+    security: str
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> WifiNetwork:
+        return cls(
+            ssid=str(data.get("ssid", "")),
+            bssid=str(data.get("bssid", "")),
+            freq_mhz=int(data.get("freq_mhz") or 0),
+            band=str(data.get("band", "")),
+            signal_dbm=int(data.get("signal_dbm") or 0),
+            security=str(data.get("security", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WifiState:
+    """One snapshot of the feeder's Wi-Fi association, as reported by `GET /wifi`
+    (`agent/src/wifi.rs`). `ssid`/`bssid`/`freq_mhz`/`band`/`signal_dbm`/`ip` are `None` while
+    disconnected; `desired_ssid` is the network `wifi.json` wants (boot re-apply/reconcile keep
+    pursuing it); `last_error` explains the most recent failed connect attempt, if any."""
+
+    ssid: str | None
+    bssid: str | None
+    freq_mhz: int | None
+    band: str | None
+    signal_dbm: int | None
+    ip: str | None
+    state: str
+    desired_ssid: str | None
+    last_error: str | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> WifiState:
+        return cls(
+            ssid=data.get("ssid"),
+            bssid=data.get("bssid"),
+            freq_mhz=data.get("freq_mhz"),
+            band=data.get("band"),
+            signal_dbm=data.get("signal_dbm"),
+            ip=data.get("ip"),
+            state=str(data.get("state", "")),
+            desired_ssid=data.get("desired_ssid"),
+            last_error=data.get("last_error"),
+        )
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -138,18 +198,29 @@ class KibbleClient:
         self._base = f"http://{host}:{port}"
         self._lock = asyncio.Lock()
 
-    async def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        timeout: ClientTimeout | None = None,
+    ) -> Any:
         async with self._lock:
             try:
                 async with self._session.request(
-                    method, f"{self._base}{path}", json=payload, timeout=TIMEOUT
+                    method, f"{self._base}{path}", json=payload, timeout=timeout or TIMEOUT
                 ) as resp:
                     if resp.status == 404:
                         raise KibbleError(f"{path} not supported by this agent version")
                     body = await resp.json(content_type=None)
                     if resp.status >= 400:
-                        raise KibbleError(str(body.get("error", body)))
-                    return body or {}
+                        detail = body.get("error", body) if isinstance(body, dict) else body
+                        raise KibbleError(str(detail))
+                    # `GET /wifi/scan` returns a bare JSON array, every other endpoint an
+                    # object -- only substitute the empty-object default for a truly absent
+                    # body, never for a legitimately empty array (`body or {}` would silently
+                    # turn `[]` into `{}`).
+                    return body if body is not None else {}
             except TimeoutError as err:
                 raise KibbleConnectionError(f"{self._base} timed out") from err
             except ClientError as err:
@@ -229,3 +300,30 @@ class KibbleClient:
         return CloudState.from_json(
             await self._request("POST", "/cloud", {"enabled": enabled})
         )
+
+    async def wifi(self) -> WifiState:
+        return WifiState.from_json(await self._request("GET", "/wifi"))
+
+    async def wifi_scan(self) -> list[WifiNetwork]:
+        """Deduplicated (strongest per SSID), hidden SSIDs already omitted by the agent."""
+        networks = await self._request("GET", "/wifi/scan")
+        return [WifiNetwork.from_json(n) for n in networks]
+
+    async def wifi_connect(self, ssid: str, psk: str | None = None) -> WifiState:
+        """Fail-safe add+select on the agent (`agent/src/wifi.rs`): up to ~30s for association
+        plus a DHCP lease, hence `WIFI_CONNECT_TIMEOUT` rather than the default. A rejected
+        write (wrong password, no reachable AP, ...) raises `KibbleError` after the agent has
+        already rolled itself back to the previous network -- same fail-safe-then-error shape
+        as `set_cloud`. `psk` is never logged or echoed back; omit it to reconnect to an SSID
+        the agent already has a saved password for."""
+        payload: dict[str, Any] = {"ssid": ssid}
+        if psk:
+            payload["psk"] = psk
+        return WifiState.from_json(
+            await self._request("POST", "/wifi/connect", payload, timeout=WIFI_CONNECT_TIMEOUT)
+        )
+
+    async def wifi_forget(self, ssid: str) -> WifiState:
+        """Removes a Kibble-added network; the agent 400s for the vendor's own network or the
+        one currently providing connectivity."""
+        return WifiState.from_json(await self._request("POST", "/wifi/forget", {"ssid": ssid}))

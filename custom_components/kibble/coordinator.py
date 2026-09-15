@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import CloudState, FeederState, KibbleClient, KibbleError, ScheduleState
+from .api import CloudState, FeederState, KibbleClient, KibbleError, ScheduleState, WifiNetwork, WifiState
 from .ble_fallback import async_feed_with_fallback
 from .const import CONF_BLE_ADDRESS, DEFAULT_SCAN_INTERVAL, DOMAIN
 
@@ -24,12 +24,15 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 @dataclass(frozen=True, slots=True)
 class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
-    device-settings snapshot, and the Petkit-cloud kill switch's status."""
+    device-settings snapshot, the Petkit-cloud kill switch's status, and the current Wi-Fi
+    association plus a fresh scan (`agent/src/wifi.rs`)."""
 
     state: FeederState
     schedule: ScheduleState
     config: dict[str, int]
     cloud: CloudState
+    wifi: WifiState
+    wifi_scan: tuple[WifiNetwork, ...]
 
 
 class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
@@ -57,7 +60,16 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             schedule = await self.client.schedule()
             config = await self.client.config()
             cloud = await self.client.cloud()
-            return KibbleData(state=state, schedule=schedule, config=config, cloud=cloud)
+            wifi = await self.client.wifi()
+            wifi_scan = tuple(await self.client.wifi_scan())
+            return KibbleData(
+                state=state,
+                schedule=schedule,
+                config=config,
+                cloud=cloud,
+                wifi=wifi,
+                wifi_scan=wifi_scan,
+            )
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -133,3 +145,16 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             await self.client.set_cloud(enabled)
         finally:
             await self.async_request_refresh()
+
+    async def async_wifi_connect(self, ssid: str, password: str | None = None) -> None:
+        """Fail-safe Wi-Fi switch (`agent/src/wifi.rs`) -- always refreshes, even when
+        `wifi_connect` raises, so a rollback's `last_error` and the (unchanged) live SSID
+        appear immediately instead of waiting for the next poll. Mirrors `async_set_cloud`."""
+        try:
+            await self.client.wifi_connect(ssid, password)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_wifi_forget(self, ssid: str) -> None:
+        await self.client.wifi_forget(ssid)
+        await self.async_request_refresh()

@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfSignalStrength, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -186,6 +186,8 @@ async def async_setup_entry(
     entities.append(KibbleScheduleSensor(coordinator))
     entities.append(KibbleCloudConnectionSensor(coordinator))
     entities.append(KibbleControlPathSensor(coordinator))
+    entities.append(KibbleWifiNetworkSensor(coordinator))
+    entities.append(KibbleWifiSignalSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -314,3 +316,45 @@ class KibbleControlPathSensor(KibbleEntity, SensorEntity):
     @property
     def native_value(self) -> str | None:
         return self.coordinator.control_path
+class KibbleWifiNetworkSensor(KibbleEntity, SensorEntity):
+    """The feeder's current Wi-Fi association (`agent/src/wifi.rs`'s `GET /wifi`). State is the
+    SSID (`None`/unknown while disconnected); bssid/band/signal/ip ride along as attributes so
+    the one entity carries the full picture without four separate sensors."""
+
+    _attr_translation_key = "wifi"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "wifi")
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.data.wifi.ssid
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        wifi = self.coordinator.data.wifi
+        return {
+            "bssid": wifi.bssid,
+            "band": wifi.band,
+            "signal_dbm": wifi.signal_dbm,
+            "ip": wifi.ip,
+        }
+
+
+class KibbleWifiSignalSensor(KibbleEntity, SensorEntity):
+    """Live received-signal strength of the feeder's current Wi-Fi association, from
+    `signal_poll` (or the last scan's entry for the current bssid -- see `agent/src/wifi.rs`)."""
+
+    _attr_translation_key = "wifi_signal"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = UnitOfSignalStrength.DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "wifi_signal")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.data.wifi.signal_dbm
