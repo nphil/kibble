@@ -14,11 +14,14 @@
 //!                                   "id": "...", "enabled": bool}  add one entry
 //!   DELETE /schedule/entry?id=      remove one entry
 //!   POST   /schedule/entry/enabled  {"id": "...", "enabled": bool}  enable/disable one entry
+//!   RTSP   :8554/<path>             live H.264 video (ring's "sub" channel, 1152x720@25fps),
+//!                                   zero re-encode
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
-//! `/opt/kibble`. It sits beside the stock firmware, speaks its internal bus, and keeps its own
-//! settings record in `/opt/kibble/` — see `persist.rs` and `docs/21-config-encryption.md`.
+//! `/opt/kibble`. It sits beside the stock firmware, speaks its internal bus (and, for video, its
+//! shared-memory frame ring), and keeps its own settings record in `/opt/kibble/` — see
+//! `persist.rs` and `docs/21-config-encryption.md`.
 
 mod backup;
 mod bus;
@@ -26,6 +29,8 @@ mod desired;
 mod http;
 mod md5;
 mod persist;
+mod ring;
+mod rtsp;
 mod schedule;
 mod settings;
 mod state;
@@ -38,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bus::{msg, FeedCtrl, Peer, Sender};
 use http::{json_field, Request, Response};
 use schedule::Schedule;
+use ring::VideoFeed;
 use state::Shm;
 
 /// `src` we stamp on bus messages. Stock `ctrl` is 1; replies to our feed land in its queue,
@@ -46,6 +52,7 @@ use state::Shm;
 const SRC_AS_CTRL: u16 = Peer::Ctrl as u16;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8765";
+const RTSP_BIND: &str = "0.0.0.0:8554";
 
 fn main() {
     let bind = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_BIND.to_string());
@@ -71,7 +78,14 @@ fn main() {
     let mut schedule = Schedule::load(PathBuf::from(schedule::CACHE_PATH))
         .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
-    eprintln!("kibbled: listening on {bind}");
+
+    let feed = VideoFeed::new();
+    let _poller = ring::spawn(feed.clone()).unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
+    let rtsp_listener =
+        TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
+    let _rtsp = rtsp::spawn(rtsp_listener, feed);
+
+    eprintln!("kibbled: listening on {bind}, rtsp on {RTSP_BIND} (chan {})", ring::CHAN_SUB);
 
     persist::spawn_reconciler(Arc::clone(&shm));
     let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule));
