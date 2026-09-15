@@ -123,3 +123,39 @@ wifi_connect:
       selector:
         text:
           type: password
+
+label_face:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    crop_id:
+      required: true
+      selector:
+        text:
+    cat:
+      required: true
+      selector:
+        text:
+
+add_cat:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    name:
+      required: true
+      selector:
+        text:
+
+identify:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble

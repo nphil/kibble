@@ -71,6 +71,16 @@
 //! the picture" feed today — with `score`/`pet_id`/`box` honestly `null` (that data lives only in
 //! the struct above, unreachable without replacing `ctrl`), not fabricated.
 //!
+//! ## Update: `cat` is real, unlike `pet_id`
+//!
+//! Since `docs/27-cat-id.md`, a `"face"`-class detection's crop is also run through
+//! [`crate::embed`]'s second-process NPU path and [`crate::faces::Gallery`]'s classifier before
+//! being published. Unlike `score`/`pet_id`/`box` above -- honestly `null` because that data is
+//! unreachable without replacing `ctrl` -- [`Detection::cat`] is a **real, first-party**
+//! identification: Kibble's own frozen-embedding classifier's opinion, not the vendor's. It is
+//! `None` whenever the classifier didn't confidently match an enrolled cat (including "no cats
+//! enrolled yet"), never a guess dressed up as a fact.
+//!
 //! `/tmp/pet_face_pic.jpg` (named in the assignment) is the one exception worth flagging: it
 //! exists only as a literal string inside **`ctrl`**, not `media`/`libalgo.so`. Disassembling its
 //! one use site shows `ctrl` *opening it for reading* (existence check, `open`-then-`snprintf` of
@@ -86,6 +96,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::catid;
 use crate::faces;
 
 /// Bus message ids relevant to the AI pipeline. See the module doc for how each was recovered.
@@ -191,6 +202,8 @@ pub struct Detection {
     pub b0x: Option<[f32; 4]>,
     /// Filename under `EVENTS_DIR` this detection's crop was saved to, if the copy succeeded.
     pub image: Option<String>,
+    /// Kibble's own classifier's opinion, when confident -- see "Update: `cat` is real" above.
+    pub cat: Option<String>,
 }
 
 impl Detection {
@@ -198,24 +211,24 @@ impl Detection {
         fn opt_num(v: Option<f32>) -> String {
             v.map_or("null".into(), |n| n.to_string())
         }
+        fn opt_str(v: &Option<String>) -> String {
+            v.as_ref().map_or("null".into(), |s| format!("\"{}\"", s.escape_debug()))
+        }
         let box_json = match self.b0x {
             Some([x, y, w, h]) => format!("[{x},{y},{w},{h}]"),
             None => "null".into(),
         };
         let pet_id = self.pet_id.map_or("null".to_string(), |v| v.to_string());
-        let image = match &self.image {
-            Some(name) => format!("\"{}\"", name.escape_debug()),
-            None => "null".into(),
-        };
         format!(
-            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{}}}"#,
+            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{},"cat":{}}}"#,
             self.seq,
             self.ts,
             self.class,
             opt_num(self.score),
             box_json,
             pet_id,
-            image,
+            opt_str(&self.image),
+            opt_str(&self.cat),
         )
     }
 }
@@ -241,7 +254,7 @@ impl Feed {
         })
     }
 
-    fn push(&self, class: &'static str, image: Option<String>) {
+    fn push(&self, class: &'static str, image: Option<String>, cat: Option<String>) {
         let mut inner = self.inner.lock().unwrap();
         let seq = inner.next_seq;
         inner.next_seq += 1;
@@ -253,6 +266,7 @@ impl Feed {
             pet_id: None,
             b0x: None,
             image,
+            cat,
         });
         while inner.events.len() > MAX_EVENTS {
             inner.events.pop_front();
@@ -305,7 +319,7 @@ fn check_one(w: &Watched, last_seen: Option<SystemTime>) -> (Option<SystemTime>,
     }
 }
 
-fn poll_loop(feed: Arc<Feed>) {
+fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>) {
     let _ = fs::create_dir_all(EVENTS_DIR);
     let mut last_seen: Vec<Option<SystemTime>> = vec![None; WATCHED.len()];
     loop {
@@ -316,10 +330,23 @@ fn poll_loop(feed: Arc<Feed>) {
                 let ts = now_unix();
                 let name = format!("{ts}-{}.jpg", w.class);
                 let saved = fs::write(Path::new(EVENTS_DIR).join(&name), &bytes).is_ok();
+                let mut cat = None;
                 if w.is_face_crop {
-                    let _ = faces::save_pending(&bytes, None);
+                    if let Ok(pending_name) = faces::save_pending(&bytes, None) {
+                        let pending_path = Path::new(faces::PENDING_DIR).join(&pending_name);
+                        match faces::ensure_embedding(&pending_path) {
+                            Ok(feat) => {
+                                if let catid::Verdict::Known { cat: found_cat, .. } = gallery.identify(&feat) {
+                                    cat = Some(found_cat);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("kibbled: ai: embed {}: {e}", pending_path.display())
+                            }
+                        }
+                    }
                 }
-                feed.push(w.class, saved.then_some(name));
+                feed.push(w.class, saved.then_some(name), cat);
             }
         }
         thread::sleep(POLL_INTERVAL);
@@ -328,10 +355,10 @@ fn poll_loop(feed: Arc<Feed>) {
 
 /// Start the background poller and return the shared feed handle for `main.rs` to route
 /// `GET /events`/`GET /events/stream` against.
-pub fn spawn() -> Arc<Feed> {
+pub fn spawn(gallery: Arc<faces::Gallery>) -> Arc<Feed> {
     let feed = Feed::new();
     let handle = Arc::clone(&feed);
-    thread::spawn(move || poll_loop(handle));
+    thread::spawn(move || poll_loop(handle, gallery));
     feed
 }
 
@@ -375,7 +402,7 @@ mod tests {
     fn push_assigns_increasing_seq_and_caps_at_max_events() {
         let feed = Feed::new();
         for _ in 0..(MAX_EVENTS + 10) {
-            feed.push("visit", None);
+            feed.push("visit", None, None);
         }
         let inner = feed.inner.lock().unwrap();
         assert_eq!(inner.events.len(), MAX_EVENTS);
@@ -384,41 +411,70 @@ mod tests {
         assert_eq!(inner.events.back().unwrap().seq, (MAX_EVENTS + 10) as u64);
     }
 
-    #[test]
     fn wait_since_returns_immediately_when_already_caught_up_to_a_past_seq() {
         let feed = Feed::new();
-        feed.push("eat", None);
-        feed.push("eat", None);
+        feed.push("eat", None, None);
+        feed.push("eat", None, None);
         let json = feed.wait_since(0, Duration::from_millis(50));
         assert!(json.contains("\"seq\":1"));
         assert!(json.contains("\"seq\":2"));
     }
 
-    #[test]
     fn wait_since_filters_out_already_seen_events() {
         let feed = Feed::new();
-        feed.push("eat", None);
-        feed.push("eat", None);
+        feed.push("eat", None, None);
+        feed.push("eat", None, None);
         let json = feed.wait_since(1, Duration::from_millis(50));
         assert!(!json.contains("\"seq\":1"));
         assert!(json.contains("\"seq\":2"));
     }
 
-    #[test]
     fn wait_since_times_out_to_an_empty_array_with_nothing_new() {
         let feed = Feed::new();
-        feed.push("eat", None);
+        feed.push("eat", None, None);
         let json = feed.wait_since(1, Duration::from_millis(30));
         assert_eq!(json, "[]");
     }
 
-    #[test]
     fn detection_json_uses_null_for_the_fields_this_tap_cannot_fill() {
-        let d = Detection { seq: 1, ts: 100, class: "face", score: None, pet_id: None, b0x: None, image: None };
+        let d = Detection {
+            seq: 1,
+            ts: 100,
+            class: "face",
+            score: None,
+            pet_id: None,
+            b0x: None,
+            image: None,
+            cat: None,
+        };
         let json = d.to_json();
         assert!(json.contains(r#""score":null"#));
         assert!(json.contains(r#""pet_id":null"#));
         assert!(json.contains(r#""box":null"#));
         assert!(json.contains(r#""image":null"#));
+        assert!(json.contains(r#""cat":null"#));
+    }
+
+    #[test]
+    fn detection_json_includes_a_real_cat_when_the_classifier_is_confident() {
+        let d = Detection {
+            seq: 1,
+            ts: 100,
+            class: "face",
+            score: None,
+            pet_id: None,
+            b0x: None,
+            image: None,
+            cat: Some("Rashy".to_string()),
+        };
+        assert!(d.to_json().contains(r#""cat":"Rashy""#));
+    }
+
+    #[test]
+    fn push_carries_the_identified_cat_through_to_the_stored_detection() {
+        let feed = Feed::new();
+        feed.push("face", Some("1-Rashy.jpg".to_string()), Some("Rashy".to_string()));
+        let inner = feed.inner.lock().unwrap();
+        assert_eq!(inner.events.back().unwrap().cat.as_deref(), Some("Rashy"));
     }
 }

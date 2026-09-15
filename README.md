@@ -38,7 +38,8 @@ The agent uses **280 KB of RSS**, one thread, and no external dependencies.
 | Dispense (per auger, amount, cancel) | working, verified by dispensing |
 | Live state (feeding, bowl fill, desiccant, firmware) | working |
 | Camera / two-way audio via Scrypted | designed, not implemented ([docs](docs/scrypted-onboarding.md)) |
-| Schedule, settings, events, cat identification | see [docs/design-entities.md](docs/design-entities.md) |
+| Schedule, settings, events | see [docs/design-entities.md](docs/design-entities.md) |
+| Cat identification (NPU embeddings + self-trained classifier) | working, see [docs/27-cat-id.md](docs/27-cat-id.md) |
 
 See [docs/](docs/) for the reverse-engineering notes this is built on, including the exact wire
 formats and the addresses they were recovered from.

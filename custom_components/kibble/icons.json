@@ -20,13 +20,17 @@
       "light_mode": { "default": "mdi:led-variant-outline" },
       "tone_mode": { "default": "mdi:volume-off" },
       "manual_lock": { "default": "mdi:lock-outline" },
-      "smart_frame": { "default": "mdi:crop-free" }
+      "smart_frame": { "default": "mdi:crop-free" },
+      "cat_present": { "default": "mdi:cat" }
     },
     "button": {
       "feed": { "default": "mdi:bowl-mix" },
       "feed_hopper_1": { "default": "mdi:numeric-1-circle" },
       "feed_hopper_2": { "default": "mdi:numeric-2-circle" },
       "cancel_feed": { "default": "mdi:stop-circle-outline" }
+    },
+    "image": {
+      "pending_face": { "default": "mdi:image-search-outline" }
     },
     "number": {
       "feed_amount": { "default": "mdi:counter" },
@@ -82,10 +86,14 @@
           "-60": "mdi:wifi-strength-3",
           "-50": "mdi:wifi-strength-4"
         }
-      }
+      },
+      "last_seen_pet": { "default": "mdi:cat" },
+      "identification_score": { "default": "mdi:percent-outline" },
+      "pending_faces": { "default": "mdi:image-multiple-outline" }
     },
     "select": {
-      "wifi": { "default": "mdi:access-point-network" }
+      "wifi": { "default": "mdi:access-point-network" },
+      "label_face": { "default": "mdi:tag-outline" }
     },
     "switch": {
       "cloud": {
@@ -104,6 +112,9 @@
     "schedule_add": "mdi:calendar-plus",
     "schedule_remove": "mdi:calendar-remove",
     "schedule_set_enabled": "mdi:calendar-check",
-    "wifi_connect": "mdi:wifi-plus"
+    "wifi_connect": "mdi:wifi-plus",
+    "label_face": "mdi:tag-outline",
+    "add_cat": "mdi:cat",
+    "identify": "mdi:magnify-scan"
   }
 }

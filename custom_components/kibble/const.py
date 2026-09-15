@@ -62,3 +62,20 @@ MAX_AMOUNT = 20
 SERVICE_WIFI_CONNECT = "wifi_connect"
 ATTR_SSID = "ssid"
 ATTR_PASSWORD = "password"
+
+SERVICE_LABEL_FACE = "label_face"
+SERVICE_ADD_CAT = "add_cat"
+SERVICE_IDENTIFY = "identify"
+
+ATTR_CROP_ID = "crop_id"
+ATTR_CAT = "cat"
+ATTR_CAT_NAME = "name"
+
+# The two reserved `cat` bucket values `agent/src/faces.rs` treats specially: moved and
+# embedded like any real cat, but never counted as one (excluded from `GET /cats` and the
+# classifier). Display strings are what `select.cat_feeder_label_face` shows in the picker;
+# the bucket values are the wire values `POST /faces/label` actually receives.
+CAT_LABEL_SKIP = "Skip"
+CAT_LABEL_NOT_A_CAT = "Not a cat"
+CAT_BUCKET_SKIP = "other"
+CAT_BUCKET_NOT_A_CAT = "not_a_cat"

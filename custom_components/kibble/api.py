@@ -190,6 +190,80 @@ class WifiState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CatInfo:
+    """One enrolled cat, as reported by `GET /cats` (`agent/src/faces.rs`'s `Gallery`)."""
+
+    name: str
+    samples: int
+    last_seen: int | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> CatInfo:
+        return cls(
+            name=str(data.get("name", "")),
+            samples=int(data.get("samples") or 0),
+            last_seen=data.get("last_seen"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IdentifyScore:
+    """A cat/score pair -- `IdentifyResult.second_best`."""
+
+    cat: str
+    score: float
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> IdentifyScore:
+        return cls(cat=str(data.get("cat", "")), score=float(data.get("score") or 0.0))
+
+
+@dataclass(frozen=True, slots=True)
+class IdentifyResult:
+    """`GET /identify`: Kibble's own frozen-embedding classifier's opinion of the newest
+    pending crop, or ground truth from the most recently labelled one once the review queue is
+    empty -- `source` distinguishes the two ("classifier" vs "labelled"). `cat` is `None` only
+    when nothing has ever been captured; once a crop exists it is a real name or the literal
+    string `"unknown"` (the classifier ran but wasn't confident)."""
+
+    cat: str | None
+    score: float | None
+    second_best: IdentifyScore | None
+    crop: str | None
+    source: str | None
+    ts: int | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> IdentifyResult:
+        second = data.get("second_best")
+        return cls(
+            cat=data.get("cat"),
+            score=data.get("score"),
+            second_best=IdentifyScore.from_json(second) if second else None,
+            crop=data.get("crop"),
+            source=data.get("source"),
+            ts=data.get("ts"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFace:
+    """`GET /faces/current/info`: metadata for whichever crop `image.*_pending_face` is
+    currently showing -- the oldest pending crop, or the most recently labelled one once the
+    queue is empty (`agent/src/faces.rs`'s `review_target`)."""
+
+    status: str  # "pending" | "labelled" | "none"
+    name: str | None
+    cat: str | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ReviewFace:
+        return cls(
+            status=str(data.get("status", "none")), name=data.get("name"), cat=data.get("cat")
+        )
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -327,3 +401,32 @@ class KibbleClient:
         """Removes a Kibble-added network; the agent 400s for the vendor's own network or the
         one currently providing connectivity."""
         return WifiState.from_json(await self._request("POST", "/wifi/forget", {"ssid": ssid}))
+
+    async def cats(self) -> list[CatInfo]:
+        return [CatInfo.from_json(c) for c in await self._request("GET", "/cats")]
+
+    async def pending_faces(self) -> list[str]:
+        """Filenames of every crop still awaiting a human label (`GET /faces/pending`) --
+        backs the diagnostic pending-count sensor."""
+        return list(await self._request("GET", "/faces/pending"))
+
+    async def add_cat(self, name: str) -> None:
+        """Pre-register a cat with zero samples, so it appears in the label select's options
+        before its first crop is ever labelled. The agent 400s for a reserved bucket name."""
+        await self._request("POST", "/cats", {"name": name})
+
+    async def identify(self) -> IdentifyResult:
+        return IdentifyResult.from_json(await self._request("GET", "/identify"))
+
+    async def review_face(self) -> ReviewFace:
+        return ReviewFace.from_json(await self._request("GET", "/faces/current/info"))
+
+    async def label_face(self, crop_id: str, cat: str) -> None:
+        """Moves a pending crop into `cat`'s permanent storage and feeds its embedding into
+        that cat's running centroid (`agent/src/main.rs`'s `faces_label_post`)."""
+        await self._request("POST", "/faces/label", {"name": crop_id, "cat": cat})
+
+    async def unlabel_face(self, crop_id: str, cat: str) -> None:
+        """The exact inverse of `label_face` -- moves a labelled crop back to pending and
+        corrects the centroid. A full re-label is this followed by another `label_face`."""
+        await self._request("POST", "/faces/unlabel", {"name": crop_id, "cat": cat})

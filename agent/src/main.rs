@@ -32,6 +32,20 @@
 //!   GET    /faces/pending/<name>    one pending crop's raw JPEG bytes
 //!   POST   /faces/label             {"name": "...", "cat": "..."}  moves a pending crop into
 //!                                   permanent, cat-named storage
+//!   POST   /faces/unlabel           {"name": "...", "cat": "..."}  moves a labelled crop back
+//!                                   into the pending queue (undo, or the first half of a
+//!                                   re-label -- follow with another POST /faces/label)
+//!   GET    /faces/current           raw JPEG of the crop to review: oldest pending, else the
+//!                                   most recently labelled crop (see faces.rs's review_target)
+//!   GET    /faces/current/info      {"status":"pending"|"labelled"|"none","name","cat"} --
+//!                                   metadata for the image above
+//!   GET    /cats                    [{"name","samples","last_seen"}] every enrolled cat
+//!                                   (see catid.rs/faces.rs's Gallery)
+//!   POST   /cats                    {"name": "..."}  pre-register a cat with zero samples
+//!   GET    /identify                {"cat","score","second_best","crop","source","ts"} --
+//!                                   Kibble's own classifier's best guess for the newest
+//!                                   pending crop, or ground truth from the most recently
+//!                                   labelled one once the queue is empty -- see docs/27-cat-id.md
 //!   GET    /feeds                   before/after dish snapshots per feed cycle (see
 //!                                   feed_capture.rs), manual and scheduled alike
 //!   GET    /feeds/<name>            one snapshot's raw H.264 keyframe bytes
@@ -60,8 +74,10 @@ mod advertise;
 mod ai;
 mod backup;
 mod bus;
+mod catid;
 mod cloud;
 mod desired;
+mod embed;
 mod faces;
 mod feed_capture;
 mod http;
@@ -74,6 +90,7 @@ mod settings;
 mod state;
 mod wifi;
 
+use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,6 +138,10 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
 
+    // Scans every labelled crop on disk and computes/caches any embedding not already cached --
+    // see `faces::Gallery::load`. A one-time startup cost, not on any request's critical path.
+    let gallery = Arc::new(faces::Gallery::load());
+
     let main_feed = VideoFeed::new();
     let sub_feed = VideoFeed::new();
     let _poller = ring::spawn(main_feed.clone(), sub_feed.clone())
@@ -130,7 +151,7 @@ fn main() {
     let capture = feed_capture::spawn(Arc::clone(&shm), Arc::clone(&sub_feed));
     let feeds = Arc::new(rtsp::Feeds { main: main_feed, sub: sub_feed });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
-    let ai_feed = ai::spawn();
+    let ai_feed = ai::spawn(Arc::clone(&gallery));
 
     eprintln!(
         "kibbled: listening on {bind}, rtsp on {RTSP_BIND} (/main chan {}, /sub chan {})",
@@ -142,7 +163,7 @@ fn main() {
     persist::spawn_reconciler(Arc::clone(&shm));
     wifi::spawn_reconciler();
     let _ = http::serve(listener, |req| {
-        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture)
+        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture, &gallery)
     });
 }
 
@@ -160,6 +181,7 @@ fn route(
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
     capture: &feed_capture::FeedCapture,
+    gallery: &faces::Gallery,
 ) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
@@ -190,7 +212,13 @@ fn route(
         ("GET", p) if p.starts_with("/faces/pending/") => {
             faces_pending_get(&p["/faces/pending/".len()..])
         }
-        ("POST", "/faces/label") => faces_label_post(req),
+        ("POST", "/faces/label") => faces_label_post(req, gallery),
+        ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery),
+        ("GET", "/faces/current") => faces_current_get(),
+        ("GET", "/faces/current/info") => faces_current_info_get(),
+        ("GET", "/cats") => cats_get(gallery),
+        ("POST", "/cats") => cats_post(req, gallery),
+        ("GET", "/identify") => identify_get(gallery),
         ("GET", "/feeds") => feeds_list(capture),
         ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
         ("GET", "/ble") => Response::Json(ble_adv.status_json()),
@@ -230,7 +258,7 @@ fn faces_pending_get(name: &str) -> Response {
     }
 }
 
-fn faces_label_post(req: &Request) -> Response {
+fn faces_label_post(req: &Request, gallery: &faces::Gallery) -> Response {
     let name = match json_field(&req.body, "name").filter(|s| !s.is_empty()) {
         Some(n) => n,
         None => return Response::BadRequest(r#""name" is required"#.into()),
@@ -240,16 +268,148 @@ fn faces_label_post(req: &Request) -> Response {
         None => return Response::BadRequest(r#""cat" is required"#.into()),
     };
     match faces::label(name, cat) {
-        Ok(()) => Response::Json(format!(
-            r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,
-            name.escape_debug(),
-            cat.escape_debug()
-        )),
+        Ok(()) => {
+            let dest = PathBuf::from(faces::FACES_ROOT).join(cat).join(name);
+            match faces::ensure_embedding(&dest) {
+                Ok(feat) => gallery.on_labelled(cat, &feat),
+                Err(e) => eprintln!("kibbled: faces: embed after label {}: {e}", dest.display()),
+            }
+            Response::Json(format!(
+                r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,
+                name.escape_debug(),
+                cat.escape_debug()
+            ))
+        }
         Err(e @ (faces::FaceError::InvalidName | faces::FaceError::InvalidCat(_))) => {
             Response::BadRequest(e.to_string())
         }
         Err(faces::FaceError::NotFound) => Response::NotFound,
         Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_unlabel_post(req: &Request, gallery: &faces::Gallery) -> Response {
+    let name = match json_field(&req.body, "name").filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => return Response::BadRequest(r#""name" is required"#.into()),
+    };
+    let cat = match json_field(&req.body, "cat").filter(|s| !s.is_empty()) {
+        Some(c) => c,
+        None => return Response::BadRequest(r#""cat" is required"#.into()),
+    };
+    // Computed before the move below, from whichever directory the crop is in right now --
+    // `faces::unlabel` renames it away, and a `.emb` sidecar right alongside travels with it.
+    let src = PathBuf::from(faces::FACES_ROOT).join(cat).join(name);
+    let feat = faces::ensure_embedding(&src).ok();
+    match faces::unlabel(cat, name) {
+        Ok(()) => {
+            if let Some(feat) = feat {
+                gallery.on_unlabelled(cat, &feat);
+            }
+            Response::Json(format!(
+                r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,
+                name.escape_debug(),
+                cat.escape_debug()
+            ))
+        }
+        Err(e @ (faces::FaceError::InvalidName | faces::FaceError::InvalidCat(_))) => {
+            Response::BadRequest(e.to_string())
+        }
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_current_get() -> Response {
+    match faces::review_target() {
+        Ok(Some(target)) => match fs::read(target.jpg_path()) {
+            Ok(bytes) => Response::Blob("image/jpeg", bytes),
+            Err(_) => Response::NotFound,
+        },
+        Ok(None) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_current_info_get() -> Response {
+    match faces::review_target() {
+        Ok(Some(faces::FaceTarget::Pending { name })) => Response::Json(format!(
+            r#"{{"status":"pending","name":"{}","cat":null}}"#,
+            name.escape_debug()
+        )),
+        Ok(Some(faces::FaceTarget::Labelled { cat, name })) => Response::Json(format!(
+            r#"{{"status":"labelled","name":"{}","cat":"{}"}}"#,
+            name.escape_debug(),
+            cat.escape_debug()
+        )),
+        Ok(None) => Response::Json(r#"{"status":"none","name":null,"cat":null}"#.into()),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn cats_get(gallery: &faces::Gallery) -> Response {
+    Response::Json(gallery.cats_json())
+}
+
+fn cats_post(req: &Request, gallery: &faces::Gallery) -> Response {
+    let name = match json_field(&req.body, "name").filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => return Response::BadRequest(r#""name" is required"#.into()),
+    };
+    match gallery.add_cat(name) {
+        Ok(()) => Response::Json(format!(r#"{{"ok":true,"name":"{}"}}"#, name.escape_debug())),
+        Err(e @ faces::FaceError::InvalidCat(_)) => Response::BadRequest(e.to_string()),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+/// `GET /identify`: Kibble's own classifier's opinion of the newest pending crop, or ground
+/// truth from the most recently labelled one once the queue is empty (`source` distinguishes
+/// the two -- see the module doc and `docs/27-cat-id.md`).
+fn identify_get(gallery: &faces::Gallery) -> Response {
+    let target = match faces::identify_target() {
+        Ok(t) => t,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let Some(target) = target else {
+        return Response::Json(
+            r#"{"cat":null,"score":null,"second_best":null,"crop":null,"source":null,"ts":null}"#
+                .into(),
+        );
+    };
+    let path = target.jpg_path();
+    let ts = fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let ts_json = ts.map_or("null".to_string(), |t| t.to_string());
+    let crop_json = format!("\"{}\"", target.name().escape_debug());
+    match target {
+        faces::FaceTarget::Labelled { cat, .. } => Response::Json(format!(
+            r#"{{"cat":"{}","score":null,"second_best":null,"crop":{crop_json},"source":"labelled","ts":{ts_json}}}"#,
+            cat.escape_debug(),
+        )),
+        faces::FaceTarget::Pending { .. } => match faces::ensure_embedding(&path) {
+            Ok(feat) => {
+                let (cat_json, score_json, second_json) = match gallery.identify(&feat) {
+                    catid::Verdict::Known { cat, score, second_best } => (
+                        format!("\"{}\"", cat.escape_debug()),
+                        score.to_string(),
+                        second_best.map_or("null".to_string(), |s| {
+                            format!(r#"{{"cat":"{}","score":{}}}"#, s.cat.escape_debug(), s.score)
+                        }),
+                    ),
+                    catid::Verdict::Unknown { .. } => {
+                        ("\"unknown\"".to_string(), "null".to_string(), "null".to_string())
+                    }
+                };
+                Response::Json(format!(
+                    r#"{{"cat":{cat_json},"score":{score_json},"second_best":{second_json},"crop":{crop_json},"source":"classifier","ts":{ts_json}}}"#
+                ))
+            }
+            Err(e) => Response::Error(e.to_string()),
+        },
     }
 }
 
