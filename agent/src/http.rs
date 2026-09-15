@@ -23,16 +23,20 @@ pub enum Response {
     BadRequest(String),
     NotFound,
     Error(String),
+    /// Raw bytes with an explicit content type -- JPEG face crops, H.264 keyframe snapshots.
+    /// Not representable as `Json`'s `String` since the body is arbitrary, non-UTF-8 binary.
+    Blob(&'static str, Vec<u8>),
 }
 
 impl Response {
-    fn parts(&self) -> (u16, &'static str, String) {
+    fn into_parts(self) -> (u16, &'static str, Vec<u8>) {
         match self {
-            Response::Json(b) => (200, "application/json", b.clone()),
-            Response::NoContent => (204, "text/plain", String::new()),
-            Response::BadRequest(m) => (400, "application/json", err_json(m)),
-            Response::NotFound => (404, "application/json", err_json("not found")),
-            Response::Error(m) => (500, "application/json", err_json(m)),
+            Response::Json(b) => (200, "application/json", b.into_bytes()),
+            Response::NoContent => (204, "text/plain", Vec::new()),
+            Response::BadRequest(m) => (400, "application/json", err_json(&m).into_bytes()),
+            Response::NotFound => (404, "application/json", err_json("not found").into_bytes()),
+            Response::Error(m) => (500, "application/json", err_json(&m).into_bytes()),
+            Response::Blob(ctype, bytes) => (200, ctype, bytes),
         }
     }
 }
@@ -83,7 +87,7 @@ where
     let mut filled = 0;
     let head_end = loop {
         if filled == buf.len() {
-            return write_response(stream, &Response::BadRequest("request too large".into()));
+            return write_response(stream, Response::BadRequest("request too large".into()));
         }
         let n = stream.read(&mut buf[filled..])?;
         if n == 0 {
@@ -109,12 +113,12 @@ where
         })
         .unwrap_or(0);
     if want > MAX_REQUEST - head_end {
-        return write_response(stream, &Response::BadRequest("body too large".into()));
+        return write_response(stream, Response::BadRequest("body too large".into()));
     }
     while filled < head_end + want {
         let n = stream.read(&mut buf[filled..])?;
         if n == 0 {
-            return write_response(stream, &Response::BadRequest("truncated body".into()));
+            return write_response(stream, Response::BadRequest("truncated body".into()));
         }
         filled += n;
     }
@@ -125,22 +129,22 @@ where
         body: String::from_utf8_lossy(&buf[head_end..head_end + want]).into_owned(),
     };
     let resp = handler(&req);
-    write_response(stream, &resp)
+    write_response(stream, resp)
 }
 
 fn find_headers_end(b: &[u8]) -> Option<usize> {
     b.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
-fn write_response(stream: &mut TcpStream, resp: &Response) -> io::Result<()> {
-    let (code, ctype, body) = resp.parts();
+fn write_response(stream: &mut TcpStream, resp: Response) -> io::Result<()> {
+    let (code, ctype, body) = resp.into_parts();
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         reason(code),
         body.len()
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    stream.write_all(&body)?;
     stream.flush()
 }
 

@@ -23,6 +23,18 @@
 //!   GET    /cloud                   {"enabled","last_error","routes","connections"} -- the
 //!                                   Petkit-cloud kill switch's status (see cloud.rs)
 //!   POST   /cloud                   {"enabled": bool}  flip the kill switch
+//!   GET    /events                  last 50 detections (see ai.rs) -- vendor JPEG side effects
+//!                                   polled from /tmp, NOT a tap of ctrl's private mqueue inbox;
+//!                                   score/pet_id/box are honestly null -- see ai.rs's module doc
+//!   GET    /events/stream?since=N   long-poll for detections past sequence N (empty array on
+//!                                   timeout, ~25s)
+//!   GET    /faces/pending           pending face crops awaiting a human label (see faces.rs)
+//!   GET    /faces/pending/<name>    one pending crop's raw JPEG bytes
+//!   POST   /faces/label             {"name": "...", "cat": "..."}  moves a pending crop into
+//!                                   permanent, cat-named storage
+//!   GET    /feeds                   before/after dish snapshots per feed cycle (see
+//!                                   feed_capture.rs), manual and scheduled alike
+//!   GET    /feeds/<name>            one snapshot's raw H.264 keyframe bytes
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
@@ -30,10 +42,13 @@
 //! shared-memory frame ring), and keeps its own settings record in `/opt/kibble/` — see
 //! `persist.rs` and `docs/21-config-encryption.md`.
 
+mod ai;
 mod backup;
 mod bus;
 mod cloud;
 mod desired;
+mod faces;
+mod feed_capture;
 mod http;
 mod md5;
 mod persist;
@@ -93,8 +108,10 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
     let rtsp_listener =
         TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
+    let capture = feed_capture::spawn(Arc::clone(&shm), Arc::clone(&sub_feed));
     let feeds = Arc::new(rtsp::Feeds { main: main_feed, sub: sub_feed });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
+    let ai_feed = ai::spawn();
 
     eprintln!(
         "kibbled: listening on {bind}, rtsp on {RTSP_BIND} (/main chan {}, /sub chan {})",
@@ -104,7 +121,8 @@ fn main() {
 
     cloud::spawn_reconciler();
     persist::spawn_reconciler(Arc::clone(&shm));
-    let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds));
+    let _ =
+        http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds, &ai_feed, &capture));
 }
 
 fn die(msg: &str) -> ! {
@@ -112,13 +130,21 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule, feeds: &rtsp::Feeds) -> Response {
+fn route(
+    req: &Request,
+    shm: &Shm,
+    ble: &Sender,
+    schedule: &mut Schedule,
+    feeds: &rtsp::Feeds,
+    ai_feed: &ai::Feed,
+    capture: &feed_capture::FeedCapture,
+) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
         ("GET", "/state") => Response::Json(shm.snapshot().to_json()),
         ("GET", "/config") => Response::Json(settings::to_json(shm)),
         ("POST", "/config") => config_write(req),
-        ("POST", "/feed") => feed(req, ble),
+        ("POST", "/feed") => feed(req, ble, capture),
         ("POST", "/feed/cancel") => send_feed(
             ble,
             FeedCtrl {
@@ -136,7 +162,84 @@ fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule, feeds:
         ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble),
         ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble),
         ("POST", "/schedule/entry/enabled") => post_schedule_entry_enabled(req, schedule, ble),
+        ("GET", "/events") => Response::Json(ai_feed.snapshot_json()),
+        ("GET", "/events/stream") => events_stream(query, ai_feed),
+        ("GET", "/faces/pending") => faces_pending_list(),
+        ("GET", p) if p.starts_with("/faces/pending/") => {
+            faces_pending_get(&p["/faces/pending/".len()..])
+        }
+        ("POST", "/faces/label") => faces_label_post(req),
+        ("GET", "/feeds") => feeds_list(capture),
+        ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
         _ => Response::NotFound,
+    }
+}
+
+/// `GET /events/stream?since=N`: `since` defaults to 0 (an HA/Scrypted client's first call gets
+/// everything currently buffered, exactly like `GET /events`, then remembers the highest `seq`
+/// it saw for the next call).
+fn events_stream(query: &str, ai_feed: &ai::Feed) -> Response {
+    let since: u64 = http::query_field(query, "since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    Response::Json(ai_feed.wait_since(since, ai::LONG_POLL_TIMEOUT))
+}
+
+fn faces_pending_list() -> Response {
+    match faces::list_pending() {
+        Ok(names) => {
+            let items: Vec<String> = names.iter().map(|n| format!("\"{}\"", n.escape_debug())).collect();
+            Response::Json(format!("[{}]", items.join(",")))
+        }
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_pending_get(name: &str) -> Response {
+    match faces::read_pending(name) {
+        Ok(bytes) => Response::Blob("image/jpeg", bytes),
+        Err(faces::FaceError::InvalidName) => Response::BadRequest("invalid file name".into()),
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_label_post(req: &Request) -> Response {
+    let name = match json_field(&req.body, "name").filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => return Response::BadRequest(r#""name" is required"#.into()),
+    };
+    let cat = match json_field(&req.body, "cat").filter(|s| !s.is_empty()) {
+        Some(c) => c,
+        None => return Response::BadRequest(r#""cat" is required"#.into()),
+    };
+    match faces::label(name, cat) {
+        Ok(()) => Response::Json(format!(
+            r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,
+            name.escape_debug(),
+            cat.escape_debug()
+        )),
+        Err(e @ (faces::FaceError::InvalidName | faces::FaceError::InvalidCat(_))) => {
+            Response::BadRequest(e.to_string())
+        }
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn feeds_list(capture: &feed_capture::FeedCapture) -> Response {
+    match capture.list_json() {
+        Ok(json) => Response::Json(json),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn feeds_get(capture: &feed_capture::FeedCapture, name: &str) -> Response {
+    match capture.read_file(name) {
+        Ok(bytes) => Response::Blob("video/h264", bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            Response::BadRequest("invalid file name".into())
+        }
+        Err(e) => Response::Error(e.to_string()),
     }
 }
 
@@ -178,7 +281,7 @@ fn cloud_write(req: &Request) -> Response {
     }
 }
 
-fn feed(req: &Request, ble: &Sender) -> Response {
+fn feed(req: &Request, ble: &Sender, capture: &feed_capture::FeedCapture) -> Response {
     let amount: u8 = match json_field(&req.body, "amount").and_then(|v| v.parse().ok()) {
         Some(n) if (1..=20).contains(&n) => n,
         _ => return Response::BadRequest("amount must be 1..=20 portions".into()),
@@ -199,6 +302,10 @@ fn feed(req: &Request, ble: &Sender) -> Response {
                 .unwrap_or(0);
             format!("kibble-{t}")
         });
+    // Before sending: leave a note the feed-capture watcher can claim the instant it sees the
+    // feeding flag rise, so the resulting before/after pair is attributed to this exact call
+    // (amounts, id, manual=true) instead of falling back to an unattributed "scheduled-*" id.
+    capture.note_manual_feed(id.clone(), a1, a2);
     send_feed(
         ble,
         FeedCtrl {
