@@ -38,6 +38,7 @@ be recovered, that is stated rather than guessed — read those gaps as gaps.
 - [10-bt-linux.md](10-bt-linux.md) — why the Wi-Fi module's Bluetooth cannot be used
 - [17-ble-fallback.md](17-ble-fallback.md) — BLE fallback: measured, and why it is deferred
 - [11-media.md](11-media.md) — encoder channels, audio in/out, the frame ring, talkback
+- [19-frame-ring.md](19-frame-ring.md) — **the frame ring decoded**, and the zero-re-encode streaming decision
 - [15-settings-write.md](15-settings-write.md) — how the ~40 device settings are written, with byte offsets
 - [16-schedule.md](16-schedule.md) — the feed schedule: write protocol, and why there is no read-back
 - [12-ai.md](12-ai.md) — the detection/identification pipeline and its models
