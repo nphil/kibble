@@ -107,3 +107,19 @@ schedule_set_enabled:
       required: true
       selector:
         boolean:
+
+wifi_connect:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    ssid:
+      required: true
+      selector:
+        text:
+    password:
+      selector:
+        text:
+          type: password

@@ -58,3 +58,7 @@ MAX_SCHEDULE_ENTRIES = 24
 # unit into one dispense cycle.
 MIN_AMOUNT = 1
 MAX_AMOUNT = 20
+
+SERVICE_WIFI_CONNECT = "wifi_connect"
+ATTR_SSID = "ssid"
+ATTR_PASSWORD = "password"

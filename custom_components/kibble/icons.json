@@ -71,7 +71,21 @@
           "bluetooth": "mdi:bluetooth",
           "unreachable": "mdi:lan-disconnect"
         }
+      },
+      "wifi": { "default": "mdi:wifi" },
+      "wifi_signal": {
+        "default": "mdi:wifi-strength-outline",
+        "range": {
+          "-90": "mdi:wifi-strength-outline",
+          "-80": "mdi:wifi-strength-1",
+          "-70": "mdi:wifi-strength-2",
+          "-60": "mdi:wifi-strength-3",
+          "-50": "mdi:wifi-strength-4"
+        }
       }
+    },
+    "select": {
+      "wifi": { "default": "mdi:access-point-network" }
     },
     "switch": {
       "cloud": {
@@ -89,6 +103,7 @@
     "schedule_set": "mdi:calendar-sync",
     "schedule_add": "mdi:calendar-plus",
     "schedule_remove": "mdi:calendar-remove",
-    "schedule_set_enabled": "mdi:calendar-check"
+    "schedule_set_enabled": "mdi:calendar-check",
+    "wifi_connect": "mdi:wifi-plus"
   }
 }
