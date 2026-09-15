@@ -138,6 +138,9 @@
       "schedule": {
         "name": "Schedule"
       },
+      "schedule_card_state": {
+        "name": "Schedule card state"
+      },
       "move_sensitivity": {
         "name": "Motion detection sensitivity"
       },
@@ -346,6 +349,86 @@
         }
       }
     },
+    "schedule_card_add": {
+      "name": "Add schedule card entry",
+      "description": "Thin adapter for the embedded dispenser-schedule-card: add one entry, delegating to schedule_add with one amount mirrored to both hoppers.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to add an entry to."
+        },
+        "id": {
+          "name": "Entry ID",
+          "description": "The id the card assigned this entry."
+        },
+        "hour": {
+          "name": "Hour",
+          "description": "Hour of day, 24-hour (0-23)."
+        },
+        "minute": {
+          "name": "Minute",
+          "description": "Minute of the hour (0-59)."
+        },
+        "amount": {
+          "name": "Amount",
+          "description": "Portions, mirrored to both hoppers."
+        }
+      }
+    },
+    "schedule_card_edit": {
+      "name": "Edit schedule card entry",
+      "description": "Thin adapter for the embedded dispenser-schedule-card: change an existing entry's time and amount in place.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to edit an entry on."
+        },
+        "id": {
+          "name": "Entry ID",
+          "description": "The existing entry's id."
+        },
+        "hour": {
+          "name": "Hour",
+          "description": "Hour of day, 24-hour (0-23)."
+        },
+        "minute": {
+          "name": "Minute",
+          "description": "Minute of the hour (0-59)."
+        },
+        "amount": {
+          "name": "Amount",
+          "description": "Portions, mirrored to both hoppers."
+        }
+      }
+    },
+    "schedule_card_remove": {
+      "name": "Remove schedule card entry",
+      "description": "Thin adapter for the embedded dispenser-schedule-card: remove one entry, delegating to schedule_remove.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to remove an entry from."
+        },
+        "id": {
+          "name": "Entry ID",
+          "description": "The entry's id."
+        }
+      }
+    },
+    "schedule_card_toggle": {
+      "name": "Toggle schedule card entry",
+      "description": "Thin adapter for the embedded dispenser-schedule-card: flip one entry's own enabled state.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to change."
+        },
+        "id": {
+          "name": "Entry ID",
+          "description": "The entry's id."
+        }
+      }
+    },
     "wifi_connect": {
       "name": "Connect to Wi-Fi network",
       "description": "Switch the feeder to a different Wi-Fi network, or reconnect to one it already has a saved password for. Fails safe: a wrong password or unreachable network rolls back to the previous connection automatically.",
@@ -460,11 +543,12 @@
   "options": {
     "step": {
       "init": {
-        "title": "Video source & Bluetooth fallback",
-        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.",
+        "title": "Video source, Bluetooth fallback & schedule writes",
+        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.\n\nSchedule-card writes (add/edit/remove/toggle) are refused until you turn this on — the MCU's per-entry time encoding is still unconfirmed, so a wrong table could dispense at the wrong time or amount.",
         "data": {
           "stream_url": "Rebroadcast RTSP URL",
-          "ble_address": "Feeder BLE MAC address"
+          "ble_address": "Feeder BLE MAC address",
+          "enable_schedule_writes": "Allow schedule card writes (unconfirmed encoding)"
         }
       }
     },

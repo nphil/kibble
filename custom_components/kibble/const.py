@@ -11,6 +11,11 @@ CONF_STREAM_URL = "stream_url"
 # (docs/25-ble-feed-frame.md). Optional: with it unset, an unreachable agent simply reports
 # "unreachable" instead of trying a BLE fallback.
 CONF_BLE_ADDRESS = "ble_address"
+# Second-entity, third-party card adapter: gate on this option until the MCU's per-entry
+# time encoding is confirmed (docs/schedule.md) -- see `KibbleCoordinator.
+# _require_schedule_writes_enabled`. Default off; a wrong table could dispense at the wrong
+# time or amount.
+CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
 
 DEFAULT_PORT = 8765
 DEFAULT_RTSP_PORT = 8554
@@ -38,6 +43,19 @@ SERVICE_SCHEDULE_SET = "schedule_set"
 SERVICE_SCHEDULE_ADD = "schedule_add"
 SERVICE_SCHEDULE_REMOVE = "schedule_remove"
 SERVICE_SCHEDULE_SET_ENABLED = "schedule_set_enabled"
+
+SERVICE_SCHEDULE_CARD_ADD = "schedule_card_add"
+SERVICE_SCHEDULE_CARD_EDIT = "schedule_card_edit"
+SERVICE_SCHEDULE_CARD_REMOVE = "schedule_card_remove"
+SERVICE_SCHEDULE_CARD_TOGGLE = "schedule_card_toggle"
+
+# `dispenser-schedule-card`'s `device.type: custom` adapter's `actions` table (docs/custom.md)
+# names this field "id" for add/edit/remove/toggle alike -- distinct from `ATTR_ENTRY_ID`
+# ("entry_id"), the field name the pre-existing `schedule_remove`/`schedule_set_enabled`
+# already committed to for other consumers.
+ATTR_ID = "id"
+ATTR_HOUR = "hour"
+ATTR_MINUTE = "minute"
 
 ATTR_ENTRIES = "entries"
 ATTR_TIME = "time"

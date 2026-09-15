@@ -108,6 +108,102 @@ schedule_set_enabled:
       selector:
         boolean:
 
+schedule_card_add:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    id:
+      required: true
+      selector:
+        text:
+    hour:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 23
+          step: 1
+          mode: box
+    minute:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 59
+          step: 1
+          mode: box
+    amount:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
+
+schedule_card_edit:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    id:
+      required: true
+      selector:
+        text:
+    hour:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 23
+          step: 1
+          mode: box
+    minute:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 59
+          step: 1
+          mode: box
+    amount:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
+
+schedule_card_remove:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    id:
+      required: true
+      selector:
+        text:
+
+schedule_card_toggle:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    id:
+      required: true
+      selector:
+        text:
+
 wifi_connect:
   fields:
     device_id:

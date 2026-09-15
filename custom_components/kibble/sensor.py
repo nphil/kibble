@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,10 +23,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import ClipInfo, CloudState, FeederState
+from .api import ClipInfo, CloudState, FeederState, ScheduleEntry
 from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -190,6 +193,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [KibbleSensor(coordinator, d) for d in SENSORS]
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
     entities.append(KibbleScheduleSensor(coordinator))
+    entities.append(KibbleScheduleCardStateSensor(coordinator))
     entities.append(KibbleCloudConnectionSensor(coordinator))
     entities.append(KibbleControlPathSensor(coordinator))
     entities.append(KibbleWifiNetworkSensor(coordinator))
@@ -261,6 +265,112 @@ class KibbleScheduleSensor(KibbleEntity, SensorEntity):
                 for e in schedule.entries
             ],
             "last_modified": schedule.last_modified,
+        }
+
+
+# HA enforces a 255-character limit on a sensor's own state string.
+MAX_STATE_LENGTH = 255
+
+# dispenser-schedule-card's `device.type: custom` adapter has no per-entry dispatch tracking
+# yet on our side, so every packed entry reports this constant status code. Per that card's
+# own `status_map` convention (docs/custom.md) and the config kibble-card already targets
+# (`kibble-schedule-summary.ts`): `0 -> dispensed, 1 -> failed, 2 -> pending, 3 -> dispensing`.
+# The card's own client-side logic still derives "skipped" correctly from "pending" plus a
+# past dispense time alone.
+STATUS_PENDING = 2
+
+
+def pack_schedule_card_state(entries: Sequence[ScheduleEntry]) -> tuple[str, int, int]:
+    """Packs enabled schedule entries into the packed, regex-parseable string
+    `dispenser-schedule-card`'s `device.type: custom` adapter reads from an entity's own
+    *state* (docs/custom.md): `"id,hour,minute,amount,status;..."`. Verified directly against
+    that card's own parser, `status_pattern`:
+    `(?<id>[^,]+),(?<hour>[0-9]{1,2}),(?<minute>[0-9]{1,2}),(?<amount>[0-9]{1,2}),(?<status>[0-9]);?`
+    -- also the exact config `kibble-schedule-summary.ts` already builds against
+    `sensor.…_schedule_card_state`.
+
+    Disabled entries are omitted outright: this format's `status_map` has only
+    dispensed/failed/pending/dispensing, no per-entry "disabled" code, and this integration
+    configures no adapter-wide `switch:` either -- packing a disabled entry as "pending" would
+    misleadingly claim it will still fire, so it is left out instead. An all-disabled table
+    therefore packs to `""`, same as "no schedule set".
+
+    One `amount` per entry, not two: `max(amount_l, amount_r)`, the same shared-bin
+    simplification `kibble.feed`'s `hopper="both"` path already makes now the physical divider
+    is removed -- on every write path through this adapter the two are mirrored equal anyway.
+
+    An id containing `,` or `;` would corrupt the packed grammar; such an entry is skipped
+    (logged, not raised) rather than emitted broken.
+
+    Entries are packed soonest-first (ascending `time`, matching the plain fallback list) until
+    the next one would push the packed string past HA's 255-character state limit; anything
+    left over is silently dropped from *this* entity only -- `sensor.…_schedule`'s own
+    `entries` attribute (the fallback list's source) is unaffected and always complete.
+
+    Returns `(packed_state, entries_packed, entries_eligible)`.
+    """
+    eligible = sorted((e for e in entries if e.enabled), key=lambda e: e.time)
+    parts: list[str] = []
+    packed = ""
+    for entry in eligible:
+        try:
+            hour_str, minute_str = entry.time.split(":", 1)
+            hour, minute = int(hour_str), int(minute_str)
+        except (ValueError, AttributeError):
+            _LOGGER.warning(
+                "schedule entry %r has an unparseable time %r; omitting from the card state",
+                entry.id,
+                entry.time,
+            )
+            continue
+        if "," in entry.id or ";" in entry.id:
+            _LOGGER.warning(
+                "schedule entry id %r contains ',' or ';'; omitting from the card state",
+                entry.id,
+            )
+            continue
+        amount = max(entry.amount_l, entry.amount_r)
+        piece = f"{entry.id},{hour},{minute},{amount},{STATUS_PENDING}"
+        candidate = ";".join([*parts, piece])
+        if len(candidate) > MAX_STATE_LENGTH:
+            break
+        parts.append(piece)
+        packed = candidate
+    return packed, len(parts), len(eligible)
+
+
+class KibbleScheduleCardStateSensor(KibbleEntity, SensorEntity):
+    """Feeds `dispenser-schedule-card`'s `device.type: custom` adapter (see
+    `pack_schedule_card_state`) so the Kibble card's schedule summary can embed that card
+    instead of falling back to its own plain list -- `kibble-card` README's "Schedule card
+    integration". A second, purpose-built entity because that adapter reads the packed string
+    from an entity's own *state*, and `sensor.…_schedule`'s state is deliberately the entry
+    count (its rich list lives in an attribute the card's regex adapter never reads).
+
+    Not diagnostic/config -- the card depends on it directly to render at all.
+    """
+
+    _attr_translation_key = "schedule_card_state"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "schedule_card_state")
+
+    @property
+    def native_value(self) -> str:
+        packed, _packed_count, _eligible = pack_schedule_card_state(
+            self.coordinator.data.schedule.entries
+        )
+        return packed
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        _packed, packed_count, eligible = pack_schedule_card_state(
+            self.coordinator.data.schedule.entries
+        )
+        return {
+            "entries_packed": packed_count,
+            "entries_eligible": eligible,
+            "truncated": packed_count < eligible,
         }
 
 

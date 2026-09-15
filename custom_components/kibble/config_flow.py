@@ -16,7 +16,15 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import KibbleClient, KibbleConnectionError, KibbleError
-from .const import CONF_BLE_ADDRESS, CONF_HOST, CONF_PORT, CONF_STREAM_URL, DEFAULT_PORT, DOMAIN
+from .const import (
+    CONF_BLE_ADDRESS,
+    CONF_ENABLE_SCHEDULE_WRITES,
+    CONF_HOST,
+    CONF_PORT,
+    CONF_STREAM_URL,
+    DEFAULT_PORT,
+    DOMAIN,
+)
 
 SCHEMA = vol.Schema(
     {vol.Required(CONF_HOST): str, vol.Optional(CONF_PORT, default=DEFAULT_PORT): int}
@@ -61,7 +69,8 @@ class KibbleConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class KibbleOptionsFlow(OptionsFlow):
-    """Video source and BLE fallback address, both filled in after initial setup.
+    """Video source, BLE fallback address, and the schedule-card write gate -- all filled in
+    after initial setup.
 
     `stream_url`: the feeder serves video to one consumer only (Scrypted); this is the
     rebroadcast URL the camera entity consumes instead of hitting the device a second time.
@@ -70,6 +79,10 @@ class KibbleOptionsFlow(OptionsFlow):
     `ble_address`: the feeder's BLE MAC, once a Bluetooth proxy has actually seen it advertise
     (`docs/25-ble-feed-frame.md`). Empty = `kibble.feed` reports "unreachable" instead of
     trying a BLE fallback when the agent's HTTP API can't be reached.
+
+    `enable_schedule_writes`: off by default. The MCU's per-entry schedule time encoding is
+    still unconfirmed (docs/schedule.md) -- until an operator flips this on deliberately, the
+    `schedule_card_add`/`_edit`/`_remove`/`_toggle` services refuse to write anything.
     """
 
     async def async_step_init(
@@ -78,6 +91,7 @@ class KibbleOptionsFlow(OptionsFlow):
         if user_input is not None:
             url = (user_input.get(CONF_STREAM_URL) or "").strip()
             address = (user_input.get(CONF_BLE_ADDRESS) or "").strip().upper()
+            enable_schedule_writes = bool(user_input.get(CONF_ENABLE_SCHEDULE_WRITES, False))
             errors: dict[str, str] = {}
             if url and not url.startswith(("rtsp://", "rtsps://")):
                 errors[CONF_STREAM_URL] = "not_rtsp"
@@ -85,25 +99,36 @@ class KibbleOptionsFlow(OptionsFlow):
                 errors[CONF_BLE_ADDRESS] = "not_mac"
             if errors:
                 return self.async_show_form(
-                    step_id="init", data_schema=self._schema(url, address), errors=errors
+                    step_id="init",
+                    data_schema=self._schema(url, address, enable_schedule_writes),
+                    errors=errors,
                 )
             return self.async_create_entry(
-                data={CONF_STREAM_URL: url, CONF_BLE_ADDRESS: address}
+                data={
+                    CONF_STREAM_URL: url,
+                    CONF_BLE_ADDRESS: address,
+                    CONF_ENABLE_SCHEDULE_WRITES: enable_schedule_writes,
+                }
             )
 
         options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
             data_schema=self._schema(
-                options.get(CONF_STREAM_URL, ""), options.get(CONF_BLE_ADDRESS, "")
+                options.get(CONF_STREAM_URL, ""),
+                options.get(CONF_BLE_ADDRESS, ""),
+                options.get(CONF_ENABLE_SCHEDULE_WRITES, False),
             ),
         )
 
     @staticmethod
-    def _schema(stream_url: str, ble_address: str) -> vol.Schema:
+    def _schema(stream_url: str, ble_address: str, enable_schedule_writes: bool) -> vol.Schema:
         return vol.Schema(
             {
                 vol.Optional(CONF_STREAM_URL, default=stream_url): str,
                 vol.Optional(CONF_BLE_ADDRESS, default=ble_address): str,
+                vol.Optional(
+                    CONF_ENABLE_SCHEDULE_WRITES, default=enable_schedule_writes
+                ): bool,
             }
         )

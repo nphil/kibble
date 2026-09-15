@@ -25,7 +25,10 @@ from .const import (
     ATTR_HOPPER,
     ATTR_HOPPER1_G,
     ATTR_HOPPER2_G,
+    ATTR_HOUR,
+    ATTR_ID,
     ATTR_MEDIA_CONTENT_ID,
+    ATTR_MINUTE,
     ATTR_PASSWORD,
     ATTR_SECONDS,
     ATTR_SSID,
@@ -51,6 +54,10 @@ from .const import (
     SERVICE_RECORD_CLIP,
     SERVICE_SAVE_CLIP,
     SERVICE_SCHEDULE_ADD,
+    SERVICE_SCHEDULE_CARD_ADD,
+    SERVICE_SCHEDULE_CARD_EDIT,
+    SERVICE_SCHEDULE_CARD_REMOVE,
+    SERVICE_SCHEDULE_CARD_TOGGLE,
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
@@ -130,6 +137,28 @@ SCHEDULE_SET_ENABLED_SCHEMA = vol.Schema(
         vol.Required(ATTR_ENABLED): cv.boolean,
     }
 )
+
+_SCHEDULE_CARD_HOUR = vol.All(vol.Coerce(int), vol.Range(min=0, max=23))
+_SCHEDULE_CARD_MINUTE = vol.All(vol.Coerce(int), vol.Range(min=0, max=59))
+_SCHEDULE_CARD_AMOUNT = vol.All(vol.Coerce(int), vol.Range(min=MIN_AMOUNT, max=MAX_AMOUNT))
+
+SCHEDULE_CARD_ADD_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_ID): cv.string,
+        vol.Required(ATTR_HOUR): _SCHEDULE_CARD_HOUR,
+        vol.Required(ATTR_MINUTE): _SCHEDULE_CARD_MINUTE,
+        vol.Required(ATTR_AMOUNT): _SCHEDULE_CARD_AMOUNT,
+    }
+)
+
+SCHEDULE_CARD_EDIT_SCHEMA = SCHEDULE_CARD_ADD_SCHEMA
+
+SCHEDULE_CARD_REMOVE_SCHEMA = vol.Schema(
+    {vol.Required("device_id"): cv.string, vol.Required(ATTR_ID): cv.string}
+)
+
+SCHEDULE_CARD_TOGGLE_SCHEMA = SCHEDULE_CARD_REMOVE_SCHEMA
 
 WIFI_CONNECT_SCHEMA = vol.Schema(
     {
@@ -296,6 +325,40 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise HomeAssistantError(f"Schedule set-enabled failed: {err}") from err
 
+    async def handle_schedule_card_add(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        time_str = f"{call.data[ATTR_HOUR]:02d}:{call.data[ATTR_MINUTE]:02d}"
+        try:
+            await coordinator.async_schedule_card_add(
+                call.data[ATTR_ID], time_str, call.data[ATTR_AMOUNT]
+            )
+        except KibbleError as err:
+            raise HomeAssistantError(f"Schedule card add failed: {err}") from err
+
+    async def handle_schedule_card_edit(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        time_str = f"{call.data[ATTR_HOUR]:02d}:{call.data[ATTR_MINUTE]:02d}"
+        try:
+            await coordinator.async_schedule_card_edit(
+                call.data[ATTR_ID], time_str, call.data[ATTR_AMOUNT]
+            )
+        except KibbleError as err:
+            raise HomeAssistantError(f"Schedule card edit failed: {err}") from err
+
+    async def handle_schedule_card_remove(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_schedule_card_remove(call.data[ATTR_ID])
+        except KibbleError as err:
+            raise HomeAssistantError(f"Schedule card remove failed: {err}") from err
+
+    async def handle_schedule_card_toggle(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_schedule_card_toggle(call.data[ATTR_ID])
+        except KibbleError as err:
+            raise HomeAssistantError(f"Schedule card toggle failed: {err}") from err
+
     async def handle_wifi_connect(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
@@ -380,6 +443,24 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_SCHEDULE_SET_ENABLED,
         handle_schedule_set_enabled,
         SCHEDULE_SET_ENABLED_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SCHEDULE_CARD_ADD, handle_schedule_card_add, SCHEDULE_CARD_ADD_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SCHEDULE_CARD_EDIT, handle_schedule_card_edit, SCHEDULE_CARD_EDIT_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SCHEDULE_CARD_REMOVE,
+        handle_schedule_card_remove,
+        SCHEDULE_CARD_REMOVE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SCHEDULE_CARD_TOGGLE,
+        handle_schedule_card_toggle,
+        SCHEDULE_CARD_TOGGLE_SCHEMA,
     )
     hass.services.async_register(
         DOMAIN, SERVICE_WIFI_CONNECT, handle_wifi_connect, WIFI_CONNECT_SCHEMA

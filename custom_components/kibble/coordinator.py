@@ -14,6 +14,7 @@ from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.components.media_source import async_resolve_media, is_media_source_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -34,6 +35,7 @@ from .api import (
 from .ble_fallback import async_feed_with_fallback
 from .const import (
     CONF_BLE_ADDRESS,
+    CONF_ENABLE_SCHEDULE_WRITES,
     CONF_HOST,
     CONF_STREAM_URL,
     DEFAULT_RTSP_PATH,
@@ -237,9 +239,14 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.async_request_refresh()
 
     async def async_schedule_add(
-        self, time: str, amount_l: int, amount_r: int, enabled: bool = True
+        self,
+        time: str,
+        amount_l: int,
+        amount_r: int,
+        enabled: bool = True,
+        entry_id: str | None = None,
     ) -> None:
-        await self.client.add_schedule_entry(time, amount_l, amount_r, enabled)
+        await self.client.add_schedule_entry(time, amount_l, amount_r, enabled, entry_id)
         await self.async_request_refresh()
 
     async def async_schedule_remove(self, entry_id: str) -> None:
@@ -249,6 +256,50 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     async def async_schedule_set_enabled(self, entry_id: str, enabled: bool) -> None:
         await self.client.set_schedule_entry_enabled(entry_id, enabled)
         await self.async_request_refresh()
+
+    def _require_schedule_writes_enabled(self) -> None:
+        """Refuses every schedule-card write path (`schedule_card_add`/`_edit`/`_remove`/
+        `_toggle`) until an operator has explicitly opted in via the `enable_schedule_writes`
+        option -- off by default. The MCU's per-entry schedule time encoding is still
+        unconfirmed (docs/schedule.md); a wrong table could dispense at the wrong time or
+        amount, so nothing on this path may reach the device before that is resolved and an
+        operator has said so."""
+        if not self.entry.options.get(CONF_ENABLE_SCHEDULE_WRITES, False):
+            raise HomeAssistantError(
+                "schedule writing is disabled until the time encoding is confirmed — "
+                "see docs/schedule"
+            )
+
+    async def async_schedule_card_add(self, entry_id: str, time: str, amount: int) -> None:
+        """One `amount` mirrored onto both `amount_l`/`amount_r` -- the same shared-bin
+        simplification the primary Feed button already makes."""
+        self._require_schedule_writes_enabled()
+        await self.async_schedule_add(time, amount, amount, True, entry_id)
+
+    async def async_schedule_card_edit(self, entry_id: str, time: str, amount: int) -> None:
+        """No native edit exists -- `schedule.rs`'s `add` rejects a duplicate id
+        (STUDY-schedule.md) -- so this removes and re-adds under the same id. Always
+        refreshes, even on a failure between the two calls, so a partial edit is reflected
+        immediately rather than waiting for the next poll."""
+        self._require_schedule_writes_enabled()
+        try:
+            await self.client.remove_schedule_entry(entry_id)
+            await self.client.add_schedule_entry(time, amount, amount, True, entry_id)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_schedule_card_remove(self, entry_id: str) -> None:
+        self._require_schedule_writes_enabled()
+        await self.async_schedule_remove(entry_id)
+
+    async def async_schedule_card_toggle(self, entry_id: str) -> None:
+        """Server-side toggle (docs/custom.md's `actions.toggle`): flips the entry's own
+        current `enabled` state rather than taking one from the caller."""
+        self._require_schedule_writes_enabled()
+        entry = next((e for e in self.data.schedule.entries if e.id == entry_id), None)
+        if entry is None:
+            raise HomeAssistantError(f"no schedule entry with id {entry_id!r}")
+        await self.async_schedule_set_enabled(entry_id, not entry.enabled)
 
     async def async_set_cloud(self, enabled: bool) -> None:
         """Flip the Petkit-cloud kill switch. A disable can fail safe and roll itself back
