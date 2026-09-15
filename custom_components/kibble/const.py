@@ -6,6 +6,7 @@ DOMAIN = "kibble"
 
 CONF_HOST = "host"
 CONF_PORT = "port"
+CONF_STREAM_URL = "stream_url"
 
 DEFAULT_PORT = 8765
 DEFAULT_RTSP_PORT = 8554

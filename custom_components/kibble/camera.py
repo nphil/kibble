@@ -1,11 +1,14 @@
 """The feeder's camera, as an entity on the Kibble device.
 
-The stream is the vendor's own hardware-encoded H.264 substream (1152x720, 25 fps), served by
-`kibbled` over RTSP straight out of the encoder's frame ring — no re-encoding anywhere. We hand
-Home Assistant that URL and let its bundled WebRTC provider (go2rtc) do the rest: live view,
-HLS fallback, and — once the agent gains an audio backchannel — two-way audio. That is the same
-mechanism Home Assistant uses for any RTSP camera, which is exactly the point: nothing here is
-Kibble-specific beyond knowing where the stream lives.
+Design rule (Nitin): **the feeder serves its video to exactly one consumer — Scrypted.** Everything
+else, this entity included, consumes Scrypted's rebroadcast of it. The device's encoder runs
+regardless of viewers, so a second direct session would buy nothing and cost the SoC a thread and
+a TCP writer it does not have to spare. Scrypted's prebuffer is the fan-out point.
+
+So this entity's stream source is Scrypted's rebroadcast URL, configured on the integration's
+options. Home Assistant's bundled WebRTC provider (go2rtc) takes it from there. Until the
+rebroadcast URL is configured, the entity falls back to the device's own substream so a fresh
+install still shows a picture.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from homeassistant.components.ffmpeg import async_get_image
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import CONF_HOST, DEFAULT_RTSP_PATH, DEFAULT_RTSP_PORT
+from .const import CONF_HOST, CONF_STREAM_URL, DEFAULT_RTSP_PATH, DEFAULT_RTSP_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 
@@ -39,14 +42,26 @@ class KibbleCamera(KibbleEntity, Camera):
     def __init__(self, entry: KibbleConfigEntry) -> None:
         KibbleEntity.__init__(self, entry.runtime_data, "camera")
         Camera.__init__(self)
-        self._url = (
-            f"rtsp://{entry.data[CONF_HOST]}:{DEFAULT_RTSP_PORT}{DEFAULT_RTSP_PATH}"
-        )
+        self._entry = entry
+
+    @property
+    def _url(self) -> str:
+        configured = self._entry.options.get(CONF_STREAM_URL)
+        if configured:
+            return configured
+        host = self._entry.data[CONF_HOST]
+        return f"rtsp://{host}:{DEFAULT_RTSP_PORT}{DEFAULT_RTSP_PATH}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        # Make it visible whether this entity is honouring the single-consumer rule.
+        return {
+            "source": "scrypted" if self._entry.options.get(CONF_STREAM_URL) else "device",
+        }
 
     @property
     def is_streaming(self) -> bool:
-        # The vendor encoder runs continuously whether or not anyone is watching, so the
-        # stream is always live; this is what makes the card show a live badge.
+        # The vendor encoder runs continuously whether or not anyone is watching.
         return True
 
     async def stream_source(self) -> str:
@@ -55,6 +70,4 @@ class KibbleCamera(KibbleEntity, Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        # A still is one decoded frame from the stream. The device has a hardware JPEG
-        # encoder that would make this free; wiring it into the agent is a later step.
         return await async_get_image(self.hass, self._url, width=width, height=height)

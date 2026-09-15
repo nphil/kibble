@@ -20,63 +20,161 @@
   },
   "entity": {
     "binary_sensor": {
-      "feeding": { "name": "Feeding" },
-      "time_display": { "name": "Video timestamp overlay" },
-      "camera": { "name": "Camera stream" },
-      "move_detection": { "name": "Motion detection" },
-      "pet_detection": { "name": "Pet detection" },
-      "eat_detection": { "name": "Eating detection" },
-      "vomit_detection": { "name": "Vomit detection" },
-      "feed_picture": { "name": "Photo on feed" },
-      "eat_video": { "name": "Video on eating detection" },
-      "sound_enable": { "name": "Feed voice prompt" },
-      "system_sound_enable": { "name": "System guidance voice" },
-      "feed_sound": { "name": "Feed-complete sound" },
-      "food_warn": { "name": "Low-food warning" },
-      "light_mode": { "name": "Status LED schedule" },
-      "tone_mode": { "name": "Do-not-disturb" },
-      "manual_lock": { "name": "Child lock" },
-      "smart_frame": { "name": "Auto-framing" }
+      "feeding": {
+        "name": "Feeding"
+      },
+      "time_display": {
+        "name": "Video timestamp overlay"
+      },
+      "camera": {
+        "name": "Camera stream"
+      },
+      "move_detection": {
+        "name": "Motion detection"
+      },
+      "pet_detection": {
+        "name": "Pet detection"
+      },
+      "eat_detection": {
+        "name": "Eating detection"
+      },
+      "vomit_detection": {
+        "name": "Vomit detection"
+      },
+      "feed_picture": {
+        "name": "Photo on feed"
+      },
+      "eat_video": {
+        "name": "Video on eating detection"
+      },
+      "sound_enable": {
+        "name": "Feed voice prompt"
+      },
+      "system_sound_enable": {
+        "name": "System guidance voice"
+      },
+      "feed_sound": {
+        "name": "Feed-complete sound"
+      },
+      "food_warn": {
+        "name": "Low-food warning"
+      },
+      "light_mode": {
+        "name": "Status LED schedule"
+      },
+      "tone_mode": {
+        "name": "Do-not-disturb"
+      },
+      "manual_lock": {
+        "name": "Child lock"
+      },
+      "smart_frame": {
+        "name": "Auto-framing"
+      }
     },
     "button": {
-      "feed": { "name": "Feed both" },
-      "feed_hopper_1": { "name": "Feed hopper 1" },
-      "feed_hopper_2": { "name": "Feed hopper 2" },
-      "cancel_feed": { "name": "Cancel feed" }
+      "feed": {
+        "name": "Feed both"
+      },
+      "feed_hopper_1": {
+        "name": "Feed hopper 1"
+      },
+      "feed_hopper_2": {
+        "name": "Feed hopper 2"
+      },
+      "cancel_feed": {
+        "name": "Cancel feed"
+      }
     },
     "number": {
-      "feed_amount": { "name": "Feed amount" },
-      "feed_amount_hopper_1": { "name": "Feed amount hopper 1" },
-      "feed_amount_hopper_2": { "name": "Feed amount hopper 2" },
-      "volume": { "name": "Volume" }
+      "feed_amount": {
+        "name": "Feed amount"
+      },
+      "feed_amount_hopper_1": {
+        "name": "Feed amount hopper 1"
+      },
+      "feed_amount_hopper_2": {
+        "name": "Feed amount hopper 2"
+      },
+      "volume": {
+        "name": "Volume"
+      }
     },
     "sensor": {
-      "bowl_fill_1": { "name": "Bowl fill hopper 1" },
-      "bowl_fill_2": { "name": "Bowl fill hopper 2" },
-      "desiccant_days": { "name": "Desiccant left" },
-      "firmware": { "name": "Firmware" },
-      "ble_firmware": { "name": "Dispenser firmware" },
-      "schedule": { "name": "Schedule" },
-      "move_sensitivity": { "name": "Motion detection sensitivity" },
-      "pet_sensitivity": { "name": "Pet detection sensitivity" },
-      "eat_sensitivity": { "name": "Eating detection sensitivity" },
-      "detect_interval": { "name": "Detection interval" },
-      "detect_range_from": { "name": "Detection active hours start" },
-      "detect_range_till": { "name": "Detection active hours end" },
-      "selected_sound": { "name": "Selected notification sound" },
-      "factor1": { "name": "Hopper 1 calibration factor" },
-      "factor2": { "name": "Hopper 2 calibration factor" },
-      "light_range_from": { "name": "Status LED active hours start" },
-      "light_range_till": { "name": "Status LED active hours end" },
-      "tone_range_from": { "name": "Do-not-disturb hours start" },
-      "tone_range_till": { "name": "Do-not-disturb hours end" },
-      "surplus_control": { "name": "Leftover food detection state" },
-      "surplus_standard": { "name": "Leftover food threshold" }
+      "bowl_fill_1": {
+        "name": "Bowl fill hopper 1"
+      },
+      "bowl_fill_2": {
+        "name": "Bowl fill hopper 2"
+      },
+      "desiccant_days": {
+        "name": "Desiccant left"
+      },
+      "firmware": {
+        "name": "Firmware"
+      },
+      "ble_firmware": {
+        "name": "Dispenser firmware"
+      },
+      "schedule": {
+        "name": "Schedule"
+      },
+      "move_sensitivity": {
+        "name": "Motion detection sensitivity"
+      },
+      "pet_sensitivity": {
+        "name": "Pet detection sensitivity"
+      },
+      "eat_sensitivity": {
+        "name": "Eating detection sensitivity"
+      },
+      "detect_interval": {
+        "name": "Detection interval"
+      },
+      "detect_range_from": {
+        "name": "Detection active hours start"
+      },
+      "detect_range_till": {
+        "name": "Detection active hours end"
+      },
+      "selected_sound": {
+        "name": "Selected notification sound"
+      },
+      "factor1": {
+        "name": "Hopper 1 calibration factor"
+      },
+      "factor2": {
+        "name": "Hopper 2 calibration factor"
+      },
+      "light_range_from": {
+        "name": "Status LED active hours start"
+      },
+      "light_range_till": {
+        "name": "Status LED active hours end"
+      },
+      "tone_range_from": {
+        "name": "Do-not-disturb hours start"
+      },
+      "tone_range_till": {
+        "name": "Do-not-disturb hours end"
+      },
+      "surplus_control": {
+        "name": "Leftover food detection state"
+      },
+      "surplus_standard": {
+        "name": "Leftover food threshold"
+      }
     },
     "switch": {
-      "night": { "name": "Night vision" },
-      "light": { "name": "Status LED" },
-      "microphone": { "name": "Microphone" }
+      "night": {
+        "name": "Night vision"
+      },
+      "light": {
+        "name": "Status LED"
+      },
+      "microphone": {
+        "name": "Microphone"
+      }
     }
   },
   "services": {
@@ -84,12 +182,18 @@
       "name": "Feed",
       "description": "Dispense food from one or both augers.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to dispense from." },
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to dispense from."
+        },
         "hopper": {
           "name": "Hopper",
           "description": "Which auger to run. The divider may be removed, in which case both draw from one bin."
         },
-        "amount": { "name": "Amount", "description": "Portions to dispense." },
+        "amount": {
+          "name": "Amount",
+          "description": "Portions to dispense."
+        },
         "id": {
           "name": "Feed ID",
           "description": "Optional identifier recorded with the feed event."
@@ -100,14 +204,20 @@
       "name": "Cancel feed",
       "description": "Stop a dispense that is in progress.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to stop." }
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to stop."
+        }
       }
     },
     "schedule_set": {
       "name": "Set schedule",
       "description": "Replace the whole feed schedule with a new list of entries.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to reschedule." },
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to reschedule."
+        },
         "entries": {
           "name": "Entries",
           "description": "The full replacement list, each with time, hopper1_g, hopper2_g and optionally enabled/entry_id."
@@ -118,18 +228,36 @@
       "name": "Add schedule entry",
       "description": "Add one entry to the feed schedule.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to add an entry to." },
-        "time": { "name": "Time", "description": "Time of day to feed." },
-        "hopper1_g": { "name": "Hopper 1 amount", "description": "Grams from hopper 1." },
-        "hopper2_g": { "name": "Hopper 2 amount", "description": "Grams from hopper 2." },
-        "enabled": { "name": "Enabled", "description": "Whether the entry is active." }
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to add an entry to."
+        },
+        "time": {
+          "name": "Time",
+          "description": "Time of day to feed."
+        },
+        "hopper1_g": {
+          "name": "Hopper 1 amount",
+          "description": "Grams from hopper 1."
+        },
+        "hopper2_g": {
+          "name": "Hopper 2 amount",
+          "description": "Grams from hopper 2."
+        },
+        "enabled": {
+          "name": "Enabled",
+          "description": "Whether the entry is active."
+        }
       }
     },
     "schedule_remove": {
       "name": "Remove schedule entry",
       "description": "Remove one entry from the feed schedule.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to remove an entry from." },
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to remove an entry from."
+        },
         "entry_id": {
           "name": "Entry ID",
           "description": "The id from sensor.cat_feeder_schedule's entries attribute."
@@ -140,13 +268,33 @@
       "name": "Enable/disable schedule entry",
       "description": "Turn one feed-schedule entry on or off without removing it.",
       "fields": {
-        "device_id": { "name": "Feeder", "description": "The feeder to change." },
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to change."
+        },
         "entry_id": {
           "name": "Entry ID",
           "description": "The id from sensor.cat_feeder_schedule's entries attribute."
         },
-        "enabled": { "name": "Enabled", "description": "Whether the entry should be active." }
+        "enabled": {
+          "name": "Enabled",
+          "description": "Whether the entry should be active."
+        }
       }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Video source",
+        "description": "The feeder serves its video to one consumer only \u2014 Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.",
+        "data": {
+          "stream_url": "Rebroadcast RTSP URL"
+        }
+      }
+    },
+    "error": {
+      "not_rtsp": "Must be an rtsp:// URL."
     }
   }
 }

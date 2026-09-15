@@ -135,6 +135,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _async_register_services(hass)
     return True
 
@@ -226,3 +227,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
         handle_schedule_set_enabled,
         SCHEDULE_SET_ENABLED_SCHEMA,
     )
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: KibbleConfigEntry) -> None:
+    """The stream source lives in options; re-create the camera entity with the new one."""
+    await hass.config_entries.async_reload(entry.entry_id)
