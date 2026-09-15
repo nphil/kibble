@@ -1,22 +1,32 @@
 //! kibbled — local control for a Petkit YumShare Dual feeder, running on the feeder itself.
 //!
 //! What it does today:
-//!   GET  /state          live telemetry from the shared config
-//!   POST /feed           {"hopper": 1|2|"both", "amount": N, "id": "..."}  dispense
-//!   POST /feed/cancel    stop a dispense in progress
+//!   GET    /state                   live telemetry from the shared config
+//!   POST   /feed                    {"hopper": 1|2|"both", "amount": N, "id": "..."}  dispense
+//!   POST   /feed/cancel             stop a dispense in progress
+//!   GET    /schedule                kibbled's cached copy of the feed schedule (the MCU has no
+//!                                   read-back -- see schedule.rs)
+//!   PUT    /schedule                {"entries": [...]}  replace the whole table
+//!   POST   /schedule/entry          {"time": "HH:MM", "amount_l": N, "amount_r": N,
+//!                                   "id": "...", "enabled": bool}  add one entry
+//!   DELETE /schedule/entry?id=      remove one entry
+//!   POST   /schedule/entry/enabled  {"id": "...", "enabled": bool}  enable/disable one entry
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
-//! flash. It sits beside the stock firmware and speaks its internal bus.
+//! flash outside `/opt/kibble`. It sits beside the stock firmware and speaks its internal bus.
 
 mod bus;
 mod http;
+mod schedule;
 mod state;
 
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bus::{msg, FeedCtrl, Peer, Sender};
 use http::{json_field, Request, Response};
+use schedule::Schedule;
 use state::Shm;
 
 /// `src` we stamp on bus messages. Stock `ctrl` is 1; replies to our feed land in its queue,
@@ -32,10 +42,12 @@ fn main() {
     let shm = Shm::open().unwrap_or_else(|e| die(&format!("open {}: {e}", state::SHM_PATH)));
     let ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
+    let mut schedule = Schedule::load(PathBuf::from(schedule::CACHE_PATH))
+        .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
     eprintln!("kibbled: listening on {bind}");
 
-    let _ = http::serve(listener, |req| route(req, &shm, &ble));
+    let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule));
 }
 
 fn die(msg: &str) -> ! {
@@ -43,8 +55,9 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn route(req: &Request, shm: &Shm, ble: &Sender) -> Response {
-    match (req.method.as_str(), req.path.as_str()) {
+fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule) -> Response {
+    let (path, query) = http::split_query(&req.path);
+    match (req.method.as_str(), path) {
         ("GET", "/state") => Response::Json(shm.snapshot().to_json()),
         ("POST", "/feed") => feed(req, ble),
         ("POST", "/feed/cancel") => send_feed(
@@ -56,6 +69,11 @@ fn route(req: &Request, shm: &Shm, ble: &Sender) -> Response {
                 amount2: 0,
             },
         ),
+        ("GET", "/schedule") => Response::Json(schedule.snapshot_json()),
+        ("PUT", "/schedule") => put_schedule(req, schedule, ble),
+        ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble),
+        ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble),
+        ("POST", "/schedule/entry/enabled") => post_schedule_entry_enabled(req, schedule, ble),
         _ => Response::NotFound,
     }
 }
@@ -102,5 +120,53 @@ fn send_feed(ble: &Sender, f: FeedCtrl) -> Response {
             f.cancel
         )),
         Err(e) => Response::Error(format!("bus send failed: {e}")),
+    }
+}
+
+fn put_schedule(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+    let entries = match schedule::parse_entries(&req.body) {
+        Ok(v) => v,
+        Err(e) => return Response::BadRequest(e),
+    };
+    schedule_result(schedule.replace(entries, ble, schedule::now_unix()), schedule)
+}
+
+fn post_schedule_entry(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+    let entry = match schedule::parse_entry(&req.body) {
+        Ok(e) => e,
+        Err(e) => return Response::BadRequest(e),
+    };
+    schedule_result(schedule.add(entry, ble, schedule::now_unix()), schedule)
+}
+
+fn delete_schedule_entry(query: &str, schedule: &mut Schedule, ble: &Sender) -> Response {
+    let id = match schedule::entry_id_from_query(query) {
+        Some(id) => id,
+        None => return Response::BadRequest("missing ?id=".into()),
+    };
+    schedule_result(schedule.remove(id, ble, schedule::now_unix()), schedule)
+}
+
+fn post_schedule_entry_enabled(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+    let id = match json_field(&req.body, "id").filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => return Response::BadRequest("missing \"id\"".into()),
+    };
+    let enabled = match json_field(&req.body, "enabled") {
+        Some(v) => v != "false",
+        None => return Response::BadRequest("missing \"enabled\"".into()),
+    };
+    schedule_result(schedule.set_enabled(&id, enabled, ble, schedule::now_unix()), schedule)
+}
+
+/// Shared success/error -> HTTP mapping for every schedule mutation: on success, echo the fresh
+/// cache so a client sees the effect immediately with no extra `GET`; `Invalid` is a 400 (the
+/// caller's fault -- bad input, unknown id, over the cap), `Internal` is a 500 (ours -- cache I/O,
+/// bus send).
+fn schedule_result(result: Result<(), schedule::Error>, schedule: &Schedule) -> Response {
+    match result {
+        Ok(()) => Response::Json(schedule.snapshot_json()),
+        Err(schedule::Error::Invalid(m)) => Response::BadRequest(m),
+        Err(schedule::Error::Internal(m)) => Response::Error(m),
     }
 }

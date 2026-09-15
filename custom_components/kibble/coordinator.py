@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import FeederState, KibbleClient, KibbleError
+from .api import FeederState, KibbleClient, KibbleError, ScheduleState
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -17,7 +19,15 @@ _LOGGER = logging.getLogger(__name__)
 type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 
-class KibbleCoordinator(DataUpdateCoordinator[FeederState]):
+@dataclass(frozen=True, slots=True)
+class KibbleData:
+    """Everything one poll cycle fetches: feeder telemetry plus the schedule cache."""
+
+    state: FeederState
+    schedule: ScheduleState
+
+
+class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     """Keeps one feeder's state fresh."""
 
     def __init__(
@@ -32,9 +42,11 @@ class KibbleCoordinator(DataUpdateCoordinator[FeederState]):
         )
         self.client = client
 
-    async def _async_update_data(self) -> FeederState:
+    async def _async_update_data(self) -> KibbleData:
         try:
-            return await self.client.state()
+            state = await self.client.state()
+            schedule = await self.client.schedule()
+            return KibbleData(state=state, schedule=schedule)
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -45,4 +57,22 @@ class KibbleCoordinator(DataUpdateCoordinator[FeederState]):
 
     async def async_cancel_feed(self) -> None:
         await self.client.cancel_feed()
+        await self.async_request_refresh()
+
+    async def async_schedule_set(self, entries: list[dict[str, Any]]) -> None:
+        await self.client.set_schedule(entries)
+        await self.async_request_refresh()
+
+    async def async_schedule_add(
+        self, time: str, amount_l: int, amount_r: int, enabled: bool = True
+    ) -> None:
+        await self.client.add_schedule_entry(time, amount_l, amount_r, enabled)
+        await self.async_request_refresh()
+
+    async def async_schedule_remove(self, entry_id: str) -> None:
+        await self.client.remove_schedule_entry(entry_id)
+        await self.async_request_refresh()
+
+    async def async_schedule_set_enabled(self, entry_id: str, enabled: bool) -> None:
+        await self.client.set_schedule_entry_enabled(entry_id, enabled)
         await self.async_request_refresh()

@@ -39,8 +39,19 @@ pub mod msg {
     pub const FEED: u16 = 0x100f;
     /// ble -> ctrl: bytes received from a BLE peer.
     pub const RECV_BLE_DATA: u16 = 0x100a;
-    /// -> ble: read the schedule the MCU holds.
+    /// ctrl's OWN dst=1 inbox, registered handler `dispatch_handler_ble_get_schedule`. Despite
+    /// the name this is NOT a message to `ble`, and it is NOT a working read: STUDY-schedule.md
+    /// §1.2 fully disassembled the handler and it is a dead stub (every path returns 0, no
+    /// `dispatch_send_msg` call at all). Kept only as a documented, confirmed dead end -- see
+    /// [`super::schedule`] for why the schedule cache, not a device read, is the source of truth.
     pub const BLE_GET_SCHEDULE: u16 = 0x101a;
+    /// ctrl -> ble: replaces the whole schedule table. Payload is [`super::schedule::WireEntry`]
+    /// entries behind a 2-byte `{count, reserved}` header. STUDY-schedule.md §3: pure pass-
+    /// through to UART CMD 0x04, no ble-side struct of its own.
+    pub const BLE_SET_SCHEDULE: u16 = 0x6005;
+    /// ctrl -> ble: 4-byte little-endian Unix timestamp. `ctrl` sends this immediately before
+    /// every schedule-set (STUDY-schedule.md §3.2); we mirror that ordering.
+    pub const BLE_SET_RTC: u16 = 0x6007;
 }
 
 type MqdT = c_int;

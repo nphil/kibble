@@ -27,6 +27,26 @@ HOPPER_2 = "2"
 HOPPER_BOTH = "both"
 HOPPERS = [HOPPER_1, HOPPER_2, HOPPER_BOTH]
 
+SERVICE_SCHEDULE_SET = "schedule_set"
+SERVICE_SCHEDULE_ADD = "schedule_add"
+SERVICE_SCHEDULE_REMOVE = "schedule_remove"
+SERVICE_SCHEDULE_SET_ENABLED = "schedule_set_enabled"
+
+ATTR_ENTRIES = "entries"
+ATTR_TIME = "time"
+ATTR_HOPPER1_G = "hopper1_g"
+ATTR_HOPPER2_G = "hopper2_g"
+ATTR_ENABLED = "enabled"
+ATTR_ENTRY_ID = "entry_id"
+
+# Matches the device's own per-entry byte range (STUDY-schedule.md §3.3 / Localkit's
+# Configuration.php `a1`/`a2`: 0-50).
+MIN_SCHEDULE_AMOUNT = 0
+MAX_SCHEDULE_AMOUNT = 50
+# kibbled's own client-side cap: the vendor's 540-byte bus payload clamp allows at most 24
+# 22-byte entries behind the 2-byte header before it would silently truncate the table.
+MAX_SCHEDULE_ENTRIES = 24
+
 # Portions, not grams: the feed struct carries one byte per auger and the MCU turns each
 # unit into one dispense cycle.
 MIN_AMOUNT = 1

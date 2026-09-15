@@ -22,11 +22,16 @@
       "bowl_fill_2": { "default": "mdi:gauge" },
       "desiccant_days": { "default": "mdi:air-filter" },
       "firmware": { "default": "mdi:chip" },
-      "ble_firmware": { "default": "mdi:memory" }
+      "ble_firmware": { "default": "mdi:memory" },
+      "schedule": { "default": "mdi:calendar-clock" }
     }
   },
   "services": {
     "feed": "mdi:bowl-mix",
-    "cancel_feed": "mdi:stop-circle-outline"
+    "cancel_feed": "mdi:stop-circle-outline",
+    "schedule_set": "mdi:calendar-sync",
+    "schedule_add": "mdi:calendar-plus",
+    "schedule_remove": "mdi:calendar-remove",
+    "schedule_set_enabled": "mdi:calendar-check"
   }
 }

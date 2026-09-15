@@ -33,3 +33,77 @@ cancel_feed:
       selector:
         device:
           integration: kibble
+
+schedule_set:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    entries:
+      required: true
+      selector:
+        object:
+
+schedule_add:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    time:
+      required: true
+      selector:
+        time:
+    hopper1_g:
+      required: true
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 1
+          mode: box
+    hopper2_g:
+      required: true
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 1
+          mode: box
+    enabled:
+      default: true
+      selector:
+        boolean:
+
+schedule_remove:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    entry_id:
+      required: true
+      selector:
+        text:
+
+schedule_set_enabled:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    entry_id:
+      required: true
+      selector:
+        text:
+    enabled:
+      required: true
+      selector:
+        boolean:

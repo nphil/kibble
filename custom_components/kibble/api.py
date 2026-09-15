@@ -11,6 +11,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import ClientError, ClientTimeout
@@ -58,6 +59,45 @@ class FeederState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduleEntry:
+    """One feed-schedule entry, as kibbled caches it (not a device read -- see kibbled's
+    `schedule.rs`; the MCU has no schedule read-back)."""
+
+    id: str
+    time: str  # "HH:MM", 24-hour
+    amount_l: int
+    amount_r: int
+    enabled: bool
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ScheduleEntry:
+        return cls(
+            id=str(data.get("id", "")),
+            time=str(data.get("time", "")),
+            amount_l=int(data.get("amount_l") or 0),
+            amount_r=int(data.get("amount_r") or 0),
+            enabled=bool(data.get("enabled", True)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleState:
+    """One snapshot of the feed schedule, as reported by `GET /schedule`."""
+
+    entries: tuple[ScheduleEntry, ...]
+    last_modified: int
+    raw: dict[str, Any]
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ScheduleState:
+        return cls(
+            entries=tuple(ScheduleEntry.from_json(e) for e in data.get("entries", [])),
+            last_modified=int(data.get("last_modified") or 0),
+            raw=data,
+        )
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -94,3 +134,43 @@ class KibbleClient:
 
     async def cancel_feed(self) -> dict:
         return await self._request("POST", "/feed/cancel")
+
+    async def schedule(self) -> ScheduleState:
+        return ScheduleState.from_json(await self._request("GET", "/schedule"))
+
+    async def set_schedule(self, entries: list[dict[str, Any]]) -> ScheduleState:
+        """Replace the whole table. `entries` items: `time`/`amount_l`/`amount_r`, optional
+        `id`/`enabled`."""
+        return ScheduleState.from_json(
+            await self._request("PUT", "/schedule", {"entries": entries})
+        )
+
+    async def add_schedule_entry(
+        self,
+        time: str,
+        amount_l: int,
+        amount_r: int,
+        enabled: bool = True,
+        entry_id: str | None = None,
+    ) -> ScheduleState:
+        payload: dict[str, Any] = {
+            "time": time,
+            "amount_l": amount_l,
+            "amount_r": amount_r,
+            "enabled": enabled,
+        }
+        if entry_id:
+            payload["id"] = entry_id
+        return ScheduleState.from_json(await self._request("POST", "/schedule/entry", payload))
+
+    async def remove_schedule_entry(self, entry_id: str) -> ScheduleState:
+        return ScheduleState.from_json(
+            await self._request("DELETE", f"/schedule/entry?id={quote(entry_id, safe='')}")
+        )
+
+    async def set_schedule_entry_enabled(self, entry_id: str, enabled: bool) -> ScheduleState:
+        return ScheduleState.from_json(
+            await self._request(
+                "POST", "/schedule/entry/enabled", {"id": entry_id, "enabled": enabled}
+            )
+        )

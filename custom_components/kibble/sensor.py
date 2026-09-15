@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -70,9 +71,10 @@ async def async_setup_entry(
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities(
-        KibbleSensor(entry.runtime_data, description) for description in SENSORS
-    )
+    coordinator = entry.runtime_data
+    entities: list[SensorEntity] = [KibbleSensor(coordinator, d) for d in SENSORS]
+    entities.append(KibbleScheduleSensor(coordinator))
+    async_add_entities(entities)
 
 
 class KibbleSensor(KibbleEntity, SensorEntity):
@@ -86,4 +88,39 @@ class KibbleSensor(KibbleEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | str | None:
-        return self.entity_description.value(self.coordinator.data)
+        return self.entity_description.value(self.coordinator.data.state)
+
+
+class KibbleScheduleSensor(KibbleEntity, SensorEntity):
+    """The feed schedule kibbled has cached and last pushed to the device.
+
+    kibbled owns the only readable copy of the schedule -- the MCU has no read-back for it -- so
+    this always reflects what kibbled last successfully wrote, not a live device query. kibbled
+    writes its cache before every send, so this stays accurate even if a send itself fails.
+    """
+
+    _attr_translation_key = "schedule"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "schedule")
+
+    @property
+    def native_value(self) -> int:
+        return len(self.coordinator.data.schedule.entries)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        schedule = self.coordinator.data.schedule
+        return {
+            "entries": [
+                {
+                    "id": e.id,
+                    "time": e.time,
+                    "amount_l": e.amount_l,
+                    "amount_r": e.amount_r,
+                    "enabled": e.enabled,
+                }
+                for e in schedule.entries
+            ],
+            "last_modified": schedule.last_modified,
+        }

@@ -38,7 +38,8 @@
       "bowl_fill_2": { "name": "Bowl fill hopper 2" },
       "desiccant_days": { "name": "Desiccant left" },
       "firmware": { "name": "Firmware" },
-      "ble_firmware": { "name": "Dispenser firmware" }
+      "ble_firmware": { "name": "Dispenser firmware" },
+      "schedule": { "name": "Schedule" }
     }
   },
   "services": {
@@ -63,6 +64,51 @@
       "description": "Stop a dispense that is in progress.",
       "fields": {
         "device_id": { "name": "Feeder", "description": "The feeder to stop." }
+      }
+    },
+    "schedule_set": {
+      "name": "Set schedule",
+      "description": "Replace the whole feed schedule with a new list of entries.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to reschedule." },
+        "entries": {
+          "name": "Entries",
+          "description": "The full replacement list, each with time, hopper1_g, hopper2_g and optionally enabled/entry_id."
+        }
+      }
+    },
+    "schedule_add": {
+      "name": "Add schedule entry",
+      "description": "Add one entry to the feed schedule.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to add an entry to." },
+        "time": { "name": "Time", "description": "Time of day to feed." },
+        "hopper1_g": { "name": "Hopper 1 amount", "description": "Grams from hopper 1." },
+        "hopper2_g": { "name": "Hopper 2 amount", "description": "Grams from hopper 2." },
+        "enabled": { "name": "Enabled", "description": "Whether the entry is active." }
+      }
+    },
+    "schedule_remove": {
+      "name": "Remove schedule entry",
+      "description": "Remove one entry from the feed schedule.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to remove an entry from." },
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The id from sensor.cat_feeder_schedule's entries attribute."
+        }
+      }
+    },
+    "schedule_set_enabled": {
+      "name": "Enable/disable schedule entry",
+      "description": "Turn one feed-schedule entry on or off without removing it.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to change." },
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The id from sensor.cat_feeder_schedule's entries attribute."
+        },
+        "enabled": { "name": "Enabled", "description": "Whether the entry should be active." }
       }
     }
   }

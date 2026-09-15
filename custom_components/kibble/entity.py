@@ -16,7 +16,7 @@ class KibbleEntity(CoordinatorEntity[KibbleCoordinator]):
 
     def __init__(self, coordinator: KibbleCoordinator, key: str) -> None:
         super().__init__(coordinator)
-        state = coordinator.data
+        state = coordinator.data.state
         self._attr_unique_id = f"{state.serial}_{key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, state.serial)},

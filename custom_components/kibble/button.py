@@ -74,7 +74,7 @@ class KibbleFeedButton(KibbleEntity, ButtonEntity):
         entity_id = registry.async_get_entity_id(
             "number",
             DOMAIN,
-            f"{self.coordinator.data.serial}_{self.entity_description.amount_key}",
+            f"{self.coordinator.data.state.serial}_{self.entity_description.amount_key}",
         )
         if entity_id and (state := self.hass.states.get(entity_id)) is not None:
             try:

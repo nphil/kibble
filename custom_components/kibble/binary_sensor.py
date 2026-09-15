@@ -37,4 +37,4 @@ class KibbleFeedingSensor(KibbleEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        return self.coordinator.data.feeding
+        return self.coordinator.data.state.feeding

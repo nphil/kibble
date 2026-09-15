@@ -156,6 +156,24 @@ pub fn json_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     Some(rest[..end].trim().trim_matches('"'))
 }
 
+/// Splits `"path?query"` into `(path, query)`. No query string -> `(path, "")`. `/schedule` routes
+/// are matched on the path half only; `DELETE /schedule/entry?id=` reads `id` from the query half.
+pub fn split_query(path: &str) -> (&str, &str) {
+    match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    }
+}
+
+/// Reads one `key=value` pair out of a query string (`&`-separated, first match wins). No
+/// percent-decoding: every value this API accepts is a plain id string kibbled itself generates.
+pub fn query_field<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +191,18 @@ mod tests {
     fn headers_end_is_found_only_on_the_blank_line() {
         assert_eq!(find_headers_end(b"GET / HTTP/1.1\r\n"), None);
         assert_eq!(find_headers_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(18));
+    }
+
+    #[test]
+    fn splits_path_and_query() {
+        assert_eq!(split_query("/schedule/entry?id=abc"), ("/schedule/entry", "id=abc"));
+        assert_eq!(split_query("/schedule/entry"), ("/schedule/entry", ""));
+    }
+
+    #[test]
+    fn reads_query_fields() {
+        assert_eq!(query_field("id=abc123", "id"), Some("abc123"));
+        assert_eq!(query_field("foo=bar&id=xyz", "id"), Some("xyz"));
+        assert_eq!(query_field("", "id"), None);
     }
 }
