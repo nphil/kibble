@@ -1,0 +1,32 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "feeding": {
+        "default": "mdi:bowl-mix-outline",
+        "state": { "on": "mdi:bowl-mix" }
+      }
+    },
+    "button": {
+      "feed": { "default": "mdi:bowl-mix" },
+      "feed_hopper_1": { "default": "mdi:numeric-1-circle" },
+      "feed_hopper_2": { "default": "mdi:numeric-2-circle" },
+      "cancel_feed": { "default": "mdi:stop-circle-outline" }
+    },
+    "number": {
+      "feed_amount": { "default": "mdi:counter" },
+      "feed_amount_hopper_1": { "default": "mdi:numeric-1-box-outline" },
+      "feed_amount_hopper_2": { "default": "mdi:numeric-2-box-outline" }
+    },
+    "sensor": {
+      "bowl_fill_1": { "default": "mdi:gauge" },
+      "bowl_fill_2": { "default": "mdi:gauge" },
+      "desiccant_days": { "default": "mdi:air-filter" },
+      "firmware": { "default": "mdi:chip" },
+      "ble_firmware": { "default": "mdi:memory" }
+    }
+  },
+  "services": {
+    "feed": "mdi:bowl-mix",
+    "cancel_feed": "mdi:stop-circle-outline"
+  }
+}
