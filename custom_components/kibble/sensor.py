@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.sensor import (
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
@@ -15,7 +16,7 @@ from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .api import FeederState
+from .api import CloudState, FeederState
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 
@@ -182,6 +183,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [KibbleSensor(coordinator, d) for d in SENSORS]
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
     entities.append(KibbleScheduleSensor(coordinator))
+    entities.append(KibbleCloudConnectionSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -246,3 +248,41 @@ class KibbleScheduleSensor(KibbleEntity, SensorEntity):
             ],
             "last_modified": schedule.last_modified,
         }
+
+
+_CLOUD_CONNECTION_STATES = ("connected", "blocked", "unreachable")
+
+
+def _cloud_connection_state(cloud: CloudState) -> str:
+    """`enabled` reflects the kill switch; a non-LAN `ESTABLISHED` socket reflects whether
+    the feeder is *actually* exchanging traffic with Petkit's cloud right now -- the two can
+    disagree (switch on but nothing connected yet after a fresh boot or a fail-safe
+    rollback, or switch off but a lingering `TIME_WAIT` socket that isn't `ESTABLISHED`)."""
+    if not cloud.enabled:
+        return "blocked"
+    if any(c.state == "ESTABLISHED" for c in cloud.connections):
+        return "connected"
+    return "unreachable"
+
+
+class KibbleCloudConnectionSensor(KibbleEntity, SensorEntity):
+    """Whether the feeder is actually exchanging traffic with Petkit's cloud right now, from
+    a live read of non-LAN sockets (`agent/src/cloud.rs`'s `GET /cloud`) gated by the kill
+    switch -- not just an echo of the switch's own position."""
+
+    _attr_translation_key = "cloud_connection"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(_CLOUD_CONNECTION_STATES)
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "cloud_connection")
+
+    @property
+    def native_value(self) -> str:
+        return _cloud_connection_state(self.coordinator.data.cloud)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        cloud = self.coordinator.data.cloud
+        return {"connections": [{"remote": c.remote, "state": c.state} for c in cloud.connections]}

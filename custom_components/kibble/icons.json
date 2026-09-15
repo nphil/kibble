@@ -55,9 +55,21 @@
       "tone_range_from": { "default": "mdi:clock-start" },
       "tone_range_till": { "default": "mdi:clock-end" },
       "surplus_control": { "default": "mdi:food-off-outline" },
-      "surplus_standard": { "default": "mdi:food-off-outline" }
+      "surplus_standard": { "default": "mdi:food-off-outline" },
+      "cloud_connection": {
+        "default": "mdi:cloud-question-outline",
+        "state": {
+          "connected": "mdi:cloud-check-outline",
+          "blocked": "mdi:cloud-lock-outline",
+          "unreachable": "mdi:cloud-alert-outline"
+        }
+      }
     },
     "switch": {
+      "cloud": {
+        "default": "mdi:cloud-off-outline",
+        "state": { "on": "mdi:cloud" }
+      },
       "night": { "default": "mdi:weather-night" },
       "light": { "default": "mdi:led-on" },
       "microphone": { "default": "mdi:microphone" }

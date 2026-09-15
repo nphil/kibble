@@ -90,6 +90,11 @@ GET  /config              every mapped setting's current value, flat {"key": val
 POST /config              {"key": "volume", "value": 5} — verified-writable keys only, others 400
 POST /feed                {"hopper":1|2|"both","amount":1..20,"id":"optional"}
 POST /feed/cancel
+GET  /cloud               {"enabled","last_error","routes","connections":[{"remote","state"}]}
+                          -- Petkit-cloud kill switch status, see agent/src/cloud.rs
+POST /cloud               {"enabled": bool} -- fails safe: a disable that can't prove LAN
+                          reachability after blackholing rolls itself back and returns an
+                          error rather than stranding the device
 ```
 
 `bowl_fill` reads `null` while the vendor has the value invalidated mid-feed (`0xffffffff`).

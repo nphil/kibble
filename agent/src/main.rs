@@ -20,6 +20,9 @@
 //!                                   zero re-encode
 //!   GET    :8765/streams            per-mount diagnostics: resolution/fps seen in the ring,
 //!                                   active session count, each session's peer address
+//!   GET    /cloud                   {"enabled","last_error","routes","connections"} -- the
+//!                                   Petkit-cloud kill switch's status (see cloud.rs)
+//!   POST   /cloud                   {"enabled": bool}  flip the kill switch
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
@@ -29,6 +32,7 @@
 
 mod backup;
 mod bus;
+mod cloud;
 mod desired;
 mod http;
 mod md5;
@@ -98,6 +102,7 @@ fn main() {
         ring::CHAN_SUB
     );
 
+    cloud::spawn_reconciler();
     persist::spawn_reconciler(Arc::clone(&shm));
     let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds));
 }
@@ -124,6 +129,8 @@ fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule, feeds:
             },
         ),
         ("GET", "/streams") => Response::Json(rtsp::streams_json(feeds)),
+        ("GET", "/cloud") => Response::Json(cloud::status_json()),
+        ("POST", "/cloud") => cloud_write(req),
         ("GET", "/schedule") => Response::Json(schedule.snapshot_json()),
         ("PUT", "/schedule") => put_schedule(req, schedule, ble),
         ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble),
@@ -156,6 +163,18 @@ fn config_write(req: &Request) -> Response {
         Err(persist::WriteError::UnknownKey) => Response::NotFound,
         Err(e @ persist::WriteError::Io(_)) => Response::Error(e.to_string()),
         Err(e) => Response::BadRequest(e.to_string()),
+    }
+}
+
+fn cloud_write(req: &Request) -> Response {
+    let enabled = match json_field(&req.body, "enabled") {
+        Some(v) => v != "false",
+        None => return Response::BadRequest(r#""enabled" is required"#.into()),
+    };
+    let result = if enabled { cloud::enable() } else { cloud::disable() };
+    match result {
+        Ok(_) => Response::Json(cloud::status_json()),
+        Err(e) => Response::Error(e.to_string()),
     }
 }
 
