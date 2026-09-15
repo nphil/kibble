@@ -1,0 +1,35 @@
+feed:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    hopper:
+      default: both
+      selector:
+        select:
+          options:
+            - "1"
+            - "2"
+            - both
+    amount:
+      required: true
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
+    id:
+      selector:
+        text:
+
+cancel_feed:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble

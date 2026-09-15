@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to your feeder",
+        "description": "Enter the address of the feeder running the Kibble agent.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "No Kibble agent answered at that address.",
+      "unknown": "The agent answered but the response could not be read."
+    },
+    "abort": {
+      "already_configured": "This feeder is already set up."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "feeding": { "name": "Feeding" }
+    },
+    "button": {
+      "feed": { "name": "Feed" },
+      "cancel_feed": { "name": "Cancel feed" }
+    },
+    "number": {
+      "feed_amount": { "name": "Feed amount" }
+    },
+    "sensor": {
+      "bowl_fill_1": { "name": "Bowl fill hopper 1" },
+      "bowl_fill_2": { "name": "Bowl fill hopper 2" },
+      "desiccant_days": { "name": "Desiccant left" },
+      "firmware": { "name": "Firmware" },
+      "ble_firmware": { "name": "Dispenser firmware" }
+    }
+  },
+  "services": {
+    "feed": {
+      "name": "Feed",
+      "description": "Dispense food from one or both augers.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to dispense from." },
+        "hopper": {
+          "name": "Hopper",
+          "description": "Which auger to run. The divider may be removed, in which case both draw from one bin."
+        },
+        "amount": { "name": "Amount", "description": "Portions to dispense." },
+        "id": {
+          "name": "Feed ID",
+          "description": "Optional identifier recorded with the feed event."
+        }
+      }
+    },
+    "cancel_feed": {
+      "name": "Cancel feed",
+      "description": "Stop a dispense that is in progress.",
+      "fields": {
+        "device_id": { "name": "Feeder", "description": "The feeder to stop." }
+      }
+    }
+  }
+}

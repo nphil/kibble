@@ -1,0 +1,15 @@
+[package]
+name = "kibbled"
+version = "0.1.0"
+edition = "2021"
+description = "On-device local-control agent for Petkit YumShare Dual feeders"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
