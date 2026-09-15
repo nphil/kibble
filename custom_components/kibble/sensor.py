@@ -12,7 +12,12 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfSignalStrength, UnitOfTime
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -353,7 +358,7 @@ class KibbleWifiSignalSensor(KibbleEntity, SensorEntity):
     _attr_translation_key = "wifi_signal"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
-    _attr_native_unit_of_measurement = UnitOfSignalStrength.DECIBELS_MILLIWATT
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator) -> None:
