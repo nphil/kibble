@@ -31,7 +31,7 @@ This gave a live, known-good specimen to search for instead of guessing.
 | Amount encoding | **Raw byte, no scaling on this device.** [HIGH] `amount_l=1`, `amount_r=1` on the wire, byte-for-byte equal to the app's own "1 portion per hopper" — confirmed by both live capture and by reading the actual divisor-flag bytes in `config_shm` (both `0`, i.e. disabled). |
 | `id[16]` content | **A generated string encoding date + local time-of-day**, e.g. `"s_20260916_62700"` (16 chars exactly, no in-field NUL). [HIGH] |
 | Time-of-day units/zone | **Local seconds-since-midnight** (62700 = 17:25:00 EDT). Confirmed present; the UTC equivalent (77100) was searched for and never found. [HIGH] |
-| The `time` **wire** field for this entry | **Zero.** [HIGH, one inferential link — see §6] The real JSON's `t` for the entry that ships to `ble`/MCU is a *positive* seconds-until-next-occurrence value (86341); `ctrl`'s own encoder (independently re-disassembled, byte-identical to `16-schedule.md` §3.4) zeroes any non-negative `t` before it reaches the wire. |
+| The `time` **wire** field for this entry | **Most likely zero.** [MED/INFERENCE — see §6, not directly observed in flight] The real JSON's `t` for the entry that ships to `ble`/MCU is a *positive* seconds-until-next-occurrence value (86341); `ctrl`'s own encoder (independently re-disassembled, byte-identical to `16-schedule.md` §3.4) zeroes any non-negative `t` before it reaches the wire. |
 | Is the earlier failed live test now explained? | **Yes**, with a different mechanism than originally suspected — see §7. No "feed list enable" flag was found anywhere (exhaustive search, §5); the more likely explanation is that the wire `time` field never carries a usable countdown in real operation at all. |
 | `enable` per-entry flag | **Confirmed absent** from the real JSON too (not just struct-capacity inference). [HIGH] |
 | Does `config_shm` cache the schedule? | **No, at all.** [HIGH, exhaustive] Every encoding candidate and a full ASCII/binary scan of the complete 11,952-byte struct found nothing schedule-shaped. |
@@ -239,8 +239,9 @@ own confirmed encoder logic (above), and (b) a real, live JSON object — reache
 `get_object_item(root,"latest")` call site — whose `"t"` is `86341`, a plain positive decimal integer
 with no minus sign anywhere in the source text (cJSON's own parser has no way to introduce a sign that
 isn't in the text). Chaining (a) and (b): **for this real entry, the wire `time` field is `0x00000000`.**
-This chain has no known gap, but it is a chain, not a single direct observation — hence "HIGH, one
-inferential link" rather than "proven by wire capture" in the TL;DR.
+This chain has no known gap, but it is a chain, not a single direct observation of the actual
+`msg_id 0x6005` bytes on the wire — hence tagged **[MED/INFERENCE]**, not [HIGH] and not "proven", in
+the TL;DR and the confidence table (§10).
 
 **Full predicted wire payload for `msg_id 0x6005`, this entry** (count=1, one 22-byte entry):
 
@@ -333,6 +334,12 @@ positives — expected, since `ctrl` links `libssl`/`libcrypto` and its heap is 
 structures. The literal-JSON-text search in §1 is what actually worked, and is the technique worth
 reusing for any future schedule-adjacent capture.)
 
+**`pktool get_config_info` cross-check (as the assignment asked):** ran it live, read-only
+(`pktool get_config_info 2>&1 | wc -l`) — **zero lines of output.** This is a direct, live confirmation
+of `07-config.md` §1's static finding that the dump function backing this subcommand could not be
+located as reachable code: on this real, running device the command is simply dead and exposes nothing,
+schedule or otherwise. Not a partial/format-mismatch failure — no output at all.
+
 ---
 
 ## 10. Confidence summary
@@ -344,7 +351,7 @@ reusing for any future schedule-adjacent capture.)
 | `id[16]` real-world shape: `"s_YYYYMMDD_SSSSS"` / `"n_SSSSS"`, exactly-16-char case has no in-field NUL | HIGH | Live heap capture, cross-checked against 3 intact empty-state captures |
 | Time-of-day unit: local seconds-since-midnight | HIGH | `62700` present 2×; UTC equivalent `77100` searched for, never found |
 | Non-negative `t` zeroed before the wire; negative `t` preserved | HIGH | Byte-identical re-pull + independent capstone disassembly, matches `16-schedule.md` §3.4 exactly |
-| Wire `time` for this real entry = 0 | HIGH, one inferential link (see §6) | Confirmed encoder logic + confirmed-positive real `t`; no literal wire-payload capture at write time |
+| Wire `time` for this real entry = 0 | **MED/INFERENCE** (see §6) | Confirmed encoder logic + confirmed-positive real `t`, chained together; no literal wire-payload capture at write time — not directly observed |
 | No weekday bitmask on the wire; recurrence is cloud-side JSON only | HIGH | Struct fully accounted for (prior study) + live capture shows recurrence as `"re":"1,2,3,4,5,6,7"`, a JSON sibling never reaching the entry-building code for the `"latest"`-present branch |
 | `enable` is not a wire-adjacent field | HIGH (upgraded from prior MEDIUM) | Absent from real captured JSON, not just inferred from struct capacity |
 | `"feed list enable"` flag exists somewhere | **Not found** | Exhaustive `config_shm` search (§9) + absent from real JSON |
@@ -368,6 +375,42 @@ already-proven, already-working manual feed path (`dispatch_handler_feed` / `fee
 `0x0A`) directly — the same mechanism `POST /feed` already uses. The MCU-facing `msg_id 0x6005` write
 becomes a "keep the vendor's own bookkeeping in sync" side effect (harmless, matches real behavior,
 useful if the app is ever used to *read* schedule status), not the actual trigger.
+
+### 11.1 Failure modes the scheduler MUST handle (safety-critical — this feeds a real animal)
+
+Moving the clock into `kibbled` moves the *responsibility* for feeding correctly onto software that can
+crash, restart, and run on a clock that itself changes. These are requirements for whoever implements
+this, not left implicit for later:
+
+1. **Missed fires while `kibbled` was down.** On startup, compare "now" against every enabled entry's
+   last recorded fire and the scheduled time(s) since then. **Feed once, late, if the miss is within a
+   bounded grace window (recommend a few hours); beyond that, skip and log it** rather than dispensing
+   at an inappropriate time of day (e.g. don't fire a missed 07:30 breakfast at 23:00 because the
+   device was powered off all day). Never catch up more than one missed occurrence per entry per
+   restart, even if several scheduled times were missed — one late meal is a reasonable recovery,
+   several stacked feeds are not. The exact grace-window length is a product decision for Nitin, not
+   this document, but the *behavior* (bounded catch-up, never a multi-feed pile-up) is not optional.
+2. **DST and clock changes.** Entries are stored and fired in **local time** (this document's own
+   finding, §2), so "next occurrence" must be (re)computed via timezone-aware local-time arithmetic on
+   every cycle — not by caching a fixed UTC instant and adding 86400 seconds repeatedly, which would
+   silently drift the actual local fire time by an hour at every DST transition. 17:25 must mean 17:25
+   local on both sides of a "spring forward"/"fall back" boundary. A manual system-clock change (NTP
+   resync, user override) must be handled the same way: re-derive "next occurrence" from the current
+   wall clock rather than trusting a previously-computed absolute deadline.
+3. **Duplicate fires after a restart.** A crash-and-restart within the same scheduled minute must not
+   re-dispense. Track "last fired at" **per entry, keyed to the specific scheduled occurrence** (not
+   just "have I fired since boot"), persisted durably (`/opt/kibble/schedule.json` or a companion state
+   file) — not held only in memory.
+4. **Hard ordering rule: record before dispense.** The sequence must be (a) determine a fire is due,
+   (b) durably persist "entry X is firing for occurrence Y" **before** calling the dispense path, (c)
+   call `feed_ctrl`, (d) update the record with the outcome. A crash between (b) and (c) is recoverable
+   (item 1's missed-fire logic retries or skips per the grace window — a *missed* feed, safe). The
+   reverse ordering — dispense, then record — is not recoverable: a crash after an actual dispense but
+   before its record is written leaves a restart believing the feed never happened, and it will
+   **double-feed**. That is the one failure mode this design must never produce. Recording first, even
+   at the cost of an occasional false "missed" for a feed that actually went out, is the correct
+   tradeoff: a possible extra late feed is bounded and recoverable by item 1; an unrecorded double-feed
+   is not bounded at all.
 
 **Test plan (safest first step, per the assignment's own instruction):** with Nitin's real plan still
 active on the device, have `kibbled` construct and send the **byte-identical** table this document
