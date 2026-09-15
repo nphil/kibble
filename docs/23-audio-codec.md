@@ -975,3 +975,237 @@ test (which does not write `slot->0x14`/`0x18`), but matters for any future atte
 `ring_base+1024`/`DATA_START`, so a naive `target.offset - DATA_START` translation would be
 off by 24 bytes. Not re-derived further this session (would need either tracing the real
 video/mic writer's own append path or a live comparison against `ring.rs`'s own scanner).
+
+## 17.9 Live test, approved and run: `speak_start`/`speak_stop` proven safe; consumption proven absent, cleanly this time
+
+Deployed to the device with full backup/md5 discipline (backup `kibbled.pre-audiostart`, md5
+`f862cc2e52cb14aacb461027c82e3788`; new binary md5 `1b4e1e3570ccba0bca6d28db380a5adf`, byte-
+verified transfer). Built from this branch on top of current `origin/main`.
+
+**First run (confounded, not counted as evidence)**: a 2.5s/~40-frame clip showed `SndFrm`
+advance 1842->1867 (+25) and a previously-nonexistent ADEC channel appear with `SndStrm=1876`.
+Initially reported as a possible real result. Two independent confounds surfaced on review: (a)
+Nitin created a Petkit-app feeding schedule within the same minute, which plays a vendor canned-
+prompt through the *same* `AX_ADEC`/`AX_AO` hardware resources and `/proc` counters `audio_out_
+thread` uses -- the two are not distinguishable from counter values alone, only from clean timing
+isolation; (b) a concurrent agent's own kibbled restart/log-redirect truncated `/tmp/kibbled.log`
+mid-run, destroying this session's own `frames_written` confirmation. Neither confound was caused
+by anything wrong in the write path or the new `AudioOutThread` code; both were environmental.
+
+**Settled, independent of the confound**: the "is `slot->0x12` a bitmask that could select the
+microphone" question Main raised is resolved from `ring.rs`'s own live-verified channel constants
+(not the live test): `CHAN_AUDIO`(mic)`=1`, `CHAN_MAIN=4`, `CHAN_SUB=8`, `CHAN_THUMB=16`,
+`CHAN_AUDIO_OUT=2` -- a proper one-hot scheme across all five real channels. `slot->0x12=2`
+ANDed against mic's channel byte (`1`): `0b001 & 0b010 = 0`. Zero overlap. The filter can only
+ever pass `CHAN_AUDIO_OUT` records; a mic-audio feedback loop through this specific mechanism is
+not possible **[HIGH]**.
+
+**Second run, clean**: device frozen to every other agent for the duration (no concurrent telnet/
+HTTP/log access). An 8.000s/128,000-sample/**exactly 125-frame** clip (1024 samples/frame, no
+remainder -- chosen so the expected `SndFrm` delta is unambiguous and could not coincidentally
+match ambient activity), prediction (`+125`, stated before sending) recorded in the hub log ahead
+of the test per the same discipline as every other consequential action this project takes.
+
+| checkpoint | UTC | `SndFrm` | ADEC `SndStrm`/`DecOk`/`GetFrm`/`RlsFrm` | guard flag (`0x767f0`) |
+|---|---|---|---|---|
+| baseline | 21:34:36 | 1867 | 1876/1876/1867/1867 | 0 |
+| send | 21:34:42.65 | -- | -- | -- |
+| +~16s (past the 8s window) | 21:34:59 | 1867 | 1876/1876/1867/1867 | 0 |
+| +~40s, final | 21:35:22 | 1867 | 1876/1876/1867/1867 | 0 |
+
+**Every single number identical, before and after, down to the digit.** Predicted `+125`, got
+`+0`. `aenc` showed only the idle banner throughout (confirmed no real app call this time, so
+this is not a repeat of the first run's confound); all 7 vendor PIDs present with continuous
+uptime across the whole test; RTSP verified `h264`+`aac` immediately before and after; the guard
+flag read `0` at every checkpoint (either it never needed to be `1` for as long as a between-
+checkpoint gap could catch, or `speak_stop` cleared it promptly either way -- the vendor-side
+counters are the load-bearing evidence here, not the flag's transient value).
+
+**Conclusion, at full confidence this time**: `speak_start`/`speak_stop` and the `AudioOutThread`
+RAII lifecycle are proven safe end-to-end on real hardware -- idempotent, self-cleaning-up,
+zero health-gate impact, guard flag verified correct. `audio_out_thread` spawns and behaves
+exactly as disassembled. **Kibbled's write is still not consumed.** This is no longer a
+disassembly prediction or an ambiguous live reading; it is a clean, isolated, confound-free
+measurement that matches §17.3's root cause exactly: consumption gates on `ring_base->0x18`, the
+single mutex-protected all-channel sequence counter, which kibbled's writer has never touched.
+The first run's `+25` is now understood as the vendor's own canned-prompt playback (a real pet-
+call-adjacent event, coincidentally timed), not evidence of anything Kibble wrote being played.
+
+**Acceptance bar, honestly met via path (b)**: not audible playback, but a precisely evidenced
+reason it still cannot be driven safely without a new, separate, higher-risk step -- joining the
+`PTHREAD_PROCESS_SHARED` mutex embedded in `media_buffer_frame_buf` and correctly advancing the
+same global counter live video/mic recording depends on (§17.3.1's lower-risk candidate, "ride
+the counter's existing ambient cadence by rewriting only `slot->0x14`/`0x18`," remains a real,
+disassembly-grounded hypothesis but is unverified and was explicitly not attempted this session
+per standing instruction -- the household's camera path is not something to experiment on without
+a deliberate, separate go-ahead).
+
+## 17.10 The publish protocol, fully disassembled: mutex robustness, exact field sequence, torn-record story, recovery
+
+Found the actual publisher this session -- a shared `publish(chn_ctx, header_and_len_struct)` at
+`0x32540`, called (by cross-reference, not yet individually confirmed per-caller) from wherever
+`media`'s own video/mic encoder completion callbacks live; not itself re-derived this session, but
+its *body* is fully disassembled and is the same function every legitimate writer funnels through
+-- confirmed by it being the *only* place in the whole binary that increments `ring_base->0x18`
+(searched: exactly one `str` to that offset from the global-pointer register, at `0x326aa`) or
+writes `ring_base->0x28` (`0x326a2`-adjacent stores are the only writes to that field anywhere).
+Answering Main's four questions in order:
+
+### 17.10.1 Is the mutex robust? No -- confirmed by absence, not inference
+
+**No.** `pthread_mutexattr_setrobust` and `pthread_mutex_consistent` appear **zero times** in
+`/app/bin/media`'s entire dynamic symbol table (`.dynsym`, 455 entries, every imported libc/SDK
+function enumerated and checked by name) -- for a dynamically-linked binary, a symbol that is
+never imported can never be called, so this is not "not found by this session," it is "does not
+exist in this binary" **[HIGH]**. `PTHREAD_PROCESS_SHARED` **is** confirmed: the only
+`pthread_mutexattr_setpshared` call site in the whole binary (`0x3229e`) feeds the same mutex
+object at `ring_base+0x00`, immediately followed by `pthread_mutex_init` at `0x322a6` -- this is
+the one and only process-shared mutex `media` creates.
+
+**Consequence, stated plainly**: this is a plain futex-based mutex with no kernel-assisted
+owner-death recovery. If any process dies while holding it -- `kibbled` included -- the futex
+word in shared memory stays marked "locked," the kernel does nothing special (`set_robust_list`
+cleanup only fires for mutexes created with the robust attribute), and *no* future
+`pthread_mutex_lock`/`_timedlock` call from *any* process will ever succeed again. Since this is
+the **same single mutex every writer uses** (§17.10.2), that means video and mic recording stall
+too, not just audio -- confirmed by tracing every `pthread_mutexattr_setpshared` call site (one)
+and cross-referencing that `0x31d58` (the lock-with-timeout helper) is called from all of: the
+registry-slot-open path, the channel-mask-set path, the audio-out consumer's poll loop, *and* the
+publish function itself (`0x3255e`) -- one mutex, shared by the read and write sides of every
+channel.
+
+### 17.10.2 Exact publish sequence, byte-level, from `0x32540`
+
+1. **Before the lock**: bounds check only (`length + 56 <= 0x800000`); reject and return early if
+   not. No lock held for this step.
+2. **Lock** (`0x31d58`: `pthread_mutex_trylock`, else a 1-second `pthread_mutex_timedlock`,
+   logging+propagating failure without ever touching ring bytes on a failed lock -- §17.10.3).
+3. An **advisory-only** check (compares `ring_base->0x28`/`0x24`/`0x20` against a fixed
+   threshold; if exceeded, logs a warning and calls a **counter-reset** helper (`0x31c38`, zeros
+   `ring_base->0x18/0x1c/0x20/0x24/0x28` back to `0`) but does **not** abort -- write proceeds
+   regardless, now starting from a wiped write cursor). Not fully re-derived this session (an edge
+   case, not the steady-state path); flagged rather than guessed at.
+4. **Bump the global sequence counter first, before any bytes move**: `ring_base->0x18 += 1`;
+   the *new* value is written straight into the caller's own soon-to-be-written header struct
+   (`*header_struct = new_seq`) -- this is where a record's header seq field ultimately comes
+   from, confirming `ring_base->0x18` is the single source of truth for every channel's seq,
+   not just a value readers happen to track.
+5. Conditionally, **only when `ring_base->0x20 == 0` at that instant**, also sets
+   `ring_base->0x1c = new_seq` -- a bootstrap/edge condition, not a per-write step; this is the
+   mechanism behind `docs/11-media.md`'s old "0x1c trails 0x18 by a roughly-constant gap"
+   observation (set once, early, then just falls behind as 0x18 keeps incrementing).
+6. **Write the 56-byte header** at `ring_base + 0x3e8 + ring_base->0x28` via a generic
+   `write_ring_bytes(offset, src, len)` helper (`0x31d1c`, the write-side mirror of the read
+   helper `0x31cdc` -- same `+0x3e8` base, same `0x800000` wrap modulus, confirmed symmetric).
+7. **Advance `ring_base->0x28` past the header** (`+= 56`, wrapped), then **write the payload**
+   at the new offset via the same helper.
+8. **Advance `ring_base->0x28` past the payload** (wrapped mod `0x800000`) -- `ring_base->0x28`
+   is, definitively, **the ring's write cursor / next-free-byte offset**, touched by every single
+   append. This resolves §17.3's flagged uncertainty about `audio_out_thread` seeding its own read
+   cursor from this exact field at open time: it is not a stale or arbitrary value, it is "start
+   reading from wherever the writer currently is" -- the same "fast-forward to now, don't replay
+   history" policy `ring.rs`'s own `Walker::seed()` independently implements on kibbled's side.
+9. Also advances `ring_base->0x20` by `56 + length`, **not wrapped** -- a monotonic running total
+   consumed only by step 3's advisory/reset check next time, not by any reader.
+10. A conditional side effect when the record's own `frame_type`-equivalent header byte (`+0x20`
+    within the header struct) equals `1` (a keyframe flag, matching `docs/19-frame-ring.md`'s
+    `FRAME_KEYFRAME`): copies a couple of header fields into `ring_base+0x3a4`/`+0x3b0` --
+    plausibly last-keyframe bookkeeping for some other consumer; tangential, not re-derived
+    further.
+11. **Notify loop, still under the lock**: walks all 20 registry slots (`base+0x2c` stride `0x2c`,
+    same geometry as §17.2); for each slot with `+0x50 != 0` (active) *and* a bitmask match
+    between the just-written record's channel field (header `+0x22`, the exact field
+    `audio_out_thread`'s own filter reads, §17.8) and that slot's own `+0x3e` subscription mask,
+    calls a per-slot notify helper (`0x31f64`): lazily `sem_open()`s a **named POSIX semaphore**
+    indexed by the slot's own `idx` field (`+0x10`) the first time, then `sem_post()`s it, then
+    clears a per-slot `+0x28` "wants a kick" flag. This is a **second synchronization primitive**
+    beyond the mutex -- a per-consumer semaphore array -- not mentioned in any prior session's
+    docs. **Not required for correctness here**: `audio_out_thread`'s own poll loop (§17.3, fully
+    traced) never calls `sem_wait`/`sem_timedwait` anywhere in its body -- it is a pure poller
+    gated on `ring_base->0x18` vs its own bookmark, re-checked on a timer/loop cadence, not woken
+    by this semaphore. A publish that skips the notify step would only cost some polling latency
+    for *this specific* consumer, not correctness -- but is noted precisely rather than assumed,
+    since a different consumer (if any) could depend on it.
+12. **Unlock** (`0x31e44` -- a 4-instruction tail call straight into `pthread_mutex_unlock`,
+    confirmed by its target PLT address; nothing else happens between the notify loop and the
+    unlock).
+13. Return `0`.
+
+### 17.10.3 Torn/mid-write records: not a live race under normal operation
+
+Traced the **read side's own lock discipline** in `audio_out_thread`'s poll function (`0x32d1c`)
+precisely: it locks at entry (`0x32d40`, same `0x31d58` helper) and does **not** unlock until one
+of exactly two exit points, both confirmed by address: (a) the "nothing new right now" path
+(`0x32e1e`) -- which, before unlocking, **re-syncs `slot->0x14`/`0x18` to the current
+`ring_base->0x18`/`0x28`** so the consumer's own bookmarks never silently drift behind the writer
+-- or (b) the "found and copied a matching record" path (`0x32f9c`), which unlocks **only after**
+the payload `read_ring_bytes` call (`0x32f86`) has already completed. **The same mutex that
+serializes every writer's header+payload write also serializes every read of that data** -- a
+reader can only ever observe a fully-written record or nothing yet, never a partial one, as long
+as it holds the lock (which it does, for the entirety of both header and payload reads) **[HIGH,
+directly disassembled, not inferred from the header's own seq/length sanity fields]**. This also
+means the *existing*, independently-documented "torn record" tolerance in `docs/23-audio-codec.md`
+/`ring.rs` (sane-length + seq-continuity + rescan-on-failure) is defense for a **different**
+scenario -- a reader that does *not* take this lock at all (kibbled's own background poller,
+`ring.rs`'s `Walker`, which was designed before this mutex was understood and reads raw bytes
+without ever calling into `media`'s pthread API) -- not evidence that torn writes are a live
+concern for a lock-honoring writer. A failed lock acquisition (`0x31d58` times out after 1s)
+returns failure **without touching any ring bytes** on either the read or write side -- confirmed
+for both call sites -- so a contended-but-not-wedged mutex degrades to "try again later," never to
+a partial read or write.
+
+### 17.10.4 Recovery story: `/dev/shm` is tmpfs, confirmed live
+
+`mount | grep shm` on the device, live: `tmpfs on /dev/shm type tmpfs (rw,relatime,mode=777)`
+**[HIGH, live-read, read-only command]**. RAM-backed, non-persistent. A reboot recreates the
+segment from nothing, re-running the zero-init + mutex-init sequence (§17.2) from scratch --
+**confirmed**: worst case for a wedged mutex is "reboot the feeder," which is recoverable, not
+"replace the device" or "silent permanent camera loss." This materially bounds the downside of
+§17.10.1's finding, exactly as Main's framing anticipated, but does not remove the need for the
+design below -- an unplanned reboot of the household's camera/mic is still a real cost, not a
+free option.
+
+## 17.11 Design whose failure mode is bounded by construction (not implemented -- awaiting Main's decision on whether to write it)
+
+Given §17.10's answers, a `kibbled`-side publish that cannot wedge the shared pipeline by
+construction:
+
+1. **Compute everything before locking.** Encode the AAC payload, build the full 56-byte header
+   in a local (stack/heap) buffer with every field *except* the seq number, and know the payload
+   length -- all of this already happens today, outside any lock, in `audioout.rs`. Nothing
+   fallible happens after this point.
+2. **Lock with a bounded timeout, never indefinitely.** `pthread_mutex_timedlock` (not
+   `_trylock`-then-block, not a bare `_lock`) with a short deadline (hundreds of ms, not the
+   vendor's own 1s -- kibbled has no reason to wait as long as `media`'s own internal callers,
+   which are on a real-time video pipeline's own deadline pressure). On timeout: treat exactly
+   like a normal "busy, try again" `SpeakError`, the same way a failed ring open already fails
+   `play_encoded` today. Never retry the *same* lock call in a loop that could itself block
+   unboundedly.
+3. **Inside the lock: read `ring_base->0x18`, increment, write it back, stamp the header, `pwrite`
+   header then payload at `ring_base->0x28` (mirroring §17.10.2 steps 4-9 exactly, byte-for-byte,
+   including the `ring_base->0x1c` conditional and the `+0x20` running-total update, so this write
+   is indistinguishable from a real vendor write to every other reader), then unlock.** No
+   allocation inside this section (buffers pre-allocated in step 1), no logging, no `eprintln!`,
+   no panics possible (every fallible step -- the two `pwrite`s -- already happens today in
+   `write_frame`, which returns `Result` rather than unwrapping; keep it that way inside the
+   locked section specifically, with zero `.unwrap()`/`.expect()` anywhere between lock and
+   unlock). Skip the notify-semaphore step (§17.10.2 step 11, `sem_post`) deliberately: it is
+   real vendor behavior but not required for `audio_out_thread` (§17.10.3), and every extra
+   `sem_open`/`sem_post` call inside the locked section is one more fallible operation to
+   exclude by the rule above.
+4. **`Drop`-guaranteed unlock**, exactly the same RAII discipline already proven this session for
+   `AudioOutThread`/`speak_stop` (§17.4-§17.7): a guard type whose `Drop` unlocks even on an early
+   return or (should it ever happen despite `panic = "abort"` making this moot for kibbled's own
+   process) a panic unwind. `panic = "abort"` cuts the other way here and matters more than usual:
+   it means *any* panic anywhere in kibbled, not just in the audio path, aborts the whole process
+   immediately -- so the real mitigation is keeping the locked section itself panic-free by
+   construction (step 3), not relying on unwind-time cleanup that this profile disables anyway.
+5. **Never write `slot->0x14`/`0x18` directly** (§17.3.1's original, lower-risk-looking idea) --
+   §17.10.2 shows those are consumer-owned working state that the *publish* protocol updates as a
+   side effect of a correct append, not a separate channel a writer is meant to poke. Following
+   the real protocol exactly (steps 1-4 above) makes that idea moot: a correct publish already
+   causes every matching consumer's next poll to see new data through the same
+   `ring_base->0x18`-vs-bookmark gate every other channel relies on.
+
+This is a design, not an implementation -- no code written against it this session, per standing
+instruction. Awaiting Main's go/no-go before touching `agent/src/audioout.rs`'s writer again.
