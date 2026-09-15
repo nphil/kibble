@@ -1,55 +1,152 @@
-//! A deliberately small RTSP/1.0 server, serving the ring's "sub" channel (1152x720@25fps H.264)
-//! straight through as RTP with no re-encoding.
+//! A deliberately small RTSP/1.0 server, serving both channels of the vendor frame ring straight
+//! through as RTP with no re-encoding: `/main` is the ring's 1728x1080 channel, `/sub` is the
+//! 1152x720@25fps channel (see `ring.rs`). Which mount a client gets is decided purely by a path
+//! segment in its request URL (`Feeds::select` below); anything that doesn't name "main" defaults
+//! to `/sub`, this server's original and most-documented mount.
 //!
-//! Same philosophy as `http.rs`: one accept loop, one connection at a time, no framework. RTP
-//! rides interleaved on the same TCP connection as the RTSP control channel (`RTP/AVP/TCP`,
-//! channel 0) -- that keeps this server to a single listening socket and sidesteps UDP port
-//! negotiation entirely, which is both simpler to implement from scratch and exactly what the
-//! verification command (`ffprobe -rtsp_transport tcp`) and Scrypted both use anyway.
+//! Same philosophy as `http.rs`: no framework. RTP rides interleaved on the same TCP connection as
+//! the RTSP control channel (`RTP/AVP/TCP`, channel 0) -- that keeps this server to a single
+//! listening socket and sidesteps UDP port negotiation entirely, which is both simpler to
+//! implement from scratch and exactly what the verification command (`ffprobe -rtsp_transport
+//! tcp`) and Scrypted both use anyway.
 //!
-//! Supported methods: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER. There is only ever
-//! one stream, so SETUP/PLAY don't gate on the requested URL path -- whatever path a client
-//! connects with, it gets the one video track. The GOP on this stream is ~4s (100 frames @25fps,
-//! see docs/11-media.md §2), which is too long to make a newly-connected client wait for the next
-//! keyframe, so PLAY sends `VideoFeed`'s cached most recent keyframe immediately, then forwards
-//! whatever the ring poller publishes from there.
+//! ## Concurrency
+//!
+//! By design, Scrypted is the single real consumer of either stream, so [`MAX_SESSIONS_PER_STREAM`]
+//! is a small, fixed ceiling (2) rather than a tunable: room for Scrypted's own prebuffer plus one
+//! spare slot for a human debugging with `ffprobe` on the same stream, applied independently per
+//! mount. A session past that cap gets an immediate, clean `453 Not Enough Bandwidth` at PLAY --
+//! never a hang. Taking the spare slot is logged to stderr with the client's address (see
+//! `handle_session`), and `GET /streams` (`streams_json`, wired in `main.rs`) exposes exactly who
+//! is attached to each mount right now, so anything other than Scrypted showing up is visible.
+//!
+//! Each accepted connection gets its own thread (see `spawn`). That matters beyond just the
+//! session cap: this server used to hand every connection to one accept-loop thread that ran the
+//! whole session to completion before calling `accept()` again, so a second client's connection
+//! sat fully formed in the kernel's accept backlog and its DESCRIBE was simply never read -- a
+//! hang, not a refusal, and the bug that motivated this rewrite. A connection that never sends a
+//! request is bounded by the same 10s read timeout every other request already gets, on its own
+//! thread, so it can't delay anyone else either.
+//!
+//! ## Frame fan-out
+//!
+//! `ring.rs`'s poller polls the shared-memory ring exactly once regardless of how many clients are
+//! attached to either mount, and publishes each new access unit into every attached client's own
+//! small bounded queue (`ring::VideoFeed`/`ring::Subscription`, 2-4 access units). A momentarily
+//! slow client only ever drops frames from its own queue -- see `Subscriber::push` in `ring.rs`
+//! for the exact policy -- and never blocks the poller or any other client. Every new session is
+//! seeded with the cached last keyframe (SPS+PPS+IDR) at subscribe time, so PLAY doesn't need to
+//! wait out the ~4s GOP for the next one.
+//!
+//! Supported methods: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER. SETUP/PLAY don't
+//! gate on trackID (there's only ever one track per mount) but DESCRIBE/PLAY do gate on which
+//! mount the URL names.
 //!
 //! While playing, a single thread interleaves two things on the same socket: waiting (with a
-//! short timeout) for the next frame from `VideoFeed`, and a short non-blocking-ish read for an
-//! incoming client request (GET_PARAMETER keepalive, or TEARDOWN) -- that avoids needing a second
-//! thread per connection just to notice a keepalive or hangup.
+//! short timeout) for the next frame from this session's `Subscription`, and a short
+//! non-blocking-ish read for an incoming client request (GET_PARAMETER keepalive, or TEARDOWN) --
+//! that avoids needing a second thread per connection just to notice a keepalive or hangup.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ring::{Frame, VideoFeed};
+use crate::ring::{Frame, Subscription, VideoFeed};
 
 const MAX_REQUEST: usize = 4096;
 /// RTP payload PT 96 = the one dynamic type we declare, always H.264.
 const PAYLOAD_TYPE: u8 = 96;
-/// Arbitrary but fixed for the process lifetime -- there's only ever one active session, so it
-/// never needs to distinguish sources.
+/// Arbitrary but fixed for the process lifetime -- RTP receivers only need it to disambiguate
+/// sources sharing one transport, and every session here has its own TCP connection.
 const SSRC: u32 = 0x4B42_4C44; // "KBLD"
 /// Conservative per-RTP-packet payload cap; NAL units larger than this get FU-A fragmented
 /// (RFC 6184 §5.8). TCP transport has no hard MTU requirement, but this is the size every RTP
 /// implementation targets by convention and there is no reason to deviate.
 const RTP_MTU: usize = 1400;
-/// Fixed RTSP session id -- fine because only one client is ever connected at a time.
-const SESSION_ID: &str = "kibble1";
+/// Concurrent PLAY sessions each mount (`/main`, `/sub`) will serve -- see the module doc's
+/// "Concurrency" section. A hard ceiling, not configurable: raising it is a design decision, not
+/// an operational one.
+const MAX_SESSIONS_PER_STREAM: usize = 2;
+/// Per-client bounded queue depth (`ring::Subscriber`). Small enough to bound memory and
+/// staleness (at 25fps this is well under 200ms of buffering even full), large enough that
+/// ordinary scheduling jitter -- not a genuine client stall -- doesn't trigger the drop policy on
+/// every single frame.
+const CLIENT_QUEUE_CAP: usize = 3;
 
-/// Open the listener's accept loop on a background thread. Mirrors `http::serve`'s shape: one
-/// connection handled fully before the next `accept()`.
-pub fn spawn(listener: TcpListener, feed: Arc<VideoFeed>) -> thread::JoinHandle<()> {
+/// The two independently-served streams. `main.rs` owns one `Arc<Feeds>`, shared between the RTSP
+/// accept loop (this module) and the HTTP `GET /streams` diagnostic handler.
+pub struct Feeds {
+    pub main: Arc<VideoFeed>,
+    pub sub: Arc<VideoFeed>,
+}
+
+impl Feeds {
+    /// Picks the stream a request's URL names, returning both the feed and its canonical name
+    /// (for logging and `GET /streams`, not necessarily byte-identical to whatever path segment
+    /// the client actually sent). Matches on a whole path segment so `/mainstream` doesn't
+    /// false-positive as `/main`; anything that doesn't say "main" -- including a client that
+    /// skips DESCRIBE and just names the bare host -- defaults to `/sub`.
+    fn select(&self, url: &str) -> (&'static str, &Arc<VideoFeed>) {
+        if url_names_segment(url, "main") {
+            ("main", &self.main)
+        } else {
+            ("sub", &self.sub)
+        }
+    }
+}
+
+fn url_names_segment(url: &str, name: &str) -> bool {
+    url.split('/').any(|seg| seg.eq_ignore_ascii_case(name))
+}
+
+/// `GET /streams`: per mount, what the ring is actually producing and exactly who is attached.
+/// Because Scrypted is meant to be the only real consumer (see module doc), any peer address
+/// beyond one expected session is itself the diagnostic signal -- this just exposes the raw facts
+/// and leaves the judgment to whoever's reading it (today: a human; the HA sensor surfaces
+/// `blocked`/`connected`-style state built from this same data in a future pass).
+pub fn streams_json(feeds: &Feeds) -> String {
+    format!(r#"{{"main":{},"sub":{}}}"#, mount_json(&feeds.main), mount_json(&feeds.sub))
+}
+
+fn mount_json(feed: &VideoFeed) -> String {
+    let snap = feed.snapshot();
+    let sessions: Vec<String> = snap.sessions.iter().map(|p| format!("\"{}\"", p.escape_debug())).collect();
+    format!(
+        r#"{{"width":{},"height":{},"fps":{:.1},"session_count":{},"sessions":[{}]}}"#,
+        snap.width,
+        snap.height,
+        snap.fps,
+        snap.sessions.len(),
+        sessions.join(",")
+    )
+}
+
+/// Monotonic counter for a unique-enough RTSP session id per connection -- now that more than one
+/// session can be active at once, the old single fixed id would let two clients' `Session` headers
+/// collide.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+fn new_session_id() -> String {
+    format!("kibble{:x}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Open the listener's accept loop on a background thread. Each accepted connection gets its own
+/// thread -- see the module doc's "Concurrency" section for why that's essential, not just nice
+/// to have.
+pub fn spawn(listener: TcpListener, feeds: Arc<Feeds>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if let Err(e) = handle_session(stream, &feed) {
-                        eprintln!("kibbled: rtsp connection: {e}");
-                    }
+                    let feeds = Arc::clone(&feeds);
+                    thread::spawn(move || {
+                        if let Err(e) = handle_session(stream, &feeds) {
+                            eprintln!("kibbled: rtsp connection: {e}");
+                        }
+                    });
                 }
                 Err(e) => eprintln!("kibbled: rtsp accept: {e}"),
             }
@@ -63,9 +160,11 @@ struct RtspRequest {
     cseq: String,
 }
 
-fn handle_session(mut stream: TcpStream, feed: &Arc<VideoFeed>) -> io::Result<()> {
+fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    let session_id = new_session_id();
     loop {
         let req = match read_request(&mut stream)? {
             Some(r) => r,
@@ -78,19 +177,30 @@ fn handle_session(mut stream: TcpStream, feed: &Arc<VideoFeed>) -> io::Result<()
                 "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n",
                 "",
             )?,
-            "DESCRIBE" => respond_describe(&mut stream, &req, feed)?,
+            "DESCRIBE" => respond_describe(&mut stream, &req, feeds.select(&req.url).1)?,
             "SETUP" => respond(
                 &mut stream,
                 &req,
-                &format!("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nSession: {SESSION_ID}\r\n"),
+                &format!("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nSession: {session_id}\r\n"),
                 "",
             )?,
             "PLAY" => {
-                respond(&mut stream, &req, &format!("Session: {SESSION_ID}\r\nRange: npt=0.000-\r\n"), "")?;
-                return stream_media(&mut stream, feed);
+                let (path, feed) = feeds.select(&req.url);
+                return match feed.subscribe(peer.clone(), MAX_SESSIONS_PER_STREAM, CLIENT_QUEUE_CAP) {
+                    Some((session, active)) => {
+                        if active == MAX_SESSIONS_PER_STREAM {
+                            eprintln!(
+                                "kibbled: rtsp /{path} spare slot taken by {peer} ({active}/{MAX_SESSIONS_PER_STREAM} sessions active)"
+                            );
+                        }
+                        respond(&mut stream, &req, &format!("Session: {session_id}\r\nRange: npt=0.000-\r\n"), "")?;
+                        stream_media(&mut stream, &session, &session_id)
+                    }
+                    None => write_status(&mut stream, &req.cseq, 453, "Not Enough Bandwidth", "", ""),
+                };
             }
-            "TEARDOWN" => return respond(&mut stream, &req, &format!("Session: {SESSION_ID}\r\n"), ""),
-            "GET_PARAMETER" => respond(&mut stream, &req, &format!("Session: {SESSION_ID}\r\n"), "")?,
+            "TEARDOWN" => return respond(&mut stream, &req, &format!("Session: {session_id}\r\n"), ""),
+            "GET_PARAMETER" => respond(&mut stream, &req, &format!("Session: {session_id}\r\n"), "")?,
             _ => write_status(&mut stream, &req.cseq, 501, "Not Implemented", "", "")?,
         }
     }
@@ -114,11 +224,12 @@ fn respond_describe(stream: &mut TcpStream, req: &RtspRequest, feed: &VideoFeed)
 }
 
 /// Poll `VideoFeed` for its cached keyframe until one shows up or `timeout` elapses. Only used
-/// from DESCRIBE, which is infrequent, so a simple sleep loop is fine.
+/// from DESCRIBE, which is infrequent, so a simple sleep loop is fine; it doesn't consume a
+/// session slot, so it's not subject to `MAX_SESSIONS_PER_STREAM`.
 fn wait_for_keyframe(feed: &VideoFeed, timeout: Duration) -> Option<Frame> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let (_, Some(kf)) = feed.latest_keyframe() {
+        if let Some(kf) = feed.latest_keyframe() {
             return Some(kf);
         }
         if Instant::now() >= deadline {
@@ -151,36 +262,31 @@ fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8]) -> String {
 /// how often frames arrive. Keeping this decoupled (rather than doing one bounded read per frame
 /// loop iteration) matters: a bounded read still costs its full timeout whenever the client has
 /// nothing pending, which -- paid on every single frame -- was enough overhead per cycle to fall
-/// behind the sub channel's ~40 ms cadence and silently drop frames (via `VideoFeed`'s
-/// latest-wins hand-off), corrupting decode until the next keyframe. A live camera view can
-/// easily tolerate 100+ ms of extra latency noticing GET_PARAMETER/TEARDOWN; it can't tolerate
-/// dropped interframes.
+/// behind the sub channel's ~40 ms cadence and silently drop frames. A live camera view can easily
+/// tolerate 100+ ms of extra latency noticing GET_PARAMETER/TEARDOWN; it can't tolerate dropped
+/// interframes.
 const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Stream RTP over the same connection until the client tears down or disconnects. Runs entirely
-/// on this one thread: frame delivery is paced by `VideoFeed::wait_next`'s own timeout, and the
-/// control-socket check (keepalive/teardown) rides along on a much coarser timer so it never taxes
-/// the frame path (see `CONTROL_CHECK_INTERVAL`).
-fn stream_media(stream: &mut TcpStream, feed: &Arc<VideoFeed>) -> io::Result<()> {
+/// on this one thread: frame delivery is paced by this session's `Subscription::recv` timeout, and
+/// the control-socket check (keepalive/teardown) rides along on a much coarser timer so it never
+/// taxes the frame path (see `CONTROL_CHECK_INTERVAL`). `session` was already seeded with the
+/// current keyframe (if any) at subscribe time, so the first `recv` below delivers it -- no
+/// separate "send the cached keyframe first" step needed.
+fn stream_media(stream: &mut TcpStream, session: &Subscription, session_id: &str) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let (gen, kf) = feed.latest_keyframe();
-    let mut last_seen = gen;
     let mut seq: u16 = 0;
-    if let Some(kf) = kf {
-        send_access_unit(stream, &kf, &mut seq)?;
-    }
-
     let mut ctrl_buf = Vec::new();
     let mut last_control_check = Instant::now();
     loop {
-        if let Some(frame) = feed.wait_next(&mut last_seen, Duration::from_millis(40)) {
+        if let Some(frame) = session.recv(Duration::from_millis(40)) {
             send_access_unit(stream, &frame, &mut seq)?;
         }
         if last_control_check.elapsed() >= CONTROL_CHECK_INTERVAL {
             last_control_check = Instant::now();
-            match poll_control(stream, &mut ctrl_buf)? {
+            match poll_control(stream, &mut ctrl_buf, session_id)? {
                 ControlEvent::Teardown => return Ok(()),
                 ControlEvent::None | ControlEvent::Handled => {}
             }
@@ -197,7 +303,7 @@ enum ControlEvent {
 /// Non-blocking-ish check for a pending client request on `stream` (whose read timeout is
 /// already set short by the caller), accumulating partial reads in `buf` across calls. Answers
 /// GET_PARAMETER inline; TEARDOWN is answered too, then reported so the caller ends the session.
-fn poll_control(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<ControlEvent> {
+fn poll_control(stream: &mut TcpStream, buf: &mut Vec<u8>, session_id: &str) -> io::Result<ControlEvent> {
     let mut chunk = [0u8; 512];
     match stream.read(&mut chunk) {
         Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed during play")),
@@ -213,7 +319,7 @@ fn poll_control(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<Control
     let req = parse_request(&buf[..head_end]);
     buf.drain(..head_end);
     let teardown = req.method.eq_ignore_ascii_case("TEARDOWN");
-    write_status(stream, &req.cseq, 200, "OK", &format!("Session: {SESSION_ID}\r\n"), "")?;
+    write_status(stream, &req.cseq, 200, "OK", &format!("Session: {session_id}\r\n"), "")?;
     Ok(if teardown { ControlEvent::Teardown } else { ControlEvent::Handled })
 }
 
@@ -533,5 +639,42 @@ mod tests {
         )));
         assert!(sdp.contains("a=rtpmap:96 H264/90000"));
         assert!(sdp.contains("a=control:rtsp://host:8554/sub/trackID=0"));
+    }
+
+    #[test]
+    fn session_ids_are_unique_and_tagged() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("kibble"));
+        assert!(b.starts_with("kibble"));
+    }
+
+    #[test]
+    fn url_names_segment_matches_a_whole_path_segment_case_insensitively() {
+        assert!(url_names_segment("rtsp://host:8554/main", "main"));
+        assert!(url_names_segment("rtsp://host:8554/Main/trackID=0", "main"));
+        assert!(!url_names_segment("rtsp://host:8554/sub", "main"));
+        assert!(!url_names_segment("rtsp://host:8554/mainstream", "main"), "must match a whole segment, not a substring");
+    }
+
+    #[test]
+    fn feeds_select_defaults_to_sub_and_recognizes_main() {
+        let feeds = Feeds { main: VideoFeed::new(), sub: VideoFeed::new() };
+        assert_eq!(feeds.select("rtsp://host:8554/main").0, "main");
+        assert_eq!(feeds.select("rtsp://host:8554/sub").0, "sub");
+        assert_eq!(feeds.select("rtsp://host:8554/").0, "sub", "unnamed mount defaults to sub");
+        assert_eq!(feeds.select("rtsp://host:8554/main/trackID=0").0, "main");
+    }
+
+    #[test]
+    fn streams_json_reports_each_mount_independently() {
+        let feeds = Feeds { main: VideoFeed::new(), sub: VideoFeed::new() };
+        let (_s, _n) = feeds.sub.subscribe("1.2.3.4:9".into(), 2, 3).unwrap();
+        let body = streams_json(&feeds);
+        assert!(body.starts_with(r#"{"main":{"#));
+        assert!(body.contains(r#""session_count":0"#), "main mount has no sessions");
+        assert!(body.contains(r#""session_count":1"#), "sub mount has the one subscribed session");
+        assert!(body.contains("\"1.2.3.4:9\""));
     }
 }

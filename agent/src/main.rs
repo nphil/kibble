@@ -14,8 +14,12 @@
 //!                                   "id": "...", "enabled": bool}  add one entry
 //!   DELETE /schedule/entry?id=      remove one entry
 //!   POST   /schedule/entry/enabled  {"id": "...", "enabled": bool}  enable/disable one entry
-//!   RTSP   :8554/<path>             live H.264 video (ring's "sub" channel, 1152x720@25fps),
+//!   RTSP   :8554/main               live H.264 video (ring's "main" channel, 1728x1080),
 //!                                   zero re-encode
+//!   RTSP   :8554/sub                live H.264 video (ring's "sub" channel, 1152x720@25fps),
+//!                                   zero re-encode
+//!   GET    :8765/streams            per-mount diagnostics: resolution/fps seen in the ring,
+//!                                   active session count, each session's peer address
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
@@ -79,16 +83,23 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
 
-    let feed = VideoFeed::new();
-    let _poller = ring::spawn(feed.clone()).unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
+    let main_feed = VideoFeed::new();
+    let sub_feed = VideoFeed::new();
+    let _poller = ring::spawn(main_feed.clone(), sub_feed.clone())
+        .unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
     let rtsp_listener =
         TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
-    let _rtsp = rtsp::spawn(rtsp_listener, feed);
+    let feeds = Arc::new(rtsp::Feeds { main: main_feed, sub: sub_feed });
+    let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
 
-    eprintln!("kibbled: listening on {bind}, rtsp on {RTSP_BIND} (chan {})", ring::CHAN_SUB);
+    eprintln!(
+        "kibbled: listening on {bind}, rtsp on {RTSP_BIND} (/main chan {}, /sub chan {})",
+        ring::CHAN_MAIN,
+        ring::CHAN_SUB
+    );
 
     persist::spawn_reconciler(Arc::clone(&shm));
-    let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule));
+    let _ = http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds));
 }
 
 fn die(msg: &str) -> ! {
@@ -96,7 +107,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule) -> Response {
+fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule, feeds: &rtsp::Feeds) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
         ("GET", "/state") => Response::Json(shm.snapshot().to_json()),
@@ -112,6 +123,7 @@ fn route(req: &Request, shm: &Shm, ble: &Sender, schedule: &mut Schedule) -> Res
                 amount2: 0,
             },
         ),
+        ("GET", "/streams") => Response::Json(rtsp::streams_json(feeds)),
         ("GET", "/schedule") => Response::Json(schedule.snapshot_json()),
         ("PUT", "/schedule") => put_schedule(req, schedule, ble),
         ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble),
