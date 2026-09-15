@@ -14,10 +14,19 @@
 //!                                   "id": "...", "enabled": bool}  add one entry
 //!   DELETE /schedule/entry?id=      remove one entry
 //!   POST   /schedule/entry/enabled  {"id": "...", "enabled": bool}  enable/disable one entry
-//!   RTSP   :8554/main               live H.264 video (ring's "main" channel, 1728x1080),
-//!                                   zero re-encode
-//!   RTSP   :8554/sub                live H.264 video (ring's "sub" channel, 1152x720@25fps),
-//!                                   zero re-encode
+//!   POST   /speak                   raw body = signed 16-bit LE mono 16kHz PCM; normalizes to
+//!                                   the vendor prompts' loudness, encodes, and plays it once
+//!                                   (409 if the speaker already has a writer -- see audioout.rs)
+//!   GET    /clips                   `[{"name","bytes"}, ...]` every stored clip
+//!   PUT    /clips/<name>            raw PCM body, same format as /speak; normalizes, encodes,
+//!                                   and saves it under that name (`/opt/kibble/clips/`)
+//!   GET    /clips/<name>            the stored clip's encoded bytes (`audio/aac`)
+//!   DELETE /clips/<name>            remove a stored clip
+//!   POST   /clips/<name>/play       plays a stored clip through the speaker (409 as above)
+//!   RTSP   :8554/main               live H.264 + AAC mic video (ring's "main" channel,
+//!                                   1728x1080), zero re-encode; backchannel when negotiated
+//!   RTSP   :8554/sub                live H.264 + AAC mic video (ring's "sub" channel,
+//!                                   1152x720@25fps), zero re-encode; backchannel when negotiated
 //!   GET    :8765/streams            per-mount diagnostics: resolution/fps seen in the ring,
 //!                                   active session count, each session's peer address
 //!   GET    /cloud                   {"enabled","last_error","routes","connections"} -- the
@@ -56,17 +65,23 @@
 //! shared-memory frame ring), and keeps its own settings record in `/opt/kibble/` — see
 //! `persist.rs` and `docs/21-config-encryption.md`.
 
+mod adts;
 mod advertise;
 mod ai;
+mod audioout;
+mod backchannel;
 mod backup;
 mod bus;
+mod clips;
 mod cloud;
 mod desired;
 mod faces;
 mod feed_capture;
+mod g711;
 mod http;
 mod md5;
 mod persist;
+mod rfc3640;
 mod ring;
 mod rtsp;
 mod schedule;
@@ -123,12 +138,20 @@ fn main() {
 
     let main_feed = VideoFeed::new();
     let sub_feed = VideoFeed::new();
-    let _poller = ring::spawn(main_feed.clone(), sub_feed.clone())
+    let audio_feed = ring::AudioFeed::new();
+    let (_poller, tail) = ring::spawn(main_feed.clone(), sub_feed.clone(), audio_feed.clone())
         .unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
+    let speaker_owner = audioout::SpeakerOwner::new();
     let rtsp_listener =
         TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
     let capture = feed_capture::spawn(Arc::clone(&shm), Arc::clone(&sub_feed));
-    let feeds = Arc::new(rtsp::Feeds { main: main_feed, sub: sub_feed });
+    let feeds = Arc::new(rtsp::Feeds {
+        main: main_feed,
+        sub: sub_feed,
+        audio: audio_feed,
+        tail: Arc::clone(&tail),
+        speaker_owner: Arc::clone(&speaker_owner),
+    });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
     let ai_feed = ai::spawn();
 
@@ -142,7 +165,7 @@ fn main() {
     persist::spawn_reconciler(Arc::clone(&shm));
     wifi::spawn_reconciler();
     let _ = http::serve(listener, |req| {
-        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture)
+        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture, &tail, &speaker_owner)
     });
 }
 
@@ -160,6 +183,8 @@ fn route(
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
     capture: &feed_capture::FeedCapture,
+    tail: &Arc<ring::TailCursor>,
+    speaker_owner: &Arc<audioout::SpeakerOwner>,
 ) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
@@ -199,6 +224,11 @@ fn route(
         ("GET", "/wifi/scan") => Response::Json(wifi::scan_json()),
         ("POST", "/wifi/connect") => wifi_connect(req),
         ("POST", "/wifi/forget") => wifi_forget(req),
+        ("POST", "/speak") => speak(req, tail, speaker_owner),
+        ("GET", "/clips") => Response::Json(clips_json()),
+        (method, p) if p.starts_with("/clips/") => {
+            clip_route(method, &p["/clips/".len()..], req, tail, speaker_owner)
+        }
         _ => Response::NotFound,
     }
 }
@@ -231,11 +261,12 @@ fn faces_pending_get(name: &str) -> Response {
 }
 
 fn faces_label_post(req: &Request) -> Response {
-    let name = match json_field(&req.body, "name").filter(|s| !s.is_empty()) {
+    let body = req.body_str();
+    let name = match json_field(&body, "name").filter(|s| !s.is_empty()) {
         Some(n) => n,
         None => return Response::BadRequest(r#""name" is required"#.into()),
     };
-    let cat = match json_field(&req.body, "cat").filter(|s| !s.is_empty()) {
+    let cat = match json_field(&body, "cat").filter(|s| !s.is_empty()) {
         Some(c) => c,
         None => return Response::BadRequest(r#""cat" is required"#.into()),
     };
@@ -272,11 +303,11 @@ fn feeds_get(capture: &feed_capture::FeedCapture, name: &str) -> Response {
 }
 
 fn ble_advertise_write(req: &Request, ble_adv: &BleAdv) -> Response {
-    let on = match json_field(&req.body, "on") {
+    let on = match json_field(&req.body_str(), "on") {
         Some(v) => v != "false",
         None => return Response::BadRequest(r#""on" is required"#.into()),
     };
-    let seconds = json_field(&req.body, "seconds").and_then(|v| v.parse::<u64>().ok());
+    let seconds = json_field(&req.body_str(), "seconds").and_then(|v| v.parse::<u64>().ok());
     match ble_adv.set(on, seconds) {
         Ok(()) => Response::Json(ble_adv.status_json()),
         Err(e) => Response::Error(format!("bus send failed: {e}")),
@@ -284,11 +315,12 @@ fn ble_advertise_write(req: &Request, ble_adv: &BleAdv) -> Response {
 }
 
 fn config_write(req: &Request) -> Response {
-    let key = match json_field(&req.body, "key") {
+    let body = req.body_str();
+    let key = match json_field(&body, "key") {
         Some(k) if !k.is_empty() => k,
         _ => return Response::BadRequest(r#""key" is required"#.into()),
     };
-    let value: u32 = match json_field(&req.body, "value").and_then(|v| v.parse().ok()) {
+    let value: u32 = match json_field(&body, "value").and_then(|v| v.parse().ok()) {
         Some(v) => v,
         None => return Response::BadRequest(r#""value" must be a non-negative integer"#.into()),
     };
@@ -310,7 +342,7 @@ fn config_write(req: &Request) -> Response {
 }
 
 fn cloud_write(req: &Request) -> Response {
-    let enabled = match json_field(&req.body, "enabled") {
+    let enabled = match json_field(&req.body_str(), "enabled") {
         Some(v) => v != "false",
         None => return Response::BadRequest(r#""enabled" is required"#.into()),
     };
@@ -322,11 +354,11 @@ fn cloud_write(req: &Request) -> Response {
 }
 
 fn wifi_connect(req: &Request) -> Response {
-    let ssid = match json_field(&req.body, "ssid") {
+    let ssid = match json_field(&req.body_str(), "ssid") {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Response::BadRequest(r#""ssid" is required"#.into()),
     };
-    let psk = json_field(&req.body, "psk").filter(|p| !p.is_empty()).map(str::to_string);
+    let psk = json_field(&req.body_str(), "psk").filter(|p| !p.is_empty()).map(str::to_string);
     match wifi::connect(&ssid, psk.as_deref()) {
         Ok(_) => Response::Json(wifi::status_json()),
         Err(e @ wifi::Error::PskRequired) => Response::BadRequest(e.to_string()),
@@ -335,7 +367,7 @@ fn wifi_connect(req: &Request) -> Response {
 }
 
 fn wifi_forget(req: &Request) -> Response {
-    let ssid = match json_field(&req.body, "ssid") {
+    let ssid = match json_field(&req.body_str(), "ssid") {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Response::BadRequest(r#""ssid" is required"#.into()),
     };
@@ -347,17 +379,17 @@ fn wifi_forget(req: &Request) -> Response {
 }
 
 fn feed(req: &Request, ble: &Sender, capture: &feed_capture::FeedCapture) -> Response {
-    let amount: u8 = match json_field(&req.body, "amount").and_then(|v| v.parse().ok()) {
+    let amount: u8 = match json_field(&req.body_str(), "amount").and_then(|v| v.parse().ok()) {
         Some(n) if (1..=20).contains(&n) => n,
         _ => return Response::BadRequest("amount must be 1..=20 portions".into()),
     };
-    let (a1, a2) = match json_field(&req.body, "hopper").unwrap_or("1") {
+    let (a1, a2) = match json_field(&req.body_str(), "hopper").unwrap_or("1") {
         "1" => (amount, 0),
         "2" => (0, amount),
         "both" => (amount, amount),
         _ => return Response::BadRequest(r#"hopper must be 1, 2 or "both""#.into()),
     };
-    let id = json_field(&req.body, "id")
+    let id = json_field(&req.body_str(), "id")
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| {
@@ -396,7 +428,7 @@ fn send_feed(ble: &Sender, f: FeedCtrl) -> Response {
 }
 
 fn put_schedule(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
-    let entries = match schedule::parse_entries(&req.body) {
+    let entries = match schedule::parse_entries(&req.body_str()) {
         Ok(v) => v,
         Err(e) => return Response::BadRequest(e),
     };
@@ -404,7 +436,7 @@ fn put_schedule(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Respons
 }
 
 fn post_schedule_entry(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
-    let entry = match schedule::parse_entry(&req.body) {
+    let entry = match schedule::parse_entry(&req.body_str()) {
         Ok(e) => e,
         Err(e) => return Response::BadRequest(e),
     };
@@ -420,11 +452,11 @@ fn delete_schedule_entry(query: &str, schedule: &mut Schedule, ble: &Sender) -> 
 }
 
 fn post_schedule_entry_enabled(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
-    let id = match json_field(&req.body, "id").filter(|s| !s.is_empty()) {
+    let id = match json_field(&req.body_str(), "id").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
         None => return Response::BadRequest("missing \"id\"".into()),
     };
-    let enabled = match json_field(&req.body, "enabled") {
+    let enabled = match json_field(&req.body_str(), "enabled") {
         Some(v) => v != "false",
         None => return Response::BadRequest("missing \"enabled\"".into()),
     };
@@ -441,4 +473,148 @@ fn schedule_result(result: Result<(), schedule::Error>, schedule: &Schedule) -> 
         Err(schedule::Error::Invalid(m)) => Response::BadRequest(m),
         Err(schedule::Error::Internal(m)) => Response::Error(m),
     }
+}
+
+/// `POST /speak`: raw body upload -- signed 16-bit little-endian mono 16kHz PCM, matching the
+/// pipeline's native format exactly (no container/header; see `http.rs`'s `MAX_BODY` doc
+/// comment). Normalizes and encodes synchronously (a few hundred ms at most for any realistic
+/// clip length -- `tools/aacenc/`'s own validation), then plays it back on a spawned thread so
+/// the HTTP server stays responsive for the clip's real-time duration; only acquiring the
+/// speaker and the encode step can fail synchronously.
+fn speak(req: &Request, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
+    let pcm = match pcm_from_body(&req.body) {
+        Ok(p) => p,
+        Err(msg) => return Response::BadRequest(msg),
+    };
+    let guard = match speaker_owner.try_acquire() {
+        Ok(g) => g,
+        Err(reason) => return Response::Conflict(reason.to_string()),
+    };
+    let adts_bytes = match audioout::normalize_and_encode(&pcm) {
+        Ok(b) => b,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let samples = pcm.len();
+    spawn_playback(adts_bytes, Arc::clone(tail), guard, "speak".to_string());
+    Response::Json(format!(
+        r#"{{"ok":true,"samples":{samples},"estimated_ms":{}}}"#,
+        samples as u64 * 1000 / 16_000
+    ))
+}
+
+/// Plays already-encoded ADTS bytes on a spawned thread (never the request-handling thread --
+/// see `speak`'s doc comment), moving the already-acquired [`audioout::OwnerGuard`] in so it
+/// releases the speaker exactly when playback (or an abort) finishes.
+fn spawn_playback(adts_bytes: Vec<u8>, tail: Arc<ring::TailCursor>, guard: audioout::OwnerGuard, tag: String) {
+    std::thread::spawn(move || match audioout::play_encoded(&adts_bytes, &tail, &guard) {
+        Ok(stats) => eprintln!(
+            "kibbled: {tag} playback done: {} frame(s){}",
+            stats.frames_written,
+            if stats.aborted_call_active { " (aborted: vendor call became active)" } else { "" }
+        ),
+        Err(e) => eprintln!("kibbled: {tag} playback error: {e}"),
+    });
+}
+
+/// Parses a raw PCM body: signed 16-bit little-endian mono samples, no container/header. Rejects
+/// an empty body or one that isn't sample-aligned (an odd byte count can only be a malformed or
+/// truncated upload).
+fn pcm_from_body(body: &[u8]) -> Result<Vec<i16>, String> {
+    if body.is_empty() {
+        return Err("body is empty; expected raw 16-bit/16kHz/mono PCM".into());
+    }
+    if body.len() % 2 != 0 {
+        return Err("body length must be a multiple of 2 (16-bit samples)".into());
+    }
+    Ok(body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+fn clips_json() -> String {
+    match clips::list() {
+        Ok(list) => {
+            let items: Vec<String> = list
+                .iter()
+                .map(|c| format!(r#"{{"name":"{}","bytes":{}}}"#, c.name.escape_debug(), c.bytes))
+                .collect();
+            format!("[{}]", items.join(","))
+        }
+        Err(e) => {
+            eprintln!("kibbled: clips::list: {e}");
+            "[]".to_string()
+        }
+    }
+}
+
+/// Dispatches every `/clips/<name>` and `/clips/<name>/play` request. `rest` is the URL after
+/// the `/clips/` prefix -- either `<name>` or `<name>/play`.
+fn clip_route(
+    method: &str,
+    rest: &str,
+    req: &Request,
+    tail: &Arc<ring::TailCursor>,
+    speaker_owner: &Arc<audioout::SpeakerOwner>,
+) -> Response {
+    let (name, play) = match rest.strip_suffix("/play") {
+        Some(name) => (name, true),
+        None => (rest, false),
+    };
+    if !clips::valid_name(name) {
+        return Response::BadRequest("invalid clip name".into());
+    }
+    match (method, play) {
+        ("PUT", false) => clip_put(name, req),
+        ("GET", false) => clip_get(name),
+        ("DELETE", false) => clip_delete(name),
+        ("POST", true) => clip_play(name, tail, speaker_owner),
+        _ => Response::NotFound,
+    }
+}
+
+fn clip_put(name: &str, req: &Request) -> Response {
+    let pcm = match pcm_from_body(&req.body) {
+        Ok(p) => p,
+        Err(msg) => return Response::BadRequest(msg),
+    };
+    let adts_bytes = match audioout::normalize_and_encode(&pcm) {
+        Ok(b) => b,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    match clips::save(name, &adts_bytes) {
+        Ok(()) => Response::Json(format!(
+            r#"{{"ok":true,"name":"{}","bytes":{}}}"#,
+            name.escape_debug(),
+            adts_bytes.len()
+        )),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn clip_get(name: &str) -> Response {
+    match clips::load(name) {
+        Ok(bytes) => Response::Blob("audio/aac", bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn clip_delete(name: &str) -> Response {
+    match clips::delete(name) {
+        Ok(()) => Response::NoContent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn clip_play(name: &str, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
+    let bytes = match clips::load(name) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Response::NotFound,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let guard = match speaker_owner.try_acquire() {
+        Ok(g) => g,
+        Err(reason) => return Response::Conflict(reason.to_string()),
+    };
+    spawn_playback(bytes, Arc::clone(tail), guard, format!("clip {name}"));
+    Response::Json(r#"{"ok":true}"#.to_string())
 }

@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+tools/aacenc/.build/
+tools/aacenc/build-arm/
+tools/aacenc/build-native/

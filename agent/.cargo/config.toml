@@ -1,0 +1,6 @@
+[target.armv7-unknown-linux-musleabihf]
+# Rust's musl target ships its own self-contained musl crt objects/libc; the cross gcc below is
+# only used as the final link-step driver (its `ld` understands ARM relocations), not for its own
+# glibc -- so a widely-available glibc-targeting cross toolchain (Debian's
+# gcc-arm-linux-gnueabihf package) works fine here despite the target naming "musleabihf".
+linker = "arm-linux-gnueabihf-gcc"

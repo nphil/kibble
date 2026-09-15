@@ -38,9 +38,12 @@
 //! seeded with the cached last keyframe (SPS+PPS+IDR) at subscribe time, so PLAY doesn't need to
 //! wait out the ~4s GOP for the next one.
 //!
-//! Supported methods: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER. SETUP/PLAY don't
-//! gate on trackID (there's only ever one track per mount) but DESCRIBE/PLAY do gate on which
-//! mount the URL names.
+//! Supported methods: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER. DESCRIBE/PLAY gate
+//! on which mount the URL names; SETUP/PLAY *do* gate on trackID now that there are three
+//! possible tracks -- video (trackID=0, interleaved 0-1), the outgoing mic (trackID=1,
+//! interleaved 2-3, always offered), and the backchannel (trackID=2, interleaved 4-5, offered
+//! only when DESCRIBE carried `Require: www.onvif.org/ver20/backchannel`). A session accumulates
+//! whichever tracks get SETUP before PLAY starts streaming all of them at once.
 //!
 //! While playing, a single thread interleaves two things on the same socket: waiting (with a
 //! short timeout) for the next frame from this session's `Subscription`, and a short
@@ -54,7 +57,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ring::{Frame, Subscription, VideoFeed};
+use crate::adts;
+use crate::backchannel::Backchannel;
+use crate::rfc3640;
+use crate::ring::{self, AudioFeed, AudioSubscription, Frame, Subscription, VideoFeed};
+use crate::audioout;
 
 const MAX_REQUEST: usize = 4096;
 /// RTP payload PT 96 = the one dynamic type we declare, always H.264.
@@ -75,12 +82,35 @@ const MAX_SESSIONS_PER_STREAM: usize = 2;
 /// ordinary scheduling jitter -- not a genuine client stall -- doesn't trigger the drop policy on
 /// every single frame.
 const CLIENT_QUEUE_CAP: usize = 3;
+/// RTP payload PT 97 = the outgoing mic track (`MPEG4-GENERIC`, RFC 3640), always offered.
+const AUDIO_PAYLOAD_TYPE: u8 = 97;
+/// Distinct from video's `SSRC`: this is a logically separate RTP stream even though it shares
+/// the same TCP transport.
+const AUDIO_SSRC: u32 = 0x4B42_4C41; // "KBLA"
+/// Interleaved-channel numbers (RTP; the next odd number is that track's unused RTCP channel).
+const VIDEO_RTP_CHANNEL: u8 = 0;
+const AUDIO_RTP_CHANNEL: u8 = 2;
+const BACKCHANNEL_RTP_CHANNEL: u8 = 4;
+/// `trackID=N` values `build_sdp`'s `a=control:` lines advertise and `SETUP`/`track_id_from_url`
+/// parse back.
+const AUDIO_TRACK: u8 = 1;
+const BACKCHANNEL_TRACK: u8 = 2;
+/// How often to poll for a new outgoing-audio access unit. AAC frames arrive every ~64ms
+/// (docs/23-audio-codec.md); riding the same loop as the video poll and the control-socket check,
+/// so it needs to be short enough not to stall either of those.
+const AUDIO_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// The two independently-served streams. `main.rs` owns one `Arc<Feeds>`, shared between the RTSP
 /// accept loop (this module) and the HTTP `GET /streams` diagnostic handler.
 pub struct Feeds {
     pub main: Arc<VideoFeed>,
     pub sub: Arc<VideoFeed>,
+    /// The one microphone, shared by both mounts (see `ring::AudioFeed`'s own doc comment).
+    pub audio: Arc<AudioFeed>,
+    /// Ring writer-side dependencies the backchannel needs to reach the speaker -- see
+    /// `audioout.rs`.
+    pub tail: Arc<ring::TailCursor>,
+    pub speaker_owner: Arc<audioout::SpeakerOwner>,
 }
 
 impl Feeds {
@@ -158,6 +188,27 @@ struct RtspRequest {
     method: String,
     url: String,
     cseq: String,
+    require: Option<String>,
+    transport: Option<String>,
+}
+
+/// Which tracks this session has `SETUP` so far -- accumulated across possibly-several `SETUP`
+/// calls before `PLAY`, per ordinary RTSP sequencing (one `SETUP` per track the client wants,
+/// then one `PLAY` that starts streaming everything that was set up). Video has no flag: it's
+/// implied by the mount the URL already names, exactly as before this session ever considered a
+/// second track.
+#[derive(Default)]
+struct SessionSetup {
+    audio: bool,
+    backchannel: bool,
+}
+
+fn track_id_from_url(url: &str) -> u8 {
+    url.rsplit_once("trackID=").and_then(|(_, id)| id.parse().ok()).unwrap_or(0)
+}
+
+fn wants_interleaved_tcp(req: &RtspRequest) -> bool {
+    req.transport.as_deref().is_some_and(|t| t.contains("TCP") || t.contains("interleaved"))
 }
 
 fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
@@ -165,6 +216,7 @@ fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
     let session_id = new_session_id();
+    let mut setup = SessionSetup::default();
     loop {
         let req = match read_request(&mut stream)? {
             Some(r) => r,
@@ -177,13 +229,34 @@ fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
                 "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n",
                 "",
             )?,
-            "DESCRIBE" => respond_describe(&mut stream, &req, feeds.select(&req.url).1)?,
-            "SETUP" => respond(
-                &mut stream,
-                &req,
-                &format!("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nSession: {session_id}\r\n"),
-                "",
-            )?,
+            "DESCRIBE" => respond_describe(&mut stream, &req, feeds)?,
+            "SETUP" => {
+                let track = track_id_from_url(&req.url);
+                if track == BACKCHANNEL_TRACK && !wants_interleaved_tcp(&req) {
+                    // Scrypted's own documented UDP-then-TCP fallback: refuse so it retries TCP.
+                    write_status(&mut stream, &req.cseq, 461, "Unsupported Transport", "", "")?;
+                    continue;
+                }
+                let interleaved = match track {
+                    AUDIO_TRACK => {
+                        setup.audio = true;
+                        "2-3"
+                    }
+                    BACKCHANNEL_TRACK => {
+                        setup.backchannel = true;
+                        "4-5"
+                    }
+                    _ => "0-1",
+                };
+                respond(
+                    &mut stream,
+                    &req,
+                    &format!(
+                        "Transport: RTP/AVP/TCP;unicast;interleaved={interleaved}\r\nSession: {session_id}\r\n"
+                    ),
+                    "",
+                )?
+            }
             "PLAY" => {
                 let (path, feed) = feeds.select(&req.url);
                 return match feed.subscribe(peer.clone(), MAX_SESSIONS_PER_STREAM, CLIENT_QUEUE_CAP) {
@@ -193,8 +266,10 @@ fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
                                 "kibbled: rtsp /{path} spare slot taken by {peer} ({active}/{MAX_SESSIONS_PER_STREAM} sessions active)"
                             );
                         }
+                        let audio_sub = setup.audio.then(|| feeds.audio.subscribe(CLIENT_QUEUE_CAP));
+                        let backchannel = start_backchannel_if_setup(&setup, feeds, &peer);
                         respond(&mut stream, &req, &format!("Session: {session_id}\r\nRange: npt=0.000-\r\n"), "")?;
-                        stream_media(&mut stream, &session, &session_id)
+                        stream_media(&mut stream, &session, audio_sub.as_ref(), backchannel, &session_id)
                     }
                     None => write_status(&mut stream, &req.cseq, 453, "Not Enough Bandwidth", "", ""),
                 };
@@ -206,11 +281,35 @@ fn handle_session(mut stream: TcpStream, feeds: &Feeds) -> io::Result<()> {
     }
 }
 
+/// Acquires the speaker and starts a live backchannel session if this session `SETUP` trackID=2
+/// -- soft-fails (logs and returns `None`, letting `PLAY` proceed with video/audio only) rather
+/// than refusing the whole `PLAY` if the speaker is busy: a viewer should still see and hear the
+/// camera even when talkback happens to be unavailable right then.
+fn start_backchannel_if_setup(setup: &SessionSetup, feeds: &Feeds, peer: &str) -> Option<Backchannel> {
+    if !setup.backchannel {
+        return None;
+    }
+    match feeds.speaker_owner.try_acquire() {
+        Ok(guard) => match Backchannel::start(Arc::clone(&feeds.tail), guard) {
+            Ok(bc) => Some(bc),
+            Err(e) => {
+                eprintln!("kibbled: rtsp backchannel start failed for {peer}: {e}");
+                None
+            }
+        },
+        Err(reason) => {
+            eprintln!("kibbled: rtsp backchannel refused for {peer}: {reason}");
+            None
+        }
+    }
+}
+
 fn respond(stream: &mut TcpStream, req: &RtspRequest, extra: &str, body: &str) -> io::Result<()> {
     write_status(stream, &req.cseq, 200, "OK", extra, body)
 }
 
-fn respond_describe(stream: &mut TcpStream, req: &RtspRequest, feed: &VideoFeed) -> io::Result<()> {
+fn respond_describe(stream: &mut TcpStream, req: &RtspRequest, feeds: &Feeds) -> io::Result<()> {
+    let (_, feed) = feeds.select(&req.url);
     let Some(kf) = wait_for_keyframe(feed, Duration::from_secs(6)) else {
         return write_status(stream, &req.cseq, 503, "Service Unavailable", "", "");
     };
@@ -218,7 +317,11 @@ fn respond_describe(stream: &mut TcpStream, req: &RtspRequest, feed: &VideoFeed)
     let (Some(sps), Some(pps)) = (find_nal_by_type(&nals, 7), find_nal_by_type(&nals, 8)) else {
         return write_status(stream, &req.cseq, 500, "Internal Server Error", "", "");
     };
-    let sdp = build_sdp(&req.url, sps, pps);
+    let backchannel = req
+        .require
+        .as_deref()
+        .is_some_and(|r| r.contains("www.onvif.org/ver20/backchannel"));
+    let sdp = build_sdp(&req.url, sps, pps, backchannel);
     let extra = format!("Content-Base: {}\r\nContent-Type: application/sdp\r\n", req.url);
     write_status(stream, &req.cseq, 200, "OK", &extra, &sdp)
 }
@@ -239,10 +342,10 @@ fn wait_for_keyframe(feed: &VideoFeed, timeout: Duration) -> Option<Frame> {
     }
 }
 
-fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8]) -> String {
+fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8], backchannel: bool) -> String {
     let profile_level_id = if sps.len() >= 4 { hex_encode(&sps[1..4]) } else { "000000".to_string() };
-    let control = format!("{}/trackID=0", base_url.trim_end_matches('/'));
-    format!(
+    let base = base_url.trim_end_matches('/');
+    let mut sdp = format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 0.0.0.0\r\n\
          s=kibble sub\r\n\
@@ -252,10 +355,25 @@ fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8]) -> String {
          a=rtpmap:{PAYLOAD_TYPE} H264/90000\r\n\
          a=fmtp:{PAYLOAD_TYPE} packetization-mode=1;profile-level-id={profile_level_id};\
          sprop-parameter-sets={},{}\r\n\
-         a=control:{control}\r\n",
+         a=control:{base}/trackID=0\r\n\
+         m=audio 0 RTP/AVP {AUDIO_PAYLOAD_TYPE}\r\n\
+         a=rtpmap:{AUDIO_PAYLOAD_TYPE} MPEG4-GENERIC/16000/1\r\n\
+         a=fmtp:{AUDIO_PAYLOAD_TYPE} streamtype=5; profile-level-id=1; mode=AAC-hbr; \
+         sizelength=13; indexlength=3; indexdeltalength=3; config={}\r\n\
+         a=control:{base}/trackID=1\r\n",
         base64_encode(sps),
         base64_encode(pps),
-    )
+        hex_encode(&adts::AUDIO_SPECIFIC_CONFIG),
+    );
+    if backchannel {
+        sdp.push_str(&format!(
+            "m=audio 0 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=sendonly\r\n\
+             a=control:{base}/trackID=2\r\n"
+        ));
+    }
+    sdp
 }
 
 /// How often to check the socket for an incoming client request while playing, independent of
@@ -273,25 +391,50 @@ const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// taxes the frame path (see `CONTROL_CHECK_INTERVAL`). `session` was already seeded with the
 /// current keyframe (if any) at subscribe time, so the first `recv` below delivers it -- no
 /// separate "send the cached keyframe first" step needed.
-fn stream_media(stream: &mut TcpStream, session: &Subscription, session_id: &str) -> io::Result<()> {
+fn stream_media(
+    stream: &mut TcpStream,
+    video: &Subscription,
+    audio: Option<&AudioSubscription>,
+    mut backchannel: Option<Backchannel>,
+    session_id: &str,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let mut seq: u16 = 0;
+    let mut video_seq: u16 = 0;
+    let mut audio_seq: u16 = 0;
     let mut ctrl_buf = Vec::new();
     let mut last_control_check = Instant::now();
-    loop {
-        if let Some(frame) = session.recv(Duration::from_millis(40)) {
-            send_access_unit(stream, &frame, &mut seq)?;
-        }
-        if last_control_check.elapsed() >= CONTROL_CHECK_INTERVAL {
-            last_control_check = Instant::now();
-            match poll_control(stream, &mut ctrl_buf, session_id)? {
-                ControlEvent::Teardown => return Ok(()),
-                ControlEvent::None | ControlEvent::Handled => {}
+    let result = (|| -> io::Result<()> {
+        loop {
+            if let Some(frame) = video.recv(Duration::from_millis(40)) {
+                send_access_unit(stream, &frame, &mut video_seq)?;
+            }
+            if let Some(sub) = audio {
+                if let Some(frame) = sub.recv(AUDIO_POLL_TIMEOUT) {
+                    send_audio_frame(stream, &frame, &mut audio_seq)?;
+                }
+            }
+            if last_control_check.elapsed() >= CONTROL_CHECK_INTERVAL {
+                last_control_check = Instant::now();
+                match poll_control(stream, &mut ctrl_buf, session_id, backchannel.as_mut())? {
+                    ControlEvent::Teardown => return Ok(()),
+                    ControlEvent::None | ControlEvent::Handled => {}
+                }
             }
         }
+    })();
+    if let Some(bc) = backchannel {
+        match bc.finish() {
+            Ok(stats) => eprintln!(
+                "kibbled: rtsp backchannel session {session_id} done: {} frame(s) written{}",
+                stats.frames_written,
+                if stats.aborted_call_active { " (aborted: vendor call became active)" } else { "" }
+            ),
+            Err(e) => eprintln!("kibbled: rtsp backchannel session {session_id} error: {e}"),
+        }
     }
+    result
 }
 
 enum ControlEvent {
@@ -300,11 +443,21 @@ enum ControlEvent {
     Teardown,
 }
 
-/// Non-blocking-ish check for a pending client request on `stream` (whose read timeout is
-/// already set short by the caller), accumulating partial reads in `buf` across calls. Answers
-/// GET_PARAMETER inline; TEARDOWN is answered too, then reported so the caller ends the session.
-fn poll_control(stream: &mut TcpStream, buf: &mut Vec<u8>, session_id: &str) -> io::Result<ControlEvent> {
-    let mut chunk = [0u8; 512];
+/// Non-blocking-ish check for pending data on `stream` (whose read timeout is already set short
+/// by the caller), accumulating partial reads in `buf` across calls. Demultiplexes RFC 2326
+/// §10.12 interleaved binary frames (`$` + channel + 2-byte length + payload -- the backchannel's
+/// incoming RTP, when negotiated) from ordinary RTSP text requests arriving on the same socket: a
+/// binary frame on [`BACKCHANNEL_RTP_CHANNEL`] is handed to `backchannel` and never answered with
+/// an RTSP status line (anything else, e.g. an RTCP channel, is accepted and discarded -- this
+/// server doesn't implement RTCP feedback); a text request gets the usual
+/// GET_PARAMETER/TEARDOWN handling.
+fn poll_control(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    session_id: &str,
+    mut backchannel: Option<&mut Backchannel>,
+) -> io::Result<ControlEvent> {
+    let mut chunk = [0u8; 4096];
     match stream.read(&mut chunk) {
         Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed during play")),
         Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -313,14 +466,42 @@ fn poll_control(stream: &mut TcpStream, buf: &mut Vec<u8>, session_id: &str) -> 
         }
         Err(e) => return Err(e),
     }
-    let Some(head_end) = find_headers_end(buf) else {
-        return Ok(ControlEvent::None); // still accumulating a full request
-    };
-    let req = parse_request(&buf[..head_end]);
-    buf.drain(..head_end);
-    let teardown = req.method.eq_ignore_ascii_case("TEARDOWN");
-    write_status(stream, &req.cseq, 200, "OK", &format!("Session: {session_id}\r\n"), "")?;
-    Ok(if teardown { ControlEvent::Teardown } else { ControlEvent::Handled })
+    let mut event = ControlEvent::None;
+    loop {
+        match buf.first() {
+            Some(b'$') => {
+                if buf.len() < 4 {
+                    break; // frame header itself still arriving
+                }
+                let channel = buf[1];
+                let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+                if buf.len() < 4 + len {
+                    break; // payload still arriving
+                }
+                let framed: Vec<u8> = buf.drain(..4 + len).collect();
+                if channel == BACKCHANNEL_RTP_CHANNEL {
+                    if let (Some(bc), Some(&pt_byte)) = (backchannel.as_deref_mut(), framed.get(5)) {
+                        bc.on_rtp_packet(&framed[4..], pt_byte & 0x7F)?;
+                    }
+                }
+            }
+            Some(_) => {
+                let Some(head_end) = find_headers_end(buf) else {
+                    break; // still accumulating a full RTSP request
+                };
+                let req = parse_request(&buf[..head_end]);
+                buf.drain(..head_end);
+                let teardown = req.method.eq_ignore_ascii_case("TEARDOWN");
+                write_status(stream, &req.cseq, 200, "OK", &format!("Session: {session_id}\r\n"), "")?;
+                event = if teardown { ControlEvent::Teardown } else { ControlEvent::Handled };
+                if teardown {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(event)
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<RtspRequest>> {
@@ -349,14 +530,22 @@ fn parse_request(head: &[u8]) -> RtspRequest {
     let method = start.next().unwrap_or_default().to_string();
     let url = start.next().unwrap_or_default().to_string();
     let mut cseq = "0".to_string();
+    let mut require = None;
+    let mut transport = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("CSeq") {
-                cseq = v.trim().to_string();
+            let k = k.trim();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("CSeq") {
+                cseq = v;
+            } else if k.eq_ignore_ascii_case("Require") {
+                require = Some(v);
+            } else if k.eq_ignore_ascii_case("Transport") {
+                transport = Some(v);
             }
         }
     }
-    RtspRequest { method, url, cseq }
+    RtspRequest { method, url, cseq, require, transport }
 }
 
 fn find_headers_end(b: &[u8]) -> Option<usize> {
@@ -434,11 +623,31 @@ fn send_nal(stream: &mut TcpStream, nal: &[u8], seq: &mut u16, rtp_ts: u32, mark
     let last = fragments.len().saturating_sub(1);
     for (i, frag) in fragments.iter().enumerate() {
         let marker = i == last && marker_on_last;
-        let pkt = build_rtp_packet(frag, *seq, rtp_ts, SSRC, marker);
+        let pkt = build_rtp_packet(PAYLOAD_TYPE, frag, *seq, rtp_ts, SSRC, marker);
         *seq = seq.wrapping_add(1);
-        stream.write_all(&interleaved_frame(0, &pkt))?;
+        stream.write_all(&interleaved_frame(VIDEO_RTP_CHANNEL, &pkt))?;
     }
     Ok(())
+}
+
+/// Sends one AAC access unit from the ring's mic-audio channel as a single RFC 3640 RTP packet
+/// (`docs/23-audio-codec.md` §7.1: one complete 1024-sample AU always fits in one packet at this
+/// bitrate, so unlike video there is no fragmentation case to handle). `frame.data` is the ring's
+/// own payload -- ADTS-framed, `ring::AudioFrame`'s own doc comment -- so the 7-byte ADTS header
+/// is stripped first: RFC 3640 carries the raw access unit plus its own AU-header section
+/// (`rfc3640.rs`), not ADTS framing.
+fn send_audio_frame(stream: &mut TcpStream, frame: &ring::AudioFrame, seq: &mut u16) -> io::Result<()> {
+    let Some(header) = adts::parse(&frame.data) else { return Ok(()) }; // malformed; drop, don't kill the stream
+    let raw_aac = &frame.data[header.header_len..];
+    let au_size = raw_aac.len().min(rfc3640::MAX_AU_SIZE as usize) as u16;
+    let au_header = rfc3640::au_header_section(au_size);
+    let mut payload = Vec::with_capacity(au_header.len() + raw_aac.len());
+    payload.extend_from_slice(&au_header);
+    payload.extend_from_slice(raw_aac);
+    let rtp_ts = (frame.pts_us as u64 * 16_000 / 1_000_000) as u32; // RFC 3640: clock rate = sample rate
+    let pkt = build_rtp_packet(AUDIO_PAYLOAD_TYPE, &payload, *seq, rtp_ts, AUDIO_SSRC, true);
+    *seq = seq.wrapping_add(1);
+    stream.write_all(&interleaved_frame(AUDIO_RTP_CHANNEL, &pkt))
 }
 
 /// Split a NAL unit (header byte included) into RTP payloads: the whole NAL as-is if it fits in
@@ -476,10 +685,10 @@ fn fragment_nal(nal: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-fn build_rtp_packet(payload: &[u8], seq: u16, rtp_ts: u32, ssrc: u32, marker: bool) -> Vec<u8> {
+fn build_rtp_packet(payload_type: u8, payload: &[u8], seq: u16, rtp_ts: u32, ssrc: u32, marker: bool) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(12 + payload.len());
     pkt.push(0x80); // V=2, P=0, X=0, CC=0
-    pkt.push((if marker { 0x80 } else { 0 }) | PAYLOAD_TYPE);
+    pkt.push((if marker { 0x80 } else { 0 }) | payload_type);
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&rtp_ts.to_be_bytes());
     pkt.extend_from_slice(&ssrc.to_be_bytes());
@@ -587,7 +796,7 @@ mod tests {
 
     #[test]
     fn build_rtp_packet_lays_out_fixed_header_fields() {
-        let pkt = build_rtp_packet(&[1, 2, 3], 0x1234, 0x89AB_CDEF, 0xDEAD_BEEF, true);
+        let pkt = build_rtp_packet(PAYLOAD_TYPE, &[1, 2, 3], 0x1234, 0x89AB_CDEF, 0xDEAD_BEEF, true);
         assert_eq!(pkt[0], 0x80, "V=2,P=0,X=0,CC=0");
         assert_eq!(pkt[1], 0x80 | PAYLOAD_TYPE, "marker set, PT=96");
         assert_eq!(&pkt[2..4], &0x1234u16.to_be_bytes());
@@ -598,7 +807,7 @@ mod tests {
 
     #[test]
     fn build_rtp_packet_clears_marker_bit_when_not_set() {
-        let pkt = build_rtp_packet(&[], 0, 0, 0, false);
+        let pkt = build_rtp_packet(PAYLOAD_TYPE, &[], 0, 0, 0, false);
         assert_eq!(pkt[1], PAYLOAD_TYPE);
     }
 
@@ -630,7 +839,7 @@ mod tests {
     fn build_sdp_embeds_base64_parameter_sets_and_profile_level_id() {
         let sps = [0x67, 0x42, 0x00, 0x1F, 0xAA];
         let pps = [0x68, 0xCE, 0x3C, 0x80];
-        let sdp = build_sdp("rtsp://host:8554/sub", &sps, &pps);
+        let sdp = build_sdp("rtsp://host:8554/sub", &sps, &pps, false);
         assert!(sdp.contains("profile-level-id=42001f"));
         assert!(sdp.contains(&format!(
             "sprop-parameter-sets={},{}",
@@ -639,6 +848,18 @@ mod tests {
         )));
         assert!(sdp.contains("a=rtpmap:96 H264/90000"));
         assert!(sdp.contains("a=control:rtsp://host:8554/sub/trackID=0"));
+        assert!(sdp.contains("a=rtpmap:97 MPEG4-GENERIC/16000/1"), "audio track always offered");
+        assert!(sdp.contains("a=control:rtsp://host:8554/sub/trackID=1"));
+        assert!(sdp.contains("config=1408"), "AudioSpecificConfig from adts::AUDIO_SPECIFIC_CONFIG");
+        assert!(!sdp.contains("trackID=2"), "backchannel not offered unless requested");
+    }
+
+    #[test]
+    fn build_sdp_offers_backchannel_only_when_requested() {
+        let sdp = build_sdp("rtsp://host:8554/sub", &[0x67, 0, 0, 0], &[0x68], true);
+        assert!(sdp.contains("a=control:rtsp://host:8554/sub/trackID=2"));
+        assert!(sdp.contains("a=rtpmap:0 PCMU/8000"));
+        assert!(sdp.contains("a=sendonly"));
     }
 
     #[test]
@@ -658,9 +879,19 @@ mod tests {
         assert!(!url_names_segment("rtsp://host:8554/mainstream", "main"), "must match a whole segment, not a substring");
     }
 
+    fn test_feeds() -> Feeds {
+        Feeds {
+            main: VideoFeed::new(),
+            sub: VideoFeed::new(),
+            audio: AudioFeed::new(),
+            tail: ring::TailCursor::new(),
+            speaker_owner: audioout::SpeakerOwner::new(),
+        }
+    }
+
     #[test]
     fn feeds_select_defaults_to_sub_and_recognizes_main() {
-        let feeds = Feeds { main: VideoFeed::new(), sub: VideoFeed::new() };
+        let feeds = test_feeds();
         assert_eq!(feeds.select("rtsp://host:8554/main").0, "main");
         assert_eq!(feeds.select("rtsp://host:8554/sub").0, "sub");
         assert_eq!(feeds.select("rtsp://host:8554/").0, "sub", "unnamed mount defaults to sub");
@@ -669,7 +900,7 @@ mod tests {
 
     #[test]
     fn streams_json_reports_each_mount_independently() {
-        let feeds = Feeds { main: VideoFeed::new(), sub: VideoFeed::new() };
+        let feeds = test_feeds();
         let (_s, _n) = feeds.sub.subscribe("1.2.3.4:9".into(), 2, 3).unwrap();
         let body = streams_json(&feeds);
         assert!(body.starts_with(r#"{"main":{"#));

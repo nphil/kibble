@@ -1,13 +1,19 @@
-//! Read-only access to the vendor `media` process's video/audio frame ring.
+//! Read-only access to the vendor `media` process's video/audio frame ring, plus a write path
+//! into the same ring's `auido-out` talkback slot (`audioout.rs` owns the writer; this module
+//! only maps the ring and defines the record header shape both directions agree on).
 //!
 //! `/dev/shm/media_buffer_frame_buf` is an 8,389,608-byte POSIX shm segment: the first
 //! `DATA_START` (1024) bytes are a reader-registration table we don't touch (byte density jumps
 //! from ~20-32% nonzero to ~99-100% exactly at that offset -- registration fields versus
 //! compressed bitstream), then a true byte-continuous circular buffer of records -- a 56-byte
-//! header immediately followed by `length` bytes of H.264 Annex-B payload, back-to-back with zero
-//! padding. A keyframe record is one access unit bundling SPS+PPS+IDR; an interframe record
-//! carries one P-slice. `chan` 4 is the 1728x1080 "main" stream and `chan` 8 is the
-//! 1152x720@25fps "sub" stream; both are served over RTSP (see `rtsp.rs`).
+//! header immediately followed by `length` bytes of payload, back-to-back with zero padding.
+//! Video payloads are H.264 Annex-B; a keyframe record is one access unit bundling SPS+PPS+IDR,
+//! an interframe record carries one P-slice. `chan` 4 is the 1728x1080 "main" stream, `chan` 8
+//! is the 1152x720@25fps "sub" stream; both are served over RTSP (see `rtsp.rs`). `chan` 1 is
+//! the microphone: MPEG-4 AAC-LC/16kHz/mono, one complete 1024-sample access unit per record,
+//! ADTS-framed (`docs/23-audio-codec.md`) -- also served over RTSP, as a third track both `/main`
+//! and `/sub` sessions subscribe to (there's only one microphone regardless of which video mount
+//! a client picked).
 //!
 //! There is no new-frame signal (the vendor creates `sem.media_buffer_reader_6` but never posts
 //! to it), so this is a poller: a background thread walks the ring, validates each record (sane
@@ -42,20 +48,29 @@ use std::io;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::AsRawFd;
 use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const RING_PATH: &str = "/dev/shm/media_buffer_frame_buf";
-const RING_LEN: usize = 8_389_608;
-const DATA_START: usize = 1024;
-const HDR: usize = 56;
+pub(crate) const RING_LEN: usize = 8_389_608;
+pub(crate) const DATA_START: usize = 1024;
+pub(crate) const HDR: usize = 56;
 
 /// Channel field values (record header offset 34).
 pub const CHAN_MAIN: u8 = 4;
 pub const CHAN_SUB: u8 = 8;
 const CHAN_THUMB: u8 = 16;
 const CHAN_AUDIO: u8 = 1;
+/// The talkback/speaker-bound tag -- confirmed live (not `docs/23-audio-codec.md`'s original
+/// inference): every record `agora` wrote during a real app talkback session decoded as valid
+/// AAC-LC/16kHz/mono ADTS under this `chan`, active for exactly the wall-clock span
+/// `/proc/ax_proc/ao`'s `SndFrm` counter also moved for. `audioout.rs` writes it; recognized
+/// here too so the video/mic-audio poller's seq-continuity walk doesn't resync-hiccup every
+/// time a talkback record shows up interleaved with ordinary video -- it's simply not
+/// dispatched to any feed (see `poll_loop`), just accepted as a normal, known record.
+pub(crate) const CHAN_AUDIO_OUT: u8 = 2;
 
 /// Frame type values (record header offset 32).
 const FRAME_KEYFRAME: u8 = 1;
@@ -147,28 +162,37 @@ impl Drop for Ring {
 }
 
 /// One record's header, parsed and structurally sanity-checked. Does not imply sequence
-/// continuity with whatever a caller read before it -- `Walker` tracks that.
-struct Header {
-    seq: u32,
-    length: u32,
-    pts_us: u32,
-    frame_type: u8,
-    chan: u8,
-    width: u16,
-    height: u16,
+/// continuity with whatever a caller read before it -- `Walker` tracks that. `pub(crate)` (and
+/// so is `parse_header`/`find_next_header` below): `audioout.rs` reuses these exact primitives
+/// for its own writer-side "where's the current tail" walk, rather than a second reimplementation
+/// of the same record-header format.
+pub(crate) struct Header {
+    pub(crate) seq: u32,
+    /// Offset 8: a separate monotonic counter per channel (main/sub/thumb/mic/audio-out each
+    /// increment their own copy by exactly 1 per record of that type). `audioout.rs` tracks this
+    /// for `CHAN_AUDIO_OUT` so its own writes continue whatever numbering `agora`'s already did,
+    /// rather than restarting at an arbitrary value a real reader might reject.
+    pub(crate) chan_seq: u32,
+    pub(crate) length: u32,
+    pub(crate) pts_us: u32,
+    pub(crate) frame_type: u8,
+    pub(crate) chan: u8,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 /// Parse and structurally validate a record header from `buf[off..]`: in-bounds header, sane
 /// payload length, known channel, and the whole record (header plus payload) fitting inside
 /// `buf` without needing bytes at or past `buf.len()`. Pure function of a byte slice so it's
 /// testable without a real mapping.
-fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
+pub(crate) fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     if off.checked_add(HDR)? > buf.len() {
         return None;
     }
     let b = &buf[off..off + HDR];
     let seq = u32::from_le_bytes(b[0..4].try_into().unwrap());
     let length = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    let chan_seq = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let pts_us = u32::from_le_bytes(b[16..20].try_into().unwrap());
     let frame_type = b[32];
     let chan = b[34];
@@ -180,20 +204,20 @@ fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     if !(1..=2_000_000).contains(&length) {
         return None;
     }
-    if !matches!(chan, CHAN_AUDIO | CHAN_MAIN | CHAN_SUB | CHAN_THUMB) {
+    if !matches!(chan, CHAN_AUDIO | CHAN_MAIN | CHAN_SUB | CHAN_THUMB | CHAN_AUDIO_OUT) {
         return None;
     }
     if off + HDR + length as usize > buf.len() {
         return None;
     }
-    Some(Header { seq, length, pts_us, frame_type, chan, width, height })
+    Some(Header { seq, chan_seq, length, pts_us, frame_type, chan, width, height })
 }
 
 /// Scan forward from `from` for the next byte offset that starts with an Annex-B start code
 /// (`00 00 00 01`) *and* whose implied header (`HDR` bytes back) passes `parse_header`. Wraps
 /// once -- `[from, buf.len())` then `[DATA_START, from)` -- so it always terminates within one
 /// lap of the ring.
-fn find_next_header(buf: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find_next_header(buf: &[u8], from: usize) -> Option<usize> {
     let start = from.clamp(DATA_START, buf.len());
     scan_range(buf, start, buf.len()).or_else(|| scan_range(buf, DATA_START, start))
 }
@@ -302,6 +326,60 @@ impl Walker {
             ring.advise_dontneed(from, to);
         }
         self.advised_upto = new_upto;
+    }
+}
+
+/// Shared, lock-free snapshot of the poller's current position in the ring: the offset
+/// immediately after the last record it validated, that record's global sequence number, and
+/// (separately) the last per-channel sequence number seen on `CHAN_AUDIO_OUT`. `audioout.rs`
+/// seeds its own append point from this rather than repeating a full ring scan on every write --
+/// the poller is already walking continuously (up to 100 Hz, `POLL_SLEEP`), so this is never more
+/// than one poll tick stale. That staleness is exactly why `audioout.rs` still does a short, fresh
+/// catch-up walk immediately before every actual write instead of trusting this snapshot as the
+/// literal write target: several records can land in even one poll tick, and writing at a
+/// position real data has already moved past would guarantee, not just risk, a collision. This
+/// cursor only narrows that catch-up walk from "scan the whole ring" to "check the last couple of
+/// records" -- see `audioout.rs`'s module doc for the full writer-side synchronization rationale
+/// (there is no known, safely-reverse-engineerable atomic claim primitive for this ring's write
+/// side; every prior research session that looked -- docs/11-media.md §4, docs/19-frame-ring.md
+/// §1 -- explicitly flagged slot 0's exact semantics as unrecovered).
+pub struct TailCursor {
+    ready: AtomicBool,
+    next_pos: AtomicU32,
+    global_seq: AtomicU32,
+    chan2_seq: AtomicU32,
+}
+
+impl TailCursor {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(false),
+            next_pos: AtomicU32::new(DATA_START as u32),
+            global_seq: AtomicU32::new(0),
+            chan2_seq: AtomicU32::new(0),
+        })
+    }
+
+    fn update(&self, global_seq: u32, next_pos: usize, chan2_seq: Option<u32>) {
+        self.next_pos.store(next_pos as u32, Ordering::Release);
+        self.global_seq.store(global_seq, Ordering::Release);
+        if let Some(s) = chan2_seq {
+            self.chan2_seq.store(s, Ordering::Release);
+        }
+        self.ready.store(true, Ordering::Release);
+    }
+
+    /// `(next_pos, last_global_seq, last_chan2_seq)`, or `None` before the poller has validated
+    /// its first record (startup only -- normally seeded within milliseconds).
+    pub(crate) fn snapshot(&self) -> Option<(usize, u32, u32)> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.next_pos.load(Ordering::Acquire) as usize,
+            self.global_seq.load(Ordering::Acquire),
+            self.chan2_seq.load(Ordering::Acquire),
+        ))
     }
 }
 
@@ -524,26 +602,141 @@ impl VideoFeed {
     }
 }
 
-fn poll_loop(ring: Ring, main_feed: Arc<VideoFeed>, sub_feed: Arc<VideoFeed>) {
+/// One AAC access unit from the ring's mic-audio channel: the raw ring payload, ADTS-framed,
+/// exactly as `media`'s encoder wrote it (`docs/23-audio-codec.md` -- one complete 1024-sample
+/// AAC-LC access unit per record, 7-byte ADTS header, no CRC). `rtsp.rs` strips the ADTS header
+/// and RFC-3640-wraps what's left; nothing here re-encodes or re-frames it.
+#[derive(Clone)]
+pub struct AudioFrame {
+    pub pts_us: u32,
+    pub data: Vec<u8>,
+}
+
+/// One client's audio inbox -- the audio equivalent of `Subscriber`, minus the keyframe
+/// eviction policy: every AAC access unit decodes independently (no GOP dependency), so once a
+/// slow client's queue is full the only sane policy is "drop the oldest queued frame".
+struct AudioSubscriber {
+    id: u64,
+    queue: Mutex<VecDeque<AudioFrame>>,
+    changed: Condvar,
+    cap: usize,
+}
+
+impl AudioSubscriber {
+    fn push(&self, frame: AudioFrame) {
+        let mut q = self.queue.lock().unwrap();
+        if q.len() >= self.cap {
+            q.pop_front();
+        }
+        q.push_back(frame);
+        self.changed.notify_one();
+    }
+
+    fn recv(&self, timeout: Duration) -> Option<AudioFrame> {
+        let q = self.queue.lock().unwrap();
+        let (mut q, _) = self.changed.wait_timeout_while(q, timeout, |q| q.is_empty()).unwrap();
+        q.pop_front()
+    }
+}
+
+struct AudioFeedInner {
+    latest: Option<AudioFrame>,
+    next_id: u64,
+    subscribers: Vec<Arc<AudioSubscriber>>,
+}
+
+/// Fan-out point for the ring's one mic-audio channel, mirroring `VideoFeed` but shared by
+/// *both* RTSP mounts: `/main` and `/sub` each get their own video feed (different ring
+/// channels), but there is only one microphone, so `main.rs` owns a single `Arc<AudioFeed>` that
+/// every session on either mount subscribes to.
+pub struct AudioFeed {
+    inner: Mutex<AudioFeedInner>,
+}
+
+/// A live subscription to an [`AudioFeed`], held for the lifetime of one RTSP PLAY session.
+pub struct AudioSubscription {
+    feed: Arc<AudioFeed>,
+    sub: Arc<AudioSubscriber>,
+}
+
+impl AudioSubscription {
+    pub fn recv(&self, timeout: Duration) -> Option<AudioFrame> {
+        self.sub.recv(timeout)
+    }
+}
+
+impl Drop for AudioSubscription {
+    fn drop(&mut self) {
+        let mut inner = self.feed.inner.lock().unwrap();
+        inner.subscribers.retain(|s| s.id != self.sub.id);
+    }
+}
+
+impl AudioFeed {
+    pub fn new() -> Arc<AudioFeed> {
+        Arc::new(AudioFeed { inner: Mutex::new(AudioFeedInner { latest: None, next_id: 0, subscribers: Vec::new() }) })
+    }
+
+    fn publish(&self, frame: AudioFrame) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.latest = Some(frame.clone());
+        for sub in &inner.subscribers {
+            sub.push(frame.clone());
+        }
+    }
+
+    /// Register a new session, seeded with the most recently published frame (if any) so PLAY
+    /// doesn't have to wait out a full ~64ms AAC frame period for its first packet. Unlike
+    /// `VideoFeed::subscribe`, there is no session cap here: a client only ever reaches this
+    /// after `rtsp.rs` has already cleared `VideoFeed`'s cap for whichever mount it SETUP, so a
+    /// second independent limit here would just double-count the same ceiling under a different
+    /// name.
+    pub fn subscribe(self: &Arc<Self>, queue_cap: usize) -> AudioSubscription {
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        let mut queue = VecDeque::with_capacity(queue_cap);
+        if let Some(f) = &inner.latest {
+            queue.push_back(f.clone());
+        }
+        let sub = Arc::new(AudioSubscriber { id, queue: Mutex::new(queue), changed: Condvar::new(), cap: queue_cap });
+        inner.subscribers.push(Arc::clone(&sub));
+        AudioSubscription { feed: Arc::clone(self), sub }
+    }
+}
+
+fn poll_loop(
+    ring: Ring,
+    main_feed: Arc<VideoFeed>,
+    sub_feed: Arc<VideoFeed>,
+    audio_feed: Arc<AudioFeed>,
+    tail: Arc<TailCursor>,
+) {
     let mut w = Walker::new();
     w.seed(ring.as_bytes());
     loop {
         let mut made_progress = false;
         while let Some((h, payload_off)) = w.step(ring.as_bytes()) {
             made_progress = true;
-            let feed = match h.chan {
-                CHAN_MAIN => Some(&main_feed),
-                CHAN_SUB => Some(&sub_feed),
-                _ => None,
-            };
-            if let Some(feed) = feed {
-                let data = ring.as_bytes()[payload_off..payload_off + h.length as usize].to_vec();
-                feed.publish(
-                    Frame { pts_us: h.pts_us, keyframe: h.frame_type == FRAME_KEYFRAME, data },
-                    h.width,
-                    h.height,
-                );
+            match h.chan {
+                CHAN_MAIN | CHAN_SUB => {
+                    let feed = if h.chan == CHAN_MAIN { &main_feed } else { &sub_feed };
+                    let data = ring.as_bytes()[payload_off..payload_off + h.length as usize].to_vec();
+                    feed.publish(
+                        Frame { pts_us: h.pts_us, keyframe: h.frame_type == FRAME_KEYFRAME, data },
+                        h.width,
+                        h.height,
+                    );
+                }
+                CHAN_AUDIO => {
+                    let data = ring.as_bytes()[payload_off..payload_off + h.length as usize].to_vec();
+                    audio_feed.publish(AudioFrame { pts_us: h.pts_us, data });
+                }
+                _ => {}
             }
+            let next_pos = payload_off + h.length as usize;
+            let chan2_seq = (h.chan == CHAN_AUDIO_OUT).then_some(h.chan_seq);
+            tail.update(h.seq, next_pos, chan2_seq);
         }
         w.maybe_advise(&ring);
         if !made_progress {
@@ -552,14 +745,25 @@ fn poll_loop(ring: Ring, main_feed: Arc<VideoFeed>, sub_feed: Arc<VideoFeed>) {
     }
 }
 
-/// Open the ring and spawn the background poller thread that feeds both `main_feed` (chan
-/// `CHAN_MAIN`) and `sub_feed` (chan `CHAN_SUB`) from a single walk through the ring -- one poll,
-/// two writers, regardless of how many RTSP clients either feed ends up fanning out to. The only
-/// fallible step is the initial open (bad path, too-small file, mmap failure); the poll loop
-/// itself never stops on its own.
-pub fn spawn(main_feed: Arc<VideoFeed>, sub_feed: Arc<VideoFeed>) -> io::Result<thread::JoinHandle<()>> {
+/// Open the ring and spawn the background poller thread that feeds `main_feed` (chan
+/// `CHAN_MAIN`), `sub_feed` (chan `CHAN_SUB`) and `audio_feed` (chan `CHAN_AUDIO`) from a single
+/// walk through the ring -- one poll, three writers, regardless of how many RTSP clients any of
+/// them ends up fanning out to. The only fallible step is the initial open (bad path, too-small
+/// file, mmap failure); the poll loop itself never stops on its own. Also returns a
+/// [`TailCursor`] the same walk keeps fresh, for `audioout.rs`'s writer to seed its own append
+/// point from (see `TailCursor`'s doc comment).
+pub fn spawn(
+    main_feed: Arc<VideoFeed>,
+    sub_feed: Arc<VideoFeed>,
+    audio_feed: Arc<AudioFeed>,
+) -> io::Result<(thread::JoinHandle<()>, Arc<TailCursor>)> {
     let ring = Ring::open()?;
-    Ok(thread::spawn(move || poll_loop(ring, main_feed, sub_feed)))
+    let tail = TailCursor::new();
+    let tail_for_poller = Arc::clone(&tail);
+    Ok((
+        thread::spawn(move || poll_loop(ring, main_feed, sub_feed, audio_feed, tail_for_poller)),
+        tail,
+    ))
 }
 
 #[cfg(test)]
