@@ -147,11 +147,22 @@ fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8]) -> String {
     )
 }
 
+/// How often to check the socket for an incoming client request while playing, independent of
+/// how often frames arrive. Keeping this decoupled (rather than doing one bounded read per frame
+/// loop iteration) matters: a bounded read still costs its full timeout whenever the client has
+/// nothing pending, which -- paid on every single frame -- was enough overhead per cycle to fall
+/// behind the sub channel's ~40 ms cadence and silently drop frames (via `VideoFeed`'s
+/// latest-wins hand-off), corrupting decode until the next keyframe. A live camera view can
+/// easily tolerate 100+ ms of extra latency noticing GET_PARAMETER/TEARDOWN; it can't tolerate
+/// dropped interframes.
+const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Stream RTP over the same connection until the client tears down or disconnects. Runs entirely
-/// on this one thread: a short-timeout read doubles as both "wait a bit for the next frame" and
-/// "notice a keepalive/teardown", so no extra thread is needed per connection.
+/// on this one thread: frame delivery is paced by `VideoFeed::wait_next`'s own timeout, and the
+/// control-socket check (keepalive/teardown) rides along on a much coarser timer so it never taxes
+/// the frame path (see `CONTROL_CHECK_INTERVAL`).
 fn stream_media(stream: &mut TcpStream, feed: &Arc<VideoFeed>) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_millis(15)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let (gen, kf) = feed.latest_keyframe();
@@ -162,13 +173,17 @@ fn stream_media(stream: &mut TcpStream, feed: &Arc<VideoFeed>) -> io::Result<()>
     }
 
     let mut ctrl_buf = Vec::new();
+    let mut last_control_check = Instant::now();
     loop {
         if let Some(frame) = feed.wait_next(&mut last_seen, Duration::from_millis(40)) {
             send_access_unit(stream, &frame, &mut seq)?;
         }
-        match poll_control(stream, &mut ctrl_buf)? {
-            ControlEvent::Teardown => return Ok(()),
-            ControlEvent::None | ControlEvent::Handled => {}
+        if last_control_check.elapsed() >= CONTROL_CHECK_INTERVAL {
+            last_control_check = Instant::now();
+            match poll_control(stream, &mut ctrl_buf)? {
+                ControlEvent::Teardown => return Ok(()),
+                ControlEvent::None | ControlEvent::Handled => {}
+            }
         }
     }
 }
