@@ -280,12 +280,18 @@ regardless: no on-device handler exists yet, §6). `ble.py::async_probe(hass, ad
 via `bleak-retry-connector`/HA's `bluetooth` integration exactly like `async_feed` does, but only
 reads back each characteristic's UUID and property bitmap — no write.
 
-**Status: pending.** This requires the feeder to actually be advertising, which is
-`BleAdvertise`'s parallel work (disassembling `pktool bleadv` / `ble`'s advertising-control UART
-commands, gated on `Main`'s sign-off before sending anything that changes advertising state —
-see that session's own notes). `docs/17-ble-fallback.md` §3 measured **zero** BLE advertisements
-from this feeder across all seven proxies under normal Wi-Fi operation, so there is nothing to
-connect to yet. Once the feeder advertises:
+**Status: pending, and not for lack of trying.** `BleAdvertise` (parallel work, same session)
+found and sent the bus message + UART frame that should switch advertising on, and confirmed
+by three independent senders converging on identical bytes that the frame itself is correctly
+formed — but a ~3-minute on-window, observed against a live, confirmed-forwarding ESPHome
+proxy (same room as the feeder), saw **zero** `Petkit`/`D4SH` names and zero 0xAAA0–2 UUIDs.
+That's inconclusive rather than a clean negative: the feeder may need another prerequisite
+besides the message that was sent, or it may be advertising unnamed/bare in a way that isn't
+distinguishable from ambient BLE noise without a proper before/after baseline (which this round
+didn't have). `docs/26-ble-advertising.md` has the full writeup and is where the next attempt's
+result will land. `docs/17-ble-fallback.md` §3 separately measured **zero** advertisements from
+this feeder under normal Wi-Fi operation, so — trigger or no trigger — there was nothing to
+connect to for this change's own window. Once a name/MAC is confirmed:
 
 1. Fill in `ble_address` with the observed MAC.
 2. Run `ble.async_probe(hass, address)` (or exercise it through the options flow + a manual
