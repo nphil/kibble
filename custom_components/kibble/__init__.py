@@ -164,7 +164,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
             await coordinator.async_feed(
                 call.data[ATTR_HOPPER], call.data[ATTR_AMOUNT], call.data.get(ATTR_FEED_ID)
             )
-        except KibbleError as err:
+        except Exception as err:
+            # Broader than the other handlers on purpose: a failed feed can now come from
+            # either transport (KibbleError from Wi-Fi, or the BLE fallback's own exception
+            # type from `custom_components/kibble/ble.py`) -- see `async_feed_with_fallback`.
+            # The cause is preserved (`from err`) so the specific failure is still in the log.
             raise HomeAssistantError(f"Feed failed: {err}") from err
 
     async def handle_cancel(call: ServiceCall) -> None:

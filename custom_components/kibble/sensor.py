@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import CloudState, FeederState
+from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 
@@ -184,6 +185,7 @@ async def async_setup_entry(
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
     entities.append(KibbleScheduleSensor(coordinator))
     entities.append(KibbleCloudConnectionSensor(coordinator))
+    entities.append(KibbleControlPathSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -286,3 +288,29 @@ class KibbleCloudConnectionSensor(KibbleEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         cloud = self.coordinator.data.cloud
         return {"connections": [{"remote": c.remote, "state": c.state} for c in cloud.connections]}
+
+
+class KibbleControlPathSensor(KibbleEntity, SensorEntity):
+    """Which transport the most recent `kibble.feed` call used or attempted:
+
+    - `wifi`: the agent's HTTP API answered (the normal case).
+    - `bluetooth`: Wi-Fi was unreachable and a BLE fallback was attempted through an ESPHome
+      Bluetooth proxy (`docs/25-ble-feed-frame.md`) -- reported regardless of whether the
+      fallback itself succeeded, since Bluetooth was the path actually used.
+    - `unreachable`: Wi-Fi was unreachable and no `ble_address` is configured.
+
+    Unknown until the first feed call after Home Assistant starts -- there is nothing to
+    report before then.
+    """
+
+    _attr_translation_key = "control_path"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(CONTROL_PATHS)
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "control_path")
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.control_path

@@ -76,6 +76,18 @@ cargo test
 cargo build --release --target armv7-unknown-linux-musleabihf
 ```
 
+The Home Assistant integration's own tests (frame codec, the Wi-Fi/BLE fallback decision, the
+BLE transport with a mocked GATT client — see [docs/25-ble-feed-frame.md](docs/25-ble-feed-frame.md))
+need Python 3.13, mirroring current Home Assistant's own requirement:
+
+```sh
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install bleak bleak-retry-connector pytest pytest-asyncio aiohttp voluptuous homeassistant \
+  pyserial habluetooth bluetooth-adapters bluetooth-auto-recovery bluetooth-data-tools dbus-fast \
+  aiousbwatcher
+pytest
+```
+
 ## Compatibility
 
 Developed against a YumShare Dual 2 (`D4SH2`), firmware 895, Axera AX620Q. The message formats are

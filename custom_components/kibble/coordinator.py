@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -12,7 +13,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import CloudState, FeederState, KibbleClient, KibbleError, ScheduleState
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .ble_fallback import async_feed_with_fallback
+from .const import CONF_BLE_ADDRESS, DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +46,10 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
         )
         self.client = client
+        self.entry = entry
+        # Which transport last actually carried (or was attempted for) a feed command; the
+        # "Control path" diagnostic sensor reads this directly. `None` until the first feed.
+        self.control_path: str | None = None
 
     async def _async_update_data(self) -> KibbleData:
         try:
@@ -55,10 +61,41 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
 
+    def _ble_feed(
+        self, hopper: str, amount: int, feed_id: str | None
+    ) -> Callable[[], Awaitable[None]] | None:
+        """A zero-arg BLE feed attempt, or None if no `ble_address` is configured. Imports
+        `.ble` lazily -- a feeder with no BLE fallback set up should never need bleak/
+        Home Assistant's `bluetooth` component loaded just to feed over Wi-Fi."""
+        address = self.entry.options.get(CONF_BLE_ADDRESS)
+        if not address:
+            return None
+
+        async def _attempt() -> None:
+            from .ble import async_feed as ble_async_feed
+
+            await ble_async_feed(
+                self.hass, address, hopper=hopper, amount=amount, feed_id=feed_id
+            )
+
+        return _attempt
+
     async def async_feed(self, hopper: str, amount: int, feed_id: str | None = None) -> None:
-        """Dispense, then refresh so the feeding flag appears without waiting for the poll."""
-        await self.client.feed(hopper, amount, feed_id)
+        """Dispense over Wi-Fi; on a connection error, fall back to BLE if `ble_address` is
+        configured (`docs/25-ble-feed-frame.md`). Always refreshes afterwards and always
+        records which transport was used/attempted on `self.control_path` -- the "Control
+        path" sensor -- even when the call ultimately fails."""
+
+        async def _wifi_feed() -> None:
+            await self.client.feed(hopper, amount, feed_id)
+
+        ble_feed = self._ble_feed(hopper, amount, feed_id)
+        outcome = await async_feed_with_fallback(_wifi_feed, ble_feed)
+        self.control_path = outcome.control_path
+        self.async_update_listeners()
         await self.async_request_refresh()
+        if outcome.error is not None:
+            raise outcome.error
 
     async def async_cancel_feed(self) -> None:
         await self.client.cancel_feed()

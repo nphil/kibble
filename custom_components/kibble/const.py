@@ -7,6 +7,10 @@ DOMAIN = "kibble"
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_STREAM_URL = "stream_url"
+# The feeder's BLE MAC, once a Bluetooth proxy has actually seen it advertise
+# (docs/25-ble-feed-frame.md). Optional: with it unset, an unreachable agent simply reports
+# "unreachable" instead of trying a BLE fallback.
+CONF_BLE_ADDRESS = "ble_address"
 
 DEFAULT_PORT = 8765
 DEFAULT_RTSP_PORT = 8554
