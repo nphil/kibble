@@ -21,10 +21,12 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 @dataclass(frozen=True, slots=True)
 class KibbleData:
-    """Everything one poll cycle fetches: feeder telemetry plus the schedule cache."""
+    """Everything one poll cycle fetches: feeder telemetry, the schedule cache, and the
+    live device-settings snapshot."""
 
     state: FeederState
     schedule: ScheduleState
+    config: dict[str, int]
 
 
 class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
@@ -46,7 +48,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         try:
             state = await self.client.state()
             schedule = await self.client.schedule()
-            return KibbleData(state=state, schedule=schedule)
+            config = await self.client.config()
+            return KibbleData(state=state, schedule=schedule, config=config)
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -57,6 +60,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
 
     async def async_cancel_feed(self) -> None:
         await self.client.cancel_feed()
+        await self.async_request_refresh()
+
+    async def async_set_config(self, key: str, value: int) -> None:
+        """Write one device setting, then refresh so the new value reflects immediately."""
+        await self.client.set_config(key, value)
         await self.async_request_refresh()
 
     async def async_schedule_set(self, entries: list[dict[str, Any]]) -> None:

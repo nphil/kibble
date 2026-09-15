@@ -4,7 +4,23 @@
       "feeding": {
         "default": "mdi:bowl-mix-outline",
         "state": { "on": "mdi:bowl-mix" }
-      }
+      },
+      "time_display": { "default": "mdi:clock-outline" },
+      "camera": { "default": "mdi:cctv" },
+      "move_detection": { "default": "mdi:run" },
+      "pet_detection": { "default": "mdi:cat" },
+      "eat_detection": { "default": "mdi:silverware-fork-knife" },
+      "vomit_detection": { "default": "mdi:emoticon-sick" },
+      "feed_picture": { "default": "mdi:camera-outline" },
+      "eat_video": { "default": "mdi:video-outline" },
+      "sound_enable": { "default": "mdi:bullhorn-outline" },
+      "system_sound_enable": { "default": "mdi:account-voice" },
+      "feed_sound": { "default": "mdi:music-note-outline" },
+      "food_warn": { "default": "mdi:alert-outline" },
+      "light_mode": { "default": "mdi:led-variant-outline" },
+      "tone_mode": { "default": "mdi:volume-off" },
+      "manual_lock": { "default": "mdi:lock-outline" },
+      "smart_frame": { "default": "mdi:crop-free" }
     },
     "button": {
       "feed": { "default": "mdi:bowl-mix" },
@@ -15,7 +31,8 @@
     "number": {
       "feed_amount": { "default": "mdi:counter" },
       "feed_amount_hopper_1": { "default": "mdi:numeric-1-box-outline" },
-      "feed_amount_hopper_2": { "default": "mdi:numeric-2-box-outline" }
+      "feed_amount_hopper_2": { "default": "mdi:numeric-2-box-outline" },
+      "volume": { "default": "mdi:volume-high" }
     },
     "sensor": {
       "bowl_fill_1": { "default": "mdi:gauge" },
@@ -23,7 +40,27 @@
       "desiccant_days": { "default": "mdi:air-filter" },
       "firmware": { "default": "mdi:chip" },
       "ble_firmware": { "default": "mdi:memory" },
-      "schedule": { "default": "mdi:calendar-clock" }
+      "schedule": { "default": "mdi:calendar-clock" },
+      "move_sensitivity": { "default": "mdi:run" },
+      "pet_sensitivity": { "default": "mdi:cat" },
+      "eat_sensitivity": { "default": "mdi:silverware-fork-knife" },
+      "detect_interval": { "default": "mdi:timer-outline" },
+      "detect_range_from": { "default": "mdi:clock-start" },
+      "detect_range_till": { "default": "mdi:clock-end" },
+      "selected_sound": { "default": "mdi:music-note" },
+      "factor1": { "default": "mdi:scale-balance" },
+      "factor2": { "default": "mdi:scale-balance" },
+      "light_range_from": { "default": "mdi:clock-start" },
+      "light_range_till": { "default": "mdi:clock-end" },
+      "tone_range_from": { "default": "mdi:clock-start" },
+      "tone_range_till": { "default": "mdi:clock-end" },
+      "surplus_control": { "default": "mdi:food-off-outline" },
+      "surplus_standard": { "default": "mdi:food-off-outline" }
+    },
+    "switch": {
+      "night": { "default": "mdi:weather-night" },
+      "light": { "default": "mdi:led-on" },
+      "microphone": { "default": "mdi:microphone" }
     }
   },
   "services": {

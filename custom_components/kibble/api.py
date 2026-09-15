@@ -126,6 +126,16 @@ class KibbleClient:
     async def state(self) -> FeederState:
         return FeederState.from_json(await self._request("GET", "/state"))
 
+    async def config(self) -> dict[str, int]:
+        """Every device setting's current value, as reported by `GET /config` (flat
+        `{"key": value, ...}` -- see `agent/src/settings.rs`'s `SETTINGS` table)."""
+        body = await self._request("GET", "/config")
+        return {key: int(value) for key, value in body.items()}
+
+    async def set_config(self, key: str, value: int) -> dict:
+        """Write one writable setting. The agent 400s for any key that isn't writable."""
+        return await self._request("POST", "/config", {"key": key, "value": value})
+
     async def feed(self, hopper: str, amount: int, feed_id: str | None = None) -> dict:
         payload: dict[str, Any] = {"hopper": hopper, "amount": amount}
         if feed_id:
