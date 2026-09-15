@@ -35,6 +35,11 @@
 //!   GET    /feeds                   before/after dish snapshots per feed cycle (see
 //!                                   feed_capture.rs), manual and scheduled alike
 //!   GET    /feeds/<name>            one snapshot's raw H.264 keyframe bytes
+//!   GET    /ble                     {"advertising","until"} -- last state kibbled itself asked
+//!                                   for; see advertise.rs for why this is not a live MCU read
+//!   POST   /ble/advertise           {"on": bool, "seconds": N}  toggle BLE advertising for the
+//!                                   WiFi-down fallback (docs/26-ble-advertising.md); `seconds`
+//!                                   optional, defaults/clamps per advertise.rs, `on` only
 //!
 //! What it deliberately does not do: talk to any cloud, replace any vendor process, or write to
 //! the vendor's own (AES-encrypted, key unrecovered) `/opt/user.conf`, or flash outside
@@ -42,6 +47,7 @@
 //! shared-memory frame ring), and keeps its own settings record in `/opt/kibble/` — see
 //! `persist.rs` and `docs/21-config-encryption.md`.
 
+mod advertise;
 mod ai;
 mod backup;
 mod bus;
@@ -63,6 +69,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use advertise::BleAdv;
 use bus::{msg, FeedCtrl, Peer, Sender};
 use http::{json_field, Request, Response};
 use schedule::Schedule;
@@ -98,6 +105,8 @@ fn main() {
     let shm = Arc::new(shm);
     let ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
+    let ble_adv = advertise::BleAdv::spawn()
+        .unwrap_or_else(|e| die(&format!("open ble_adv queue: {e}")));
     let mut schedule = Schedule::load(PathBuf::from(schedule::CACHE_PATH))
         .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
@@ -121,8 +130,9 @@ fn main() {
 
     cloud::spawn_reconciler();
     persist::spawn_reconciler(Arc::clone(&shm));
-    let _ =
-        http::serve(listener, |req| route(req, &shm, &ble, &mut schedule, &feeds, &ai_feed, &capture));
+    let _ = http::serve(listener, |req| {
+        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture)
+    });
 }
 
 fn die(msg: &str) -> ! {
@@ -134,6 +144,7 @@ fn route(
     req: &Request,
     shm: &Shm,
     ble: &Sender,
+    ble_adv: &BleAdv,
     schedule: &mut Schedule,
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
@@ -171,6 +182,8 @@ fn route(
         ("POST", "/faces/label") => faces_label_post(req),
         ("GET", "/feeds") => feeds_list(capture),
         ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
+        ("GET", "/ble") => Response::Json(ble_adv.status_json()),
+        ("POST", "/ble/advertise") => ble_advertise_write(req, ble_adv),
         _ => Response::NotFound,
     }
 }
@@ -240,6 +253,18 @@ fn feeds_get(capture: &feed_capture::FeedCapture, name: &str) -> Response {
             Response::BadRequest("invalid file name".into())
         }
         Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn ble_advertise_write(req: &Request, ble_adv: &BleAdv) -> Response {
+    let on = match json_field(&req.body, "on") {
+        Some(v) => v != "false",
+        None => return Response::BadRequest(r#""on" is required"#.into()),
+    };
+    let seconds = json_field(&req.body, "seconds").and_then(|v| v.parse::<u64>().ok());
+    match ble_adv.set(on, seconds) {
+        Ok(()) => Response::Json(ble_adv.status_json()),
+        Err(e) => Response::Error(format!("bus send failed: {e}")),
     }
 }
 

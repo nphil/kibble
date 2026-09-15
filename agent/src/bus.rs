@@ -52,6 +52,12 @@ pub mod msg {
     /// ctrl -> ble: 4-byte little-endian Unix timestamp. `ctrl` sends this immediately before
     /// every schedule-set (STUDY-schedule.md §3.2); we mirror that ordering.
     pub const BLE_SET_RTC: u16 = 0x6007;
+    /// ctrl -> ble: enable/disable BLE advertising, `dispatch_handler_ble_set_adv`. Payload
+    /// byte 0 is `1`=on/`0`=off, rest padding to the 4-byte shape every sender (`pktool`'s
+    /// `bleadv 0|1`, `ctrl`'s own pairing flow, us) uses. `ble` relays it to the T31 MCU as
+    /// UART CMD `0x09`, subaddr `2` -- see docs/26-ble-advertising.md for the full disassembly
+    /// trace and why nothing here implies a timeout: that lives entirely in [`super::advertise`].
+    pub const BLE_SET_ADV: u16 = 0x6001;
 }
 
 type MqdT = c_int;
@@ -99,11 +105,34 @@ impl Sender {
         }
         Ok(())
     }
+
+    /// The raw descriptor, for a context that cannot use [`Sender::send`] safely -- namely a
+    /// signal handler, which must not allocate or take a lock the interrupted code might
+    /// already hold. Nothing here is unsafe by itself; [`send_raw`] is the signal-safe sender
+    /// that actually uses it. See [`super::advertise`]'s shutdown handler, the one caller.
+    pub fn raw(&self) -> MqdT {
+        self.mqd
+    }
 }
 
 impl Drop for Sender {
     fn drop(&mut self) {
         unsafe { mq_close(self.mqd) };
+    }
+}
+
+/// Signal-handler-safe send: fixed-size stack buffer, no allocation, no lock -- unlike
+/// [`Sender::send`], which is safe everywhere else but must not be called from a signal handler
+/// (its `Sender` would need to be reached through a lock or reopened through `CString`, both of
+/// which can deadlock if the interrupted code was already inside the allocator). `mqd` is a
+/// [`Sender::raw`] descriptor kept in a plain `AtomicI32` for exactly this purpose.
+pub fn send_raw(mqd: MqdT, msg_id: u16, src: u16, payload: &[u8; 4]) {
+    let mut buf = [0u8; 8];
+    buf[0..2].copy_from_slice(&msg_id.to_le_bytes());
+    buf[2..4].copy_from_slice(&src.to_le_bytes());
+    buf[4..8].copy_from_slice(payload);
+    unsafe {
+        mq_send(mqd, buf.as_ptr() as *const c_char, 8, 0);
     }
 }
 
