@@ -23,11 +23,15 @@
       "feeding": { "name": "Feeding" }
     },
     "button": {
-      "feed": { "name": "Feed" },
+      "feed": { "name": "Feed both" },
+      "feed_hopper_1": { "name": "Feed hopper 1" },
+      "feed_hopper_2": { "name": "Feed hopper 2" },
       "cancel_feed": { "name": "Cancel feed" }
     },
     "number": {
-      "feed_amount": { "name": "Feed amount" }
+      "feed_amount": { "name": "Feed amount" },
+      "feed_amount_hopper_1": { "name": "Feed amount hopper 1" },
+      "feed_amount_hopper_2": { "name": "Feed amount hopper 2" }
     },
     "sensor": {
       "bowl_fill_1": { "name": "Bowl fill hopper 1" },

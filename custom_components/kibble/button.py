@@ -1,17 +1,51 @@
-"""Feed and cancel buttons."""
+"""Feed and cancel buttons.
+
+One feed button per auger plus a combined one. The augers are independent motors — the feed
+payload carries a separate amount byte for each — so they are separately controllable regardless
+of whether the physical hopper divider is fitted.
+"""
 
 from __future__ import annotations
 
-from homeassistant.components.button import ButtonEntity
+from dataclasses import dataclass
+
+from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import KibbleError
-from .const import DOMAIN, HOPPER_BOTH, MAX_AMOUNT, MIN_AMOUNT
+from .const import DOMAIN, HOPPER_1, HOPPER_2, HOPPER_BOTH, MAX_AMOUNT, MIN_AMOUNT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+
+
+@dataclass(frozen=True, kw_only=True)
+class KibbleFeedDescription(ButtonEntityDescription):
+    """A feed button, the hopper it runs and the amount entity it reads."""
+
+    hopper: str
+    amount_key: str
+
+
+FEEDS: tuple[KibbleFeedDescription, ...] = (
+    KibbleFeedDescription(
+        key="feed", translation_key="feed", hopper=HOPPER_BOTH, amount_key="feed_amount"
+    ),
+    KibbleFeedDescription(
+        key="feed_hopper_1",
+        translation_key="feed_hopper_1",
+        hopper=HOPPER_1,
+        amount_key="feed_amount_hopper_1",
+    ),
+    KibbleFeedDescription(
+        key="feed_hopper_2",
+        translation_key="feed_hopper_2",
+        hopper=HOPPER_2,
+        amount_key="feed_amount_hopper_2",
+    ),
+)
 
 
 async def async_setup_entry(
@@ -20,22 +54,27 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities([KibbleFeedButton(coordinator), KibbleCancelButton(coordinator)])
+    entities: list[ButtonEntity] = [KibbleFeedButton(coordinator, d) for d in FEEDS]
+    entities.append(KibbleCancelButton(coordinator))
+    async_add_entities(entities)
 
 
 class KibbleFeedButton(KibbleEntity, ButtonEntity):
-    """Dispense the amount currently set on the feed-amount control."""
+    """Dispense the amount set on this button's companion amount control."""
 
-    _attr_translation_key = "feed"
+    entity_description: KibbleFeedDescription
 
-    def __init__(self, coordinator) -> None:
-        super().__init__(coordinator, "feed")
+    def __init__(self, coordinator, description: KibbleFeedDescription) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
 
     def _amount(self) -> int:
-        """Read the companion number entity, defaulting to one portion."""
+        """Read the companion number entity, falling back to one portion."""
         registry = er.async_get(self.hass)
         entity_id = registry.async_get_entity_id(
-            "number", DOMAIN, f"{self.coordinator.data.serial}_feed_amount"
+            "number",
+            DOMAIN,
+            f"{self.coordinator.data.serial}_{self.entity_description.amount_key}",
         )
         if entity_id and (state := self.hass.states.get(entity_id)) is not None:
             try:
@@ -46,7 +85,9 @@ class KibbleFeedButton(KibbleEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         try:
-            await self.coordinator.async_feed(HOPPER_BOTH, self._amount())
+            await self.coordinator.async_feed(
+                self.entity_description.hopper, self._amount()
+            )
         except KibbleError as err:
             raise HomeAssistantError(f"Feed failed: {err}") from err
 
