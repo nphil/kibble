@@ -36,6 +36,7 @@ be recovered, that is stated rather than guessed — read those gaps as gaps.
 - [08-mcu.md](08-mcu.md) — the dispenser MCU's UART protocol
 - [09-ble.md](09-ble.md) — BLE: GATT profile, framing, and what the MCU does on its own
 - [10-bt-linux.md](10-bt-linux.md) — why the Wi-Fi module's Bluetooth cannot be used
+- [17-ble-fallback.md](17-ble-fallback.md) — BLE fallback: measured, and why it is deferred
 - [11-media.md](11-media.md) — encoder channels, audio in/out, the frame ring, talkback
 - [15-settings-write.md](15-settings-write.md) — how the ~40 device settings are written, with byte offsets
 - [16-schedule.md](16-schedule.md) — the feed schedule: write protocol, and why there is no read-back
