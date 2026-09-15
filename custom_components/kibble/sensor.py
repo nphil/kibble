@@ -30,6 +30,10 @@ from .entity import KibbleEntity
 
 _LOGGER = logging.getLogger(__name__)
 
+# Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
+
 
 @dataclass(frozen=True, kw_only=True)
 class KibbleSensorDescription(SensorEntityDescription):
@@ -58,6 +62,7 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
         translation_key="desiccant_days",
         native_unit_of_measurement=UnitOfTime.DAYS,
         entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
         value=lambda s: s.desiccant_days,
     ),
     KibbleSensorDescription(
@@ -396,6 +401,7 @@ class KibbleCloudConnectionSensor(KibbleEntity, SensorEntity):
 
     _attr_translation_key = "cloud_connection"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = list(_CLOUD_CONNECTION_STATES)
 
@@ -427,6 +433,7 @@ class KibbleControlPathSensor(KibbleEntity, SensorEntity):
 
     _attr_translation_key = "control_path"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = list(CONTROL_PATHS)
 
@@ -443,6 +450,7 @@ class KibbleWifiNetworkSensor(KibbleEntity, SensorEntity):
 
     _attr_translation_key = "wifi"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, coordinator) -> None:
         super().__init__(coordinator, "wifi")
@@ -468,6 +476,7 @@ class KibbleWifiSignalSensor(KibbleEntity, SensorEntity):
 
     _attr_translation_key = "wifi_signal"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
     _attr_state_class = SensorStateClass.MEASUREMENT

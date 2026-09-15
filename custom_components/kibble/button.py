@@ -11,7 +11,6 @@ from dataclasses import dataclass
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -19,6 +18,11 @@ from .api import KibbleError
 from .const import DOMAIN, HOPPER_1, HOPPER_2, HOPPER_BOTH, MAX_AMOUNT, MIN_AMOUNT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+from .errors import raise_agent_action_failed
+
+# Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -89,7 +93,7 @@ class KibbleFeedButton(KibbleEntity, ButtonEntity):
                 self.entity_description.hopper, self._amount()
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Feed failed: {err}") from err
+            raise_agent_action_failed("Feed", err)
 
 
 class KibbleCancelButton(KibbleEntity, ButtonEntity):
@@ -104,4 +108,4 @@ class KibbleCancelButton(KibbleEntity, ButtonEntity):
         try:
             await self.coordinator.async_cancel_feed()
         except KibbleError as err:
-            raise HomeAssistantError(f"Cancel failed: {err}") from err
+            raise_agent_action_failed("Cancel", err)

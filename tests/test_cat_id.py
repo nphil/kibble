@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from kibble.api import IdentifyResult, KibbleError, ReviewFace
 from kibble.binary_sensor import PRESENCE_WINDOW, is_present
 from kibble.image import _image_url
@@ -80,23 +80,28 @@ async def test_select_option_passes_a_real_cat_name_through_unchanged() -> None:
 async def test_select_option_raises_when_the_review_queue_is_not_pending() -> None:
     fake_self = _fake_select(ReviewFace(status="labelled", name="3-unknown.jpg", cat="Rashy"))
 
-    with pytest.raises(HomeAssistantError, match="No pending face"):
+    with pytest.raises(ServiceValidationError) as excinfo:
         await KibbleLabelFaceSelect.async_select_option(fake_self, "Rashy")
+    assert excinfo.value.translation_key == "no_pending_face"
 
 
 async def test_select_option_raises_when_there_is_no_crop_at_all() -> None:
     fake_self = _fake_select(ReviewFace(status="none", name=None, cat=None))
 
-    with pytest.raises(HomeAssistantError, match="No pending face"):
+    with pytest.raises(ServiceValidationError) as excinfo:
         await KibbleLabelFaceSelect.async_select_option(fake_self, "Rashy")
+    assert excinfo.value.translation_key == "no_pending_face"
 
 
 async def test_select_option_wraps_a_kibble_error_as_a_home_assistant_error() -> None:
     label_face = AsyncMock(side_effect=KibbleError("agent unreachable"))
     fake_self = _fake_select(ReviewFace(status="pending", name="4-unknown.jpg", cat=None), label_face)
 
-    with pytest.raises(HomeAssistantError, match="agent unreachable"):
+    with pytest.raises(HomeAssistantError) as excinfo:
         await KibbleLabelFaceSelect.async_select_option(fake_self, "Rashy")
+    assert excinfo.value.translation_key == "agent_action_failed"
+    assert excinfo.value.translation_placeholders == {"action": "Label", "error": "agent unreachable"}
+
 
 
 # --- image._image_url -------------------------------------------------------------------------

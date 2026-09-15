@@ -1,0 +1,219 @@
+rules:
+  # Bronze
+  action-setup:
+    status: done
+    comment: All kibble.* actions registered in async_setup_entry via _async_register_services.
+  appropriate-polling:
+    status: done
+    comment: |
+      DataUpdateCoordinator, update_interval=DEFAULT_SCAN_INTERVAL (10s) -- config_shm reads are
+      "nearly free" on-device (const.py); the limit is the feeder's single-client HTTP server,
+      not the poll rate. See coordinator.py's module docstring for the full reasoning, including
+      the new POLL_TIMEOUT/backoff behavior.
+  brands:
+    status: exempt
+    comment: |
+      Kibble is a HACS-distributed custom integration, never submitted to home-assistant/core.
+      This rule requires a PR to the separate home-assistant/brands repository, which only
+      accepts submissions from core-merged integrations. brand/ in this repo holds the same
+      assets HACS itself reads directly from the repo, which is the correct mechanism for a
+      custom integration.
+  common-modules:
+    status: done
+    comment: coordinator.py (KibbleCoordinator) and entity.py (KibbleEntity) per convention.
+  config-flow-test-coverage:
+    status: todo
+    comment: No dedicated tests/test_config_flow.py exists. Out of scope for this pass (focus was robustness); flagged for follow-up.
+  config-flow:
+    status: done
+    comment: config_flow.py, UI setup, test-before-configure via client.state().
+  dependency-transparency:
+    status: done
+    comment: manifest.json requirements are versioned (bleak>=0.20.0, bleak-retry-connector>=3.0.0), no git/local paths.
+  docs-actions:
+    status: todo
+    comment: Not verified against README.md this session -- services.yaml/strings.json are in sync, but README coverage of every action was not audited.
+  docs-triggers:
+    status: exempt
+    comment: This integration has no device triggers.
+  docs-conditions:
+    status: exempt
+    comment: This integration has no device conditions.
+  docs-high-level-description:
+    status: done
+    comment: README.md describes the feeder, the agent, and the integration's scope.
+  docs-installation-instructions:
+    status: done
+    comment: README.md HACS installation steps.
+  docs-removal-instructions:
+    status: todo
+    comment: Not verified against README.md this session.
+  entity-event-setup:
+    status: done
+    comment: Dynamic per-cat entities added via coordinator.async_add_listener registered in async_setup_entry, unsubscribed via entry.async_on_unload -- correct lifecycle.
+  entity-unique-id:
+    status: done
+    comment: KibbleEntity sets f"{serial}_{key}" for every entity; serial is stable across reboots/address changes (see entity.py's docstring).
+  has-entity-name:
+    status: done
+    comment: KibbleEntity sets _attr_has_entity_name = True; inherited by every platform.
+  runtime-data:
+    status: done
+    comment: 'entry.runtime_data holds the KibbleCoordinator; type KibbleConfigEntry = ConfigEntry[KibbleCoordinator] used throughout.'
+  test-before-configure:
+    status: done
+    comment: config_flow.py's async_step_user calls client.state() before creating the entry.
+  test-before-setup:
+    status: done
+    comment: async_config_entry_first_refresh() raises ConfigEntryNotReady on a failed first poll (HA-native behavior, unmodified).
+  unique-config-entry:
+    status: done
+    comment: async_set_unique_id(state.serial) + _abort_if_unique_id_configured in config_flow.py.
+
+  # Silver
+  action-exceptions:
+    status: done
+    comment: |
+      Newly satisfied this pass. Every service handler and entity action method raises
+      ServiceValidationError (bad input: unknown_device, unknown_schedule_entry,
+      schedule_writes_disabled, no_pending_face) or HomeAssistantError (agent/network failure:
+      agent_action_failed, speaker_busy) via the shared errors.py helpers, never a bare string.
+  config-entry-unloading:
+    status: done
+    comment: async_unload_entry unloads exactly coordinator.loaded_platforms (only what actually loaded -- see the entity-unavailable/platform-isolation notes in the audit doc).
+  docs-configuration-parameters:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-installation-parameters:
+    status: todo
+    comment: Not verified against README.md this session.
+  entity-unavailable:
+    status: done
+    comment: |
+      This is the headline fix of this pass (defect #1). coordinator.py's _async_update_data
+      now tolerates CONSECUTIVE_FAILURES_FOR_UNAVAILABLE-1 failed polls (serving last-known-good
+      data, last_update_success stays True) before raising UpdateFailed for real. See
+      coordinator.py's module docstring for the full, deliberately-reasoned policy -- this is a
+      documented, considered deviation from the rule's literal single-failure example, justified
+      by this specific device's known contention pattern (three of five attempts failed during
+      the real incident this fix responds to).
+  log-when-unavailable:
+    status: done
+    comment: |
+      Obtained for free from DataUpdateCoordinator's own built-in once-logging (error on the
+      real transition to unavailable, info on recovery) now that last_update_success only flips
+      on a genuine, threshold-crossing failure instead of every poll.
+  integration-owner:
+    status: done
+    comment: 'manifest.json codeowners: ["@nphil"].'
+  parallel-updates:
+    status: done
+    comment: |
+      Newly added this pass: PARALLEL_UPDATES = 0 on all 9 platforms (sensor, binary_sensor,
+      switch, number, select, button, camera, image, media_player). Coordinator-backed reads
+      and coordinator-mediated writes both funnel through api.py's single asyncio.Lock, so 0 is
+      correct everywhere, matching reolink's own justification for the same choice.
+  reauthentication-flow:
+    status: exempt
+    comment: LAN device with no credentials/account -- nothing to reauthenticate.
+  test-coverage:
+    status: todo
+    comment: 228 tests pass (up from ~130 at the start of this pass) but coverage % was not measured with a coverage tool this session -- cannot claim the 95% threshold without measuring it.
+
+  # Gold
+  devices:
+    status: done
+    comment: |
+      DeviceInfo (identifiers, manufacturer, model, name, serial_number, sw_version) plus, new
+      this pass, configuration_url pointing at the agent's own host:port (entity.py).
+  diagnostics:
+    status: done
+    comment: |
+      New this pass: diagnostics.py. Redacts host, the Scrypted rebroadcast URL (a
+      bearer-token-shaped capability URL), BLE MAC, Wi-Fi SSID/BSSID/IP, serial, and any
+      password/psk/token key, recursively (including inside FeederState.raw).
+  discovery-update-info:
+    status: exempt
+    comment: No discovery mechanism (see discovery, below).
+  discovery:
+    status: exempt
+    comment: The feeder has no mDNS/SSDP/DHCP-fingerprintable announcement this integration could discover from; manual IP entry is the only option. Worth a future look if the agent ever gains an announce beacon, but out of this pass's scope.
+  docs-data-update:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-examples:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-known-limitations:
+    status: todo
+    comment: Not verified against README.md this session (media_player.py's own module docstring documents the current audio-playback limitation in-code, but that is not the same as it being in the README).
+  docs-supported-devices:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-supported-functions:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-troubleshooting:
+    status: todo
+    comment: Not verified against README.md this session.
+  docs-use-cases:
+    status: todo
+    comment: Not verified against README.md this session.
+  dynamic-devices:
+    status: exempt
+    comment: Exactly one device per config entry, fixed for the entry's lifetime. Nothing to add dynamically.
+  entity-category:
+    status: done
+    comment: |
+      Newly regression-tested this pass (tests/test_entity_platform_rules.py). Confirms no
+      sensor/binary_sensor entity ever carries EntityCategory.CONFIG (the exact shape of
+      defect #3) and that every other category assignment is deliberate.
+  entity-device-class:
+    status: done
+    comment: Used where a real device class exists and fits (BinarySensorDeviceClass.RUNNING/CONNECTIVITY, SensorDeviceClass.ENUM/SIGNAL_STRENGTH, MediaPlayerDeviceClass.SPEAKER); not forced where none fits.
+  entity-disabled-by-default:
+    status: done
+    comment: |
+      House rule 4. Regression-tested this pass -- found and fixed 5 real violations
+      (desiccant_days, cloud_connection, control_path, wifi, wifi_signal: all DIAGNOSTIC but
+      missing entity_registry_enabled_default=False). One documented, deliberate exception on
+      record: switch.cloud (KibbleCloudSwitch), the privacy control the integration exists for.
+  entity-translations:
+    status: done
+    comment: strings.json/translations/en.json entity.<platform>.<key>.name for every entity, translation_key used throughout (no bare _attr_name).
+  exception-translations:
+    status: done
+    comment: Newly satisfied this pass -- see action-exceptions; strings.json's new "exceptions" block backs every raise.
+  icon-translations:
+    status: done
+    comment: icons.json covers every entity by translation_key, including new state-based icons (feeding, reachable); no raw _attr_icon anywhere.
+  reconfiguration-flow:
+    status: todo
+    comment: OptionsFlow exists (stream URL, BLE MAC, schedule-writes gate) but there is no async_step_reconfigure -- host/port cannot be changed without removing and re-adding the entry. Out of scope for this pass.
+  repair-issues:
+    status: done
+    comment: |
+      New this pass: coordinator.py raises feeder_unresponsive (is_fixable=False, WARNING) the
+      moment a poll crosses CONSECUTIVE_FAILURES_FOR_UNAVAILABLE, and clears it on recovery.
+      Deliberately the only repair issue added -- see docs/30-quality-scale-audit.md for why a
+      "schedule writes disabled" issue was considered and rejected (repair-issues' own reasoning:
+      "should not raise repair issues for just letting users know that something is wrong, which
+      they can't fix themselves" -- schedule-writes-off is an intentional default, not a fault).
+  stale-devices:
+    status: exempt
+    comment: Exactly one device per config entry; removing the entry removes the device via HA's own generic handling. No async_remove_config_entry_device implemented -- there is no fleet to prune from.
+
+  # Platinum
+  async-dependency:
+    status: done
+    comment: aiohttp-based KibbleClient, fully async throughout; bleak (BLE fallback) is also async.
+  inject-websession:
+    status: done
+    comment: async_get_clientsession(hass) passed into KibbleClient in __init__.py; no session of its own.
+  strict-typing:
+    status: todo
+    comment: |
+      The pattern is followed (typed KibbleConfigEntry used throughout, per the rule's own
+      warning about runtime-data integrations) but mypy --strict was not run against this repo
+      this session, so the claim is unverified. The .strict-typing core-repo registration itself
+      does not apply to a non-core integration.

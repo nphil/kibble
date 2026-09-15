@@ -5,13 +5,24 @@ from __future__ import annotations
 from homeassistant.components.persistent_notification import async_create
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import KibbleError
-from .const import CAT_BUCKET_NOT_A_CAT, CAT_BUCKET_SKIP, CAT_LABEL_NOT_A_CAT, CAT_LABEL_SKIP
+from .const import (
+    CAT_BUCKET_NOT_A_CAT,
+    CAT_BUCKET_SKIP,
+    CAT_LABEL_NOT_A_CAT,
+    CAT_LABEL_SKIP,
+    DOMAIN,
+)
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
+from .errors import raise_agent_action_failed
+
+# Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
@@ -71,7 +82,7 @@ class KibbleWifiSelect(KibbleEntity, SelectEntity):
         try:
             await self.coordinator.async_wifi_connect(option)
         except KibbleError as err:
-            raise HomeAssistantError(f"Connect to {option} failed: {err}") from err
+            raise_agent_action_failed(f"Connect to {option}", err)
 
 
 def cat_for_option(option: str) -> str:
@@ -115,8 +126,10 @@ class KibbleLabelFaceSelect(KibbleEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         review = self.coordinator.data.review_face
         if review.status != "pending" or review.name is None:
-            raise HomeAssistantError("No pending face to label right now")
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="no_pending_face"
+            )
         try:
             await self.coordinator.async_label_face(review.name, cat_for_option(option))
         except KibbleError as err:
-            raise HomeAssistantError(f"Label failed: {err}") from err
+            raise_agent_action_failed("Label", err)

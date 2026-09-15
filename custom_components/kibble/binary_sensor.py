@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -17,6 +18,10 @@ from homeassistant.util import dt as dt_util, slugify
 from .api import IdentifyResult
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
+
+# Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
 
 # How long a cat stays "present" after its last confident identification. An implementation
 # choice, not a device-measured value -- see docs/27-cat-id.md's honesty section. There is no
@@ -146,7 +151,10 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    entities: list[BinarySensorEntity] = [KibbleFeedingSensor(coordinator)]
+    entities: list[BinarySensorEntity] = [
+        KibbleFeedingSensor(coordinator),
+        KibbleReachableBinarySensor(coordinator),
+    ]
     entities.extend(KibbleSettingBinarySensor(coordinator, d) for d in SETTING_SENSORS)
     async_add_entities(entities)
 
@@ -183,6 +191,46 @@ class KibbleFeedingSensor(KibbleEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.coordinator.data.state.feeding
+
+
+class KibbleReachableBinarySensor(KibbleEntity, BinarySensorEntity):
+    """Whether the *most recent* poll reached the feeder at all -- `coordinator.
+    feeder_reachable`, stricter than every other entity's `available`
+    (`coordinator.last_update_success`, which the module docstring explains only goes
+    `False` after several consecutive misses). This entity is the one place that difference
+    is directly visible: it goes `off` at the very first missed poll, exactly the window
+    where every other entity is still quietly showing its last known value, so a user who
+    enables it can see "starting to have trouble" before anything actually goes unavailable
+    for real -- and it is the one entity that deliberately does NOT go unavailable itself
+    when the feeder is confirmed down (see its `available` override below), so it stays
+    informative at exactly the moment every other entity stops being.
+    """
+
+    _attr_translation_key = "reachable"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "reachable")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.feeder_reachable
+
+    @property
+    def available(self) -> bool:
+        """Always available -- see the class docstring. Never gated on
+        `coordinator.last_update_success`; the entity's entire purpose is to keep reporting
+        through the window where that would otherwise hide it."""
+        return True
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "consecutive_failures": self.coordinator.consecutive_failures,
+            "last_error": self.coordinator.last_error,
+        }
 
 
 class KibbleSettingBinarySensor(KibbleEntity, BinarySensorEntity):

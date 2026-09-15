@@ -117,3 +117,8 @@ MAX_DEVICE_VOLUME = 9
 # length. Not a device-confirmed limit, an integration-side sanity bound.
 MIN_CLIP_SECONDS = 1
 MAX_CLIP_SECONDS = 30
+
+# `coordinator.py`'s repair issue, raised once the feeder has missed
+# CONSECUTIVE_FAILURES_FOR_UNAVAILABLE polls in a row -- see its module docstring for the
+# full availability policy this backs.
+ISSUE_FEEDER_UNRESPONSIVE = "feeder_unresponsive"

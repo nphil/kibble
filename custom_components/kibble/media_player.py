@@ -36,7 +36,6 @@ from homeassistant.components.media_player import (
     MediaType,
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
@@ -44,6 +43,11 @@ from .api import KibbleError, KibbleSpeakerBusyError
 from .const import MAX_DEVICE_VOLUME
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
+from .errors import raise_agent_action_failed, raise_speaker_busy
+
+# Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
@@ -52,10 +56,6 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     async_add_entities([KibbleSpeaker(entry.runtime_data)])
-
-
-def _busy_message(err: KibbleSpeakerBusyError) -> str:
-    return f"The feeder's speaker is already in use (another clip, or the vendor app): {err}"
 
 
 class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
@@ -90,7 +90,7 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
         try:
             await self.coordinator.async_set_config("volume", device_volume)
         except KibbleError as err:
-            raise HomeAssistantError(f"Set volume failed: {err}") from err
+            raise_agent_action_failed("Set volume", err)
 
     async def async_play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
@@ -98,9 +98,9 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
         try:
             result = await self.coordinator.async_play_media_content(media_id)
         except KibbleSpeakerBusyError as err:
-            raise HomeAssistantError(_busy_message(err)) from err
+            raise_speaker_busy(err)
         except KibbleError as err:
-            raise HomeAssistantError(f"Play failed: {err}") from err
+            raise_agent_action_failed("Play", err)
         self._mark_playing(result.get("estimated_ms"))
 
     def _mark_playing(self, estimated_ms: float | int | None) -> None:

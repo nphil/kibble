@@ -1,4 +1,61 @@
-"""Polling coordinator for a Kibble feeder."""
+"""Polling coordinator for a Kibble feeder.
+
+## Availability policy: why one failed poll no longer blanks every entity
+
+The feeder's HTTP agent (`kibbled`) runs on a tiny ARM device behind what is, in practice, a
+single-client HTTP server: it is shared with the Scrypted plugin and HomeKit, and one slow
+consumer (an ad-hoc ~25s long-poll, observed live against this exact device) is enough to make
+every other consumer's requests queue up and time out. That is routine contention for this
+device, not evidence the feeder itself is down -- but the first version of this integration
+treated it as exactly that: one failed poll raised `UpdateFailed`, which flipped
+`DataUpdateCoordinator.last_update_success` to `False`, and because `CoordinatorEntity.available`
+is simply `coordinator.last_update_success` (unmodified by `entity.py`), all 51 entities went
+`unavailable` at once, mid-dashboard, seconds before the feeder answered normally again.
+
+This coordinator now tells "the last poll failed" apart from "the feeder is down":
+
+- `_fetch_all` makes the same dozen-ish sequential state/config/schedule/... calls as before,
+  but the whole batch is bounded by one `POLL_TIMEOUT`, not by summing each call's own
+  `api.TIMEOUT`. A single congested endpoint can no longer make one poll cycle balloon toward,
+  or past, `DEFAULT_SCAN_INTERVAL` and pile up against the next scheduled one.
+- On failure, `consecutive_failures` is incremented. Below `CONSECUTIVE_FAILURES_FOR_UNAVAILABLE`
+  *and* as long as a prior good snapshot (`self.data`) exists, `_async_update_data` returns that
+  stale snapshot instead of raising: `last_update_success` stays `True`, every entity keeps
+  showing its last real value, and only `.consecutive_failures`/`.last_error` (read by the
+  disabled-by-default "Feeder reachable" diagnostic binary sensor and by `diagnostics.py`) record
+  that something is off. Three is deliberate, not arbitrary: the starved-server incident this
+  policy exists for saw `GET /state` fail 3 of 5 attempts at a 10s timeout -- failures in ones
+  and twos are this device's ordinary noise floor at a 10s poll interval, not an outage; three in
+  a row is ~30s with *zero* successful contact despite three independent attempts, long enough
+  that "busy" stops being the more likely explanation than "down". For a cat feeder specifically
+  this is the right trade: bowl-fill percentage, Wi-Fi signal, the cached schedule and so on do
+  not go stale in a way that matters over one or two 10s ticks, and showing a slightly-old value
+  is far less disruptive than every entity blanking out and back while someone is looking at the
+  dashboard. `feeding` -- the one field that changes on human timescales, mid-dispense -- is the
+  entity most exposed to staleness here, and it self-corrects on the very next successful poll,
+  same as it always has.
+- At or above the threshold, `_async_update_data` raises `UpdateFailed` exactly as before -- HA's
+  own `DataUpdateCoordinator` then flips `last_update_success` (logging once, at `error`,
+  satisfying the `log-when-unavailable` quality-scale rule for free) and every entity correctly
+  goes `unavailable`, because by this point it is no longer a guess. A repair issue
+  (`feeder_unresponsive`) is also raised at this exact point -- the tolerance window below it has
+  no issue and no user-visible unavailability, so this is the *first* moment the user needs
+  telling, and it is the same moment `entity-unavailable` already made visible in the UI. Every
+  raise past the threshold sets `UpdateFailed.retry_after` to a capped exponential backoff -- a
+  feeder that has been down for minutes does not need polling every `DEFAULT_SCAN_INTERVAL`, and
+  backing off reduces load on whatever eventually restarts it (the device or its network).
+  `async_config_entry_first_refresh` is deliberately exempt from all of the above: with no prior
+  snapshot to fall back on, a failure there is unconditionally raised on the first attempt, which
+  HA turns into `ConfigEntryNotReady` (see `__init__.py`) -- correct, since there is nothing to
+  show either way.
+- Every HTTP call in this module funnels through one `KibbleClient`, which serialises them with
+  its own `asyncio.Lock` (see `api.py`'s module docstring) -- there is only ever one Kibble
+  request in flight against the feeder at a time, whether it originates from this coordinator's
+  poll or from an entity's write (`kibble.feed`, a switch flip, ...); nothing here fans out
+  several requests to the same, or different, endpoints concurrently. Nothing in this module
+  opens a long-lived connection either: every call is a bounded, ordinary request/response,
+  never a stream or a poll held open past its own timeout.
+"""
 
 from __future__ import annotations
 
@@ -13,8 +70,10 @@ from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
 from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.components.media_source import async_resolve_media, is_media_source_id
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -42,9 +101,22 @@ from .const import (
     DEFAULT_RTSP_PORT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    ISSUE_FEEDER_UNRESPONSIVE,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bounds one whole `_fetch_all` batch (a dozen-ish sequential calls), regardless of how many of
+# them there are or what each one's own `api.TIMEOUT` allows individually -- see the module
+# docstring. Comfortably under `DEFAULT_SCAN_INTERVAL` so a stuck cycle aborts, rather than
+# piling up against the next one.
+POLL_TIMEOUT = 8.0
+
+# See the module docstring's reasoning: this is a count of poll cycles, not seconds.
+CONSECUTIVE_FAILURES_FOR_UNAVAILABLE = 3
+
+# Cap on `UpdateFailed.retry_after`'s exponential backoff once the feeder is confirmed down.
+MAX_RETRY_AFTER = 60.0
 
 type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
@@ -157,37 +229,118 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # Which transport last actually carried (or was attempted for) a feed command; the
         # "Control path" diagnostic sensor reads this directly. `None` until the first feed.
         self.control_path: str | None = None
+        # Which platforms actually finished `async_setup_entry` -- see `__init__.py`'s
+        # per-platform forwarding loop. Populated once, after `async_setup_entry` forwards
+        # every platform; `async_unload_entry` only unloads what is in here.
+        self.loaded_platforms: list[Platform] = []
+        # See the module docstring's availability policy.
+        self.consecutive_failures = 0
+        self.last_error: str | None = None
+
+    @property
+    def feeder_reachable(self) -> bool:
+        """True iff the *most recent* poll succeeded outright -- stricter than `.available`
+        (`CoordinatorEntity.available`/`last_update_success`), which stays `True` through the
+        tolerance window described in the module docstring. Backs the disabled-by-default
+        "Feeder reachable" diagnostic binary sensor."""
+        return self.consecutive_failures == 0
 
     async def _async_update_data(self) -> KibbleData:
         try:
-            state = await self.client.state()
-            schedule = await self.client.schedule()
-            config = await self.client.config()
-            cloud = await self.client.cloud()
-            wifi = await self.client.wifi()
-            wifi_scan = tuple(await self.client.wifi_scan())
-            cats = tuple(await self.client.cats())
-            identify = await self.client.identify()
-            review_face = await self.client.review_face()
-            pending_face_count = len(await self.client.pending_faces())
-            clips = tuple(await self.client.clips())
-            feeds = tuple(await self.client.feeds())
-            return KibbleData(
-                state=state,
-                schedule=schedule,
-                config=config,
-                cloud=cloud,
-                wifi=wifi,
-                wifi_scan=wifi_scan,
-                cats=cats,
-                identify=identify,
-                review_face=review_face,
-                pending_face_count=pending_face_count,
-                clips=clips,
-                feeds=feeds,
+            async with asyncio.timeout(POLL_TIMEOUT):
+                data = await self._fetch_all()
+        except (KibbleError, TimeoutError) as err:
+            return self._handle_poll_failure(err)
+        self._handle_poll_success()
+        return data
+
+    async def _fetch_all(self) -> KibbleData:
+        """One full snapshot: every read this integration polls, back-to-back over the one
+        connection `self.client` serialises (see `api.py`). Bounded from the outside by
+        `POLL_TIMEOUT` in `_async_update_data`, not by summing each call's own `api.TIMEOUT`."""
+        state = await self.client.state()
+        schedule = await self.client.schedule()
+        config = await self.client.config()
+        cloud = await self.client.cloud()
+        wifi = await self.client.wifi()
+        wifi_scan = tuple(await self.client.wifi_scan())
+        cats = tuple(await self.client.cats())
+        identify = await self.client.identify()
+        review_face = await self.client.review_face()
+        pending_face_count = len(await self.client.pending_faces())
+        clips = tuple(await self.client.clips())
+        feeds = tuple(await self.client.feeds())
+        return KibbleData(
+            state=state,
+            schedule=schedule,
+            config=config,
+            cloud=cloud,
+            wifi=wifi,
+            wifi_scan=wifi_scan,
+            cats=cats,
+            identify=identify,
+            review_face=review_face,
+            pending_face_count=pending_face_count,
+            clips=clips,
+            feeds=feeds,
+        )
+
+    def _handle_poll_success(self) -> None:
+        if self.consecutive_failures:
+            _LOGGER.debug(
+                "Feeder poll recovered after %s failed attempt(s)", self.consecutive_failures
             )
-        except KibbleError as err:
-            raise UpdateFailed(str(err)) from err
+            self._async_clear_unresponsive_issue()
+        self.consecutive_failures = 0
+        self.last_error = None
+
+    def _handle_poll_failure(self, err: Exception) -> KibbleData:
+        """Below `CONSECUTIVE_FAILURES_FOR_UNAVAILABLE`, with a prior snapshot to fall back on:
+        re-serve it so `last_update_success`/entity availability don't flip for what is, per the
+        module docstring, this device's ordinary noise floor. At or past the threshold, or with
+        no prior snapshot (the very first refresh -- see `async_config_entry_first_refresh`),
+        raise so HA's own coordinator marks entities unavailable for real."""
+        self.consecutive_failures += 1
+        self.last_error = str(err) or repr(err)
+        if self.data is not None and self.consecutive_failures < CONSECUTIVE_FAILURES_FOR_UNAVAILABLE:
+            _LOGGER.warning(
+                "Feeder poll %s/%s failed (%s); showing last-known values while it recovers",
+                self.consecutive_failures,
+                CONSECUTIVE_FAILURES_FOR_UNAVAILABLE - 1,
+                self.last_error,
+            )
+            return self.data
+        if self.data is not None:
+            self._async_create_unresponsive_issue()
+        raise UpdateFailed(self.last_error, retry_after=self._retry_after_seconds()) from err
+
+    def _retry_after_seconds(self) -> float:
+        """Exponential backoff once the feeder is confirmed down (at or past the tolerance
+        threshold), capped at `MAX_RETRY_AFTER` -- polling a device that has not answered in
+        three straight tries every `DEFAULT_SCAN_INTERVAL` regardless just adds load to
+        whatever eventually restarts it."""
+        overage = self.consecutive_failures - CONSECUTIVE_FAILURES_FOR_UNAVAILABLE
+        return min(MAX_RETRY_AFTER, DEFAULT_SCAN_INTERVAL * (2 ** max(overage, 0)))
+
+    def _async_create_unresponsive_issue(self) -> None:
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            f"{ISSUE_FEEDER_UNRESPONSIVE}_{self.entry.entry_id}",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=ISSUE_FEEDER_UNRESPONSIVE,
+            translation_placeholders={
+                "name": self.entry.title,
+                "failures": str(self.consecutive_failures),
+                "error": self.last_error or "",
+            },
+        )
+
+    def _async_clear_unresponsive_issue(self) -> None:
+        ir.async_delete_issue(
+            self.hass, DOMAIN, f"{ISSUE_FEEDER_UNRESPONSIVE}_{self.entry.entry_id}"
+        )
 
     def _ble_feed(
         self, hopper: str, amount: int, feed_id: str | None
@@ -265,9 +418,9 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         amount, so nothing on this path may reach the device before that is resolved and an
         operator has said so."""
         if not self.entry.options.get(CONF_ENABLE_SCHEDULE_WRITES, False):
-            raise HomeAssistantError(
-                "schedule writing is disabled until the time encoding is confirmed — "
-                "see docs/schedule"
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="schedule_writes_disabled",
             )
 
     async def async_schedule_card_add(self, entry_id: str, time: str, amount: int) -> None:
@@ -298,7 +451,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         self._require_schedule_writes_enabled()
         entry = next((e for e in self.data.schedule.entries if e.id == entry_id), None)
         if entry is None:
-            raise HomeAssistantError(f"no schedule entry with id {entry_id!r}")
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="unknown_schedule_entry",
+                translation_placeholders={"entry_id": entry_id},
+            )
         await self.async_schedule_set_enabled(entry_id, not entry.enabled)
 
     async def async_set_cloud(self, enabled: bool) -> None:

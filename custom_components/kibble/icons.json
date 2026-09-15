@@ -5,6 +5,10 @@
         "default": "mdi:bowl-mix-outline",
         "state": { "on": "mdi:bowl-mix" }
       },
+      "reachable": {
+        "default": "mdi:lan-connect",
+        "state": { "off": "mdi:lan-disconnect" }
+      },
       "time_display": { "default": "mdi:clock-outline" },
       "camera": { "default": "mdi:cctv" },
       "move_detection": { "default": "mdi:run" },

@@ -13,12 +13,17 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import KibbleError
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+from .errors import raise_agent_action_failed
+
+# Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
+
 
 SWITCHES: tuple[SwitchEntityDescription, ...] = (
     SwitchEntityDescription(
@@ -78,9 +83,7 @@ class KibbleSettingSwitch(KibbleEntity, SwitchEntity):
         try:
             await self.coordinator.async_set_config(self.entity_description.key, value)
         except KibbleError as err:
-            raise HomeAssistantError(
-                f"Set {self.entity_description.key} failed: {err}"
-            ) from err
+            raise_agent_action_failed(f"Set {self.entity_description.key}", err)
 
 
 class KibbleCloudSwitch(KibbleEntity, SwitchEntity):
@@ -119,4 +122,4 @@ class KibbleCloudSwitch(KibbleEntity, SwitchEntity):
         try:
             await self.coordinator.async_set_cloud(enabled)
         except KibbleError as err:
-            raise HomeAssistantError(f"Set Petkit cloud failed: {err}") from err
+            raise_agent_action_failed("Set Petkit cloud", err)

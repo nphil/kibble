@@ -23,6 +23,9 @@
       "feeding": {
         "name": "Feeding"
       },
+      "reachable": {
+        "name": "Feeder reachable"
+      },
       "time_display": {
         "name": "Video timestamp overlay"
       },
@@ -555,6 +558,32 @@
     "error": {
       "not_rtsp": "Must be an rtsp:// URL.",
       "not_mac": "Must be a MAC address, e.g. AA:BB:CC:DD:EE:FF."
+    }
+  },
+  "exceptions": {
+    "agent_action_failed": {
+      "message": "{action} failed: {error}"
+    },
+    "speaker_busy": {
+      "message": "The feeder's speaker is already in use (another clip, or the vendor app): {error}"
+    },
+    "unknown_device": {
+      "message": "{device_id} is not a Kibble feeder."
+    },
+    "schedule_writes_disabled": {
+      "message": "Schedule writing is disabled until the time encoding is confirmed \u2014 see docs/schedule."
+    },
+    "unknown_schedule_entry": {
+      "message": "No schedule entry with ID {entry_id}."
+    },
+    "no_pending_face": {
+      "message": "No pending face to label right now."
+    }
+  },
+  "issues": {
+    "feeder_unresponsive": {
+      "title": "{name} is not responding",
+      "description": "The feeder has not answered {failures} polls in a row (most recent error: {error}). Entities keep showing their last known values, not live ones, until it recovers.\n\nCheck that the feeder is powered on and connected to Wi-Fi, and that its `kibbled` agent is running. This resolves itself \u2014 and this issue clears \u2014 as soon as a poll succeeds again."
     }
   }
 }

@@ -23,7 +23,6 @@ from homeassistant.components.number import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -31,6 +30,11 @@ from .api import KibbleError
 from .const import HOPPER_1, HOPPER_2, HOPPER_BOTH, MAX_AMOUNT, MIN_AMOUNT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+from .errors import raise_agent_action_failed
+
+# Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
+# module docstring and the parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -123,4 +127,4 @@ class KibbleVolumeNumber(KibbleEntity, NumberEntity):
         try:
             await self.coordinator.async_set_config("volume", int(value))
         except KibbleError as err:
-            raise HomeAssistantError(f"Set volume failed: {err}") from err
+            raise_agent_action_failed("Set volume", err)

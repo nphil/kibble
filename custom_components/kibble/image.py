@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
 
 from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
-from homeassistant.components.image import ImageEntity
+from homeassistant.components.image import ImageEntity, ImageEntityDescription
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -21,6 +22,23 @@ from .entity import KibbleEntity
 
 _LOGGER = logging.getLogger(__name__)
 
+# Read-only, coordinator-backed. See coordinator.py's module docstring and the
+# parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class KibbleDishImageDescription(ImageEntityDescription):
+    """One half of the before/after dish-snapshot pair."""
+
+    side: str
+
+
+DISH_IMAGES: tuple[KibbleDishImageDescription, ...] = (
+    KibbleDishImageDescription(key="dish_before", translation_key="dish_before", side="before"),
+    KibbleDishImageDescription(key="dish_after", translation_key="dish_after", side="after"),
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -30,8 +48,7 @@ async def async_setup_entry(
     async_add_entities(
         [
             KibblePendingFaceImage(hass, entry),
-            KibbleDishImage(hass, entry, "before"),
-            KibbleDishImage(hass, entry, "after"),
+            *(KibbleDishImage(hass, entry, description) for description in DISH_IMAGES),
         ]
     )
 
@@ -147,16 +164,22 @@ class KibbleDishImage(KibbleEntity, ImageEntity):
     it on demand via `_h264_keyframe_to_jpeg` rather than `ImageEntity`'s own built-in URL
     fetch, which requires the URL to directly return a recognized image content type."""
 
+    entity_description: KibbleDishImageDescription
     _attr_content_type = "image/jpeg"
 
-    def __init__(self, hass: HomeAssistant, entry: KibbleConfigEntry, side: str) -> None:
-        KibbleEntity.__init__(self, entry.runtime_data, f"dish_{side}")
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: KibbleConfigEntry,
+        description: KibbleDishImageDescription,
+    ) -> None:
+        KibbleEntity.__init__(self, entry.runtime_data, description.key)
         ImageEntity.__init__(self, hass)
+        self.entity_description = description
         self._entry = entry
-        self._side = side
-        self._attr_translation_key = f"dish_{side}"
+        self._side = description.side
         self._name, self._attr_image_last_updated = _latest_dish_snapshot(
-            entry.runtime_data.data.feeds, side
+            entry.runtime_data.data.feeds, description.side
         )
         self._jpeg: bytes | None = None
 

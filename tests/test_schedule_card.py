@@ -14,7 +14,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from kibble.api import ScheduleEntry
 from kibble.const import CONF_ENABLE_SCHEDULE_WRITES
 from kibble.coordinator import KibbleCoordinator
@@ -108,8 +108,9 @@ def test_schedule_writes_gate_refuses_unless_explicitly_enabled() -> None:
     explicit `True` lets a schedule-card write path proceed."""
     for options in ({}, {CONF_ENABLE_SCHEDULE_WRITES: False}):
         fake_self = _fake_coordinator(options)
-        with pytest.raises(HomeAssistantError, match="schedule writing is disabled"):
+        with pytest.raises(ServiceValidationError) as excinfo:
             KibbleCoordinator._require_schedule_writes_enabled(fake_self)
+        assert excinfo.value.translation_key == "schedule_writes_disabled"
 
     enabled_self = _fake_coordinator({CONF_ENABLE_SCHEDULE_WRITES: True})
     KibbleCoordinator._require_schedule_writes_enabled(enabled_self)  # must not raise

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 import voluptuous as vol
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -64,6 +65,9 @@ from .const import (
     SERVICE_WIFI_CONNECT,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
+from .errors import raise_agent_action_failed, raise_speaker_busy
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -236,8 +240,49 @@ def _entry_payload(entry: dict) -> dict:
     return payload
 
 
+async def _async_forward_platforms_isolated(
+    hass: HomeAssistant, entry: KibbleConfigEntry, platforms: list[Platform]
+) -> list[Platform]:
+    """Forwards each platform in `platforms` on its own, isolated `async_forward_entry_setups`
+    call, returning whichever ones actually loaded.
+
+    One call per platform -- not one call for the whole list -- deliberately. HA's own
+    implementation batches every platform passed to a single call under one
+    `asyncio.gather(...)` with no `return_exceptions=True`; a single-element list is unaffected
+    by (and just as efficient as) that batching, but it means one bad platform (a bad import, a
+    bug in its `async_setup_entry`) fails only that call, not a `gather` shared with every other
+    platform. This is the isolation defect #2 (a removed `UnitOfSignalStrength` import taking
+    down all 51 entities) needed and did not have. A platform that fails is logged and skipped;
+    the rest still load -- see `docs/30-quality-scale-audit.md` for exactly what is, and is
+    not, achievable here.
+    """
+    loaded: list[Platform] = []
+    for platform in platforms:
+        try:
+            await hass.config_entries.async_forward_entry_setups(entry, [platform])
+        except Exception:  # noqa: BLE001 -- deliberately broad, see docstring
+            _LOGGER.exception(
+                "Setting up the %s platform failed; other Kibble platforms still loaded",
+                platform,
+            )
+        else:
+            loaded.append(platform)
+    return loaded
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
-    """Set up one feeder."""
+    """Set up one feeder.
+
+    Platform setup is isolated per-platform by `_async_forward_platforms_isolated` (see its own
+    docstring). If every platform fails there is nothing this entry usefully provides, so that
+    case still fails setup outright.
+
+    The coordinator's own first refresh, above, is deliberately NOT isolated the same way: with
+    no data fetched yet, no platform has anything to show, so splitting that one failure nine
+    ways would not add any real isolation -- it would just spread one "nothing works yet"
+    outcome across nine try/except blocks. Its failure already raises `ConfigEntryNotReady`
+    (via `async_config_entry_first_refresh`), which is the correct, standard signal either way.
+    """
     client = KibbleClient(
         async_get_clientsession(hass), entry.data[CONF_HOST], entry.data[CONF_PORT]
     )
@@ -245,24 +290,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    loaded = await _async_forward_platforms_isolated(hass, entry, PLATFORMS)
+    coordinator.loaded_platforms = loaded
+    if not loaded:
+        raise ConfigEntryNotReady("No Kibble platform could be set up; see the log above")
+
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _async_register_services(hass)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    return await hass.config_entries.async_unload_platforms(
+        entry, entry.runtime_data.loaded_platforms
+    )
 
 
 def _coordinator_for_device(hass: HomeAssistant, device_id: str) -> KibbleCoordinator:
     """Resolve a service call's target device to its coordinator."""
+    registry = er.async_get(hass)
     for entry in hass.config_entries.async_entries(DOMAIN):
-        registry = er.async_get(hass)
         entries = er.async_entries_for_config_entry(registry, entry.entry_id)
         if any(e.device_id == device_id for e in entries):
             return entry.runtime_data
-    raise HomeAssistantError(f"{device_id} is not a Kibble feeder")
+    raise ServiceValidationError(
+        translation_domain=DOMAIN,
+        translation_key="unknown_device",
+        translation_placeholders={"device_id": device_id},
+    )
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
@@ -280,14 +335,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
             # either transport (KibbleError from Wi-Fi, or the BLE fallback's own exception
             # type from `custom_components/kibble/ble.py`) -- see `async_feed_with_fallback`.
             # The cause is preserved (`from err`) so the specific failure is still in the log.
-            raise HomeAssistantError(f"Feed failed: {err}") from err
+            raise_agent_action_failed("Feed", err)
 
     async def handle_cancel(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_cancel_feed()
         except KibbleError as err:
-            raise HomeAssistantError(f"Cancel failed: {err}") from err
+            raise_agent_action_failed("Cancel", err)
 
     async def handle_schedule_set(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -295,7 +350,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         try:
             await coordinator.async_schedule_set(entries)
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule replace failed: {err}") from err
+            raise_agent_action_failed("Schedule replace", err)
 
     async def handle_schedule_add(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -307,14 +362,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_ENABLED],
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule add failed: {err}") from err
+            raise_agent_action_failed("Schedule add", err)
 
     async def handle_schedule_remove(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_schedule_remove(call.data[ATTR_ENTRY_ID])
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule remove failed: {err}") from err
+            raise_agent_action_failed("Schedule remove", err)
 
     async def handle_schedule_set_enabled(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -323,7 +378,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_ENTRY_ID], call.data[ATTR_ENABLED]
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule set-enabled failed: {err}") from err
+            raise_agent_action_failed("Schedule set-enabled", err)
 
     async def handle_schedule_card_add(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -333,7 +388,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_ID], time_str, call.data[ATTR_AMOUNT]
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule card add failed: {err}") from err
+            raise_agent_action_failed("Schedule card add", err)
 
     async def handle_schedule_card_edit(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -343,21 +398,21 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_ID], time_str, call.data[ATTR_AMOUNT]
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule card edit failed: {err}") from err
+            raise_agent_action_failed("Schedule card edit", err)
 
     async def handle_schedule_card_remove(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_schedule_card_remove(call.data[ATTR_ID])
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule card remove failed: {err}") from err
+            raise_agent_action_failed("Schedule card remove", err)
 
     async def handle_schedule_card_toggle(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_schedule_card_toggle(call.data[ATTR_ID])
         except KibbleError as err:
-            raise HomeAssistantError(f"Schedule card toggle failed: {err}") from err
+            raise_agent_action_failed("Schedule card toggle", err)
 
     async def handle_wifi_connect(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -366,28 +421,28 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_SSID], call.data.get(ATTR_PASSWORD)
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Wi-Fi connect failed: {err}") from err
+            raise_agent_action_failed("Wi-Fi connect", err)
 
     async def handle_label_face(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_label_face(call.data[ATTR_CROP_ID], call.data[ATTR_CAT])
         except KibbleError as err:
-            raise HomeAssistantError(f"Label face failed: {err}") from err
+            raise_agent_action_failed("Label face", err)
 
     async def handle_add_cat(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_add_cat(call.data[ATTR_CAT_NAME])
         except KibbleError as err:
-            raise HomeAssistantError(f"Add cat failed: {err}") from err
+            raise_agent_action_failed("Add cat", err)
 
     async def handle_identify(call: ServiceCall) -> ServiceResponse:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             result = await coordinator.async_identify_now()
         except KibbleError as err:
-            raise HomeAssistantError(f"Identify failed: {err}") from err
+            raise_agent_action_failed("Identify", err)
         return {
             "cat": result.cat,
             "score": result.score,
@@ -407,7 +462,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_CLIP_NAME], call.data[ATTR_MEDIA_CONTENT_ID]
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Save clip failed: {err}") from err
+            raise_agent_action_failed("Save clip", err)
 
     async def handle_record_clip(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -416,16 +471,16 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 call.data[ATTR_CLIP_NAME], call.data[ATTR_SECONDS]
             )
         except KibbleError as err:
-            raise HomeAssistantError(f"Record clip failed: {err}") from err
+            raise_agent_action_failed("Record clip", err)
 
     async def handle_play_clip(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_play_clip(call.data[ATTR_CLIP_NAME])
         except KibbleSpeakerBusyError as err:
-            raise HomeAssistantError(f"The feeder's speaker is already in use: {err}") from err
+            raise_speaker_busy(err)
         except KibbleError as err:
-            raise HomeAssistantError(f"Play clip failed: {err}") from err
+            raise_agent_action_failed("Play clip", err)
 
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)

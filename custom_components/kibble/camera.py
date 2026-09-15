@@ -22,6 +22,11 @@ from .const import CONF_HOST, CONF_STREAM_URL, DEFAULT_RTSP_PATH, DEFAULT_RTSP_P
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 
+# One coordinator-backed entity; the stream itself is Scrypted's/the device's RTSP, entirely
+# outside HA's own update cycle. See coordinator.py's module docstring and the
+# parallel-updates quality-scale rule.
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
