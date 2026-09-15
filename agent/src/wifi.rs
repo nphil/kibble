@@ -764,6 +764,7 @@ fn wait_for_ctrl_socket() {
 /// `timeout`/`poll_interval` are parameters for the same reason `connect_with_timeout`'s are:
 /// so tests can exercise this in milliseconds instead of seconds.
 fn boot_reapply(timeout: Duration, poll_interval: Duration) {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let desired = load();
     let Some(ssid) = desired.ssid.clone() else { return };
     let mut runner = RealRunner;
@@ -813,6 +814,7 @@ fn reconcile_once(
     timeout: Duration,
     poll_interval: Duration,
 ) {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let desired = load();
     let Some(ssid) = desired.ssid.clone() else {
         *last_target = None;
