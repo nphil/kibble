@@ -41,7 +41,8 @@ be recovered, that is stated rather than guessed — read those gaps as gaps.
 - [15-settings-write.md](15-settings-write.md) — how the ~40 device settings are written, with byte offsets
 - [16-schedule.md](16-schedule.md) — the feed schedule: write protocol, and why there is no read-back
 - [12-ai.md](12-ai.md) — the detection/identification pipeline and its models
-- [13-npu-probe.md](13-npu-probe.md) — can a second process use the NPU? (inconclusive; see the review note)
+- [18-npu-confirmed.md](18-npu-confirmed.md) — **NPU: a second process can run inference** (settles it: yes, 1.77 ms per face embedding)
+- [13-npu-probe.md](13-npu-probe.md) — the earlier probe that got it wrong, kept for the method
 
 **Results and design**
 - [14-feed-test.md](14-feed-test.md) — the proof: a local message that dispenses food
