@@ -64,6 +64,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adts;
+use crate::bus;
 use crate::ring::{self, TailCursor};
 
 /// Where `tools/aacenc/build.sh` deploys its output, alongside `kibbled` itself.
@@ -133,6 +134,11 @@ pub struct SpeakerOwner(AtomicBool);
 
 impl SpeakerOwner {
     pub fn new() -> Arc<Self> {
+        // Best-effort, non-fatal: clears a guard flag a previous kibbled crash may have left
+        // stuck at `1` (docs/23-audio-codec.md §17.4 -- nothing else ever clears it, and
+        // stopping when nothing is running is itself a harmless, logged no-op on the vendor
+        // side). Runs exactly once, here, so `main.rs` doesn't need its own startup hook.
+        AudioOutThread::clear_stale_guard_flag();
         Arc::new(Self(AtomicBool::new(false)))
     }
 
@@ -157,11 +163,56 @@ impl Drop for OwnerGuard {
     }
 }
 
+/// RAII guard for the vendor's `audio_out_thread` lifecycle (docs/23-audio-codec.md §17): sends
+/// `speak_start` on acquisition and `speak_stop` on `Drop`, unconditionally, regardless of which
+/// thread drops it or whether playback succeeded. `speak_stop` does not itself stop the vendor
+/// thread -- it exits on its own idle timeout regardless, ~5s (§17.5) -- but is required to keep
+/// its guard flag truthful for the *next* `speak_start`: kibbled's own, or (architecture-
+/// consistent, not independently proven -- §17.6) a real Petkit-app pet-call talkback sharing the
+/// same handler. Every construction path pairs with exactly one `Drop`; never sent standalone.
+struct AudioOutThread;
+
+/// `src` we stamp on `speak_start`/`speak_stop` -- neither handler reads it (disassembly-
+/// confirmed, §17.1/§17.4), so this only matters for matching the rest of the project's existing
+/// "we speak on ctrl's behalf" convention (`main.rs`'s own `SRC_AS_CTRL`).
+const BUS_SRC: u16 = bus::Peer::Ctrl as u16;
+
+impl AudioOutThread {
+    /// Sends `speak_start` (msg `0xa`, empty payload -- §17.7). Idempotent server-side: §17.1
+    /// disassembled both of `speak_start`'s "already started" return paths, both a bare `-1`
+    /// with zero side effects, so calling this while the thread is already running is harmless.
+    fn start() -> Result<Self, SpeakError> {
+        send(bus::msg::SPEAK_START)?;
+        Ok(Self)
+    }
+
+    fn clear_stale_guard_flag() {
+        if let Err(e) = send(bus::msg::SPEAK_STOP) {
+            eprintln!("kibbled: startup speak_stop: {e}");
+        }
+    }
+}
+
+impl Drop for AudioOutThread {
+    fn drop(&mut self) {
+        if let Err(e) = send(bus::msg::SPEAK_STOP) {
+            eprintln!("kibbled: speak_stop on drop: {e}");
+        }
+    }
+}
+
+fn send(msg_id: u16) -> Result<(), SpeakError> {
+    bus::Sender::open(bus::Peer::Media, BUS_SRC)
+        .and_then(|s| s.send(msg_id, &[]))
+        .map_err(|e| SpeakError::Bus(e.to_string()))
+}
+
 /// Errors from a speaker-write attempt, surfaced to HTTP callers via `main.rs`.
 #[derive(Debug)]
 pub enum SpeakError {
     Encoder(String),
     Ring(String),
+    Bus(String),
 }
 
 impl std::fmt::Display for SpeakError {
@@ -169,6 +220,7 @@ impl std::fmt::Display for SpeakError {
         match self {
             SpeakError::Encoder(e) => write!(f, "encoder: {e}"),
             SpeakError::Ring(e) => write!(f, "ring write: {e}"),
+            SpeakError::Bus(e) => write!(f, "audio_out_thread: {e}"),
         }
     }
 }
@@ -222,6 +274,8 @@ pub fn play_encoded(
     tail: &Arc<TailCursor>,
     _owner: &OwnerGuard,
 ) -> Result<PlaybackStats, SpeakError> {
+    // Held until this function returns; `Drop` sends `speak_stop` regardless of how we exit.
+    let _audio_thread = AudioOutThread::start()?;
     let mut frames = Vec::new();
     let mut off = 0;
     while let Some(header) = adts::parse(&adts_bytes[off..]) {
@@ -256,10 +310,13 @@ pub struct LiveSession {
     child: Child,
     drainer: Option<thread::JoinHandle<Result<PlaybackStats, SpeakError>>>,
     _owner: OwnerGuard,
+    // Held for the whole session; `Drop` sends `speak_stop` when this session ends, however.
+    _audio_thread: AudioOutThread,
 }
 
 impl LiveSession {
     pub fn start(tail: Arc<TailCursor>, owner: OwnerGuard) -> Result<Self, SpeakError> {
+        let audio_thread = AudioOutThread::start()?;
         let ring_file = open_ring_for_write()?;
         let mut child = spawn_encoder()?;
         let stdin = child.stdin.take().expect("piped stdin");
@@ -283,7 +340,13 @@ impl LiveSession {
                 }
             }
         });
-        Ok(Self { stdin: Some(stdin), child, drainer: Some(drainer), _owner: owner })
+        Ok(Self {
+            stdin: Some(stdin),
+            child,
+            drainer: Some(drainer),
+            _owner: owner,
+            _audio_thread: audio_thread,
+        })
     }
 
     /// Feeds one arbitrary-length slice of 16kHz/mono PCM (`backchannel.rs` has already decoded
