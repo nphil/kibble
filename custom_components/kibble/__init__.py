@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import voluptuous as vol
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -12,6 +12,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import KibbleClient, KibbleError
 from .const import (
     ATTR_AMOUNT,
+    ATTR_CAT,
+    ATTR_CAT_NAME,
+    ATTR_CROP_ID,
     ATTR_ENABLED,
     ATTR_ENTRIES,
     ATTR_ENTRY_ID,
@@ -32,8 +35,11 @@ from .const import (
     MAX_SCHEDULE_ENTRIES,
     MIN_AMOUNT,
     MIN_SCHEDULE_AMOUNT,
+    SERVICE_ADD_CAT,
     SERVICE_CANCEL_FEED,
     SERVICE_FEED,
+    SERVICE_IDENTIFY,
+    SERVICE_LABEL_FACE,
     SERVICE_SCHEDULE_ADD,
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
@@ -46,6 +52,7 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.CAMERA,
+    Platform.IMAGE,
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
@@ -120,6 +127,23 @@ WIFI_CONNECT_SCHEMA = vol.Schema(
         vol.Optional(ATTR_PASSWORD): cv.string,
     }
 )
+
+LABEL_FACE_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CROP_ID): cv.string,
+        vol.Required(ATTR_CAT): cv.string,
+    }
+)
+
+ADD_CAT_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CAT_NAME): cv.string,
+    }
+)
+
+IDENTIFY_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
 
 
 def _entry_payload(entry: dict) -> dict:
@@ -235,6 +259,38 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise HomeAssistantError(f"Wi-Fi connect failed: {err}") from err
 
+    async def handle_label_face(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_label_face(call.data[ATTR_CROP_ID], call.data[ATTR_CAT])
+        except KibbleError as err:
+            raise HomeAssistantError(f"Label face failed: {err}") from err
+
+    async def handle_add_cat(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_add_cat(call.data[ATTR_CAT_NAME])
+        except KibbleError as err:
+            raise HomeAssistantError(f"Add cat failed: {err}") from err
+
+    async def handle_identify(call: ServiceCall) -> ServiceResponse:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            result = await coordinator.async_identify_now()
+        except KibbleError as err:
+            raise HomeAssistantError(f"Identify failed: {err}") from err
+        return {
+            "cat": result.cat,
+            "score": result.score,
+            "second_best": (
+                {"cat": result.second_best.cat, "score": result.second_best.score}
+                if result.second_best
+                else None
+            ),
+            "crop": result.crop,
+            "source": result.source,
+        }
+
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
     hass.services.async_register(
@@ -254,6 +310,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_WIFI_CONNECT, handle_wifi_connect, WIFI_CONNECT_SCHEMA
+    )
+    hass.services.async_register(DOMAIN, SERVICE_LABEL_FACE, handle_label_face, LABEL_FACE_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_ADD_CAT, handle_add_cat, ADD_CAT_SCHEMA)
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_IDENTIFY,
+        handle_identify,
+        IDENTIFY_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
 

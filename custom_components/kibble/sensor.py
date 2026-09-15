@@ -15,10 +15,11 @@ from homeassistant.components.sensor import (
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfSignalStrength, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .api import CloudState, FeederState
 from .ble_fallback import CONTROL_PATHS
-from .coordinator import KibbleConfigEntry
+from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 
 
@@ -188,6 +189,9 @@ async def async_setup_entry(
     entities.append(KibbleControlPathSensor(coordinator))
     entities.append(KibbleWifiNetworkSensor(coordinator))
     entities.append(KibbleWifiSignalSensor(coordinator))
+    entities.append(KibbleLastSeenPetSensor(coordinator))
+    entities.append(KibbleIdentificationScoreSensor(coordinator))
+    entities.append(KibblePendingFacesSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -358,3 +362,72 @@ class KibbleWifiSignalSensor(KibbleEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         return self.coordinator.data.wifi.signal_dbm
+
+
+class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
+    """Kibble's own frozen-embedding classifier's most recent opinion (`GET /identify`) --
+    state is the cat's name, the literal `"unknown"` if the classifier ran but wasn't
+    confident, or unavailable if nothing has ever been captured. `source` (an attribute)
+    distinguishes a live classifier guess from ground truth carried over from the most
+    recently labelled crop once the review queue is empty. `docs/27-cat-id.md` documents
+    measured accuracy and the cold-start behaviour this can show with very little labelled
+    data -- treat a low-sample-count identification as a guess, not a fact."""
+
+    _attr_translation_key = "last_seen_pet"
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "last_seen_pet")
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.data.identify.cat
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        result = self.coordinator.data.identify
+        attrs: dict[str, Any] = {}
+        if result.source is not None:
+            attrs["source"] = result.source
+        if result.score is not None:
+            attrs["score"] = result.score
+        if result.second_best is not None:
+            attrs["second_best_cat"] = result.second_best.cat
+            attrs["second_best_score"] = result.second_best.score
+        if result.ts is not None:
+            attrs["last_identified"] = dt_util.utc_from_timestamp(result.ts).isoformat()
+        return attrs
+
+
+class KibbleIdentificationScoreSensor(KibbleEntity, SensorEntity):
+    """The raw cosine-similarity score behind `last_seen_pet`'s current identification --
+    troubleshooting/tuning only (e.g. seeing how close a borderline call was), disabled by
+    default per house rule 4."""
+
+    _attr_translation_key = "identification_score"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "identification_score")
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.data.identify.score
+
+
+class KibblePendingFacesSensor(KibbleEntity, SensorEntity):
+    """How many captured face crops are still awaiting a human label -- diagnostic (house rule
+    4: disabled by default), not something Nitin needs to watch routinely."""
+
+    _attr_translation_key = "pending_faces"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "pending_faces")
+
+    @property
+    def native_value(self) -> int:
+        return self.coordinator.data.pending_face_count

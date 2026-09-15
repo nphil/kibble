@@ -70,6 +70,9 @@
       },
       "smart_frame": {
         "name": "Auto-framing"
+      },
+      "cat_present": {
+        "name": "{cat_name} present"
       }
     },
     "button": {
@@ -84,6 +87,11 @@
       },
       "cancel_feed": {
         "name": "Cancel feed"
+      }
+    },
+    "image": {
+      "pending_face": {
+        "name": "Pending face"
       }
     },
     "number": {
@@ -185,6 +193,15 @@
       },
       "wifi_signal": {
         "name": "Wi-Fi signal"
+      },
+      "last_seen_pet": {
+        "name": "Last seen pet"
+      },
+      "identification_score": {
+        "name": "Identification score"
+      },
+      "pending_faces": {
+        "name": "Pending faces"
       }
     },
     "switch": {
@@ -204,6 +221,9 @@
     "select": {
       "wifi": {
         "name": "Wi-Fi network"
+      },
+      "label_face": {
+        "name": "Label face"
       }
     }
   },
@@ -327,6 +347,48 @@
         "password": {
           "name": "Password",
           "description": "Leave empty to reconnect to a network Kibble already has a saved password for."
+        }
+      }
+    },
+    "label_face": {
+      "name": "Label face",
+      "description": "Move a pending face crop into a cat's permanent storage and train the identifier on it.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to label a crop on."
+        },
+        "crop_id": {
+          "name": "Crop ID",
+          "description": "The pending crop's filename, from image.cat_feeder_pending_face's attributes or GET /faces/pending."
+        },
+        "cat": {
+          "name": "Cat",
+          "description": "The cat's name, or \"other\"/\"not_a_cat\" to skip training on this crop."
+        }
+      }
+    },
+    "add_cat": {
+      "name": "Add cat",
+      "description": "Pre-register a cat with zero samples, so it appears as a label option before its first crop is labelled.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to add a cat to."
+        },
+        "name": {
+          "name": "Name",
+          "description": "The new cat's name."
+        }
+      }
+    },
+    "identify": {
+      "name": "Identify now",
+      "description": "Force an immediate identification of the newest pending crop and refresh the last-seen-pet sensor.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to identify."
         }
       }
     }

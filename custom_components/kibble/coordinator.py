@@ -12,7 +12,18 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import CloudState, FeederState, KibbleClient, KibbleError, ScheduleState, WifiNetwork, WifiState
+from .api import (
+    CatInfo,
+    CloudState,
+    FeederState,
+    IdentifyResult,
+    KibbleClient,
+    KibbleError,
+    ReviewFace,
+    ScheduleState,
+    WifiNetwork,
+    WifiState,
+)
 from .ble_fallback import async_feed_with_fallback
 from .const import CONF_BLE_ADDRESS, DEFAULT_SCAN_INTERVAL, DOMAIN
 
@@ -24,8 +35,10 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 @dataclass(frozen=True, slots=True)
 class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
-    device-settings snapshot, the Petkit-cloud kill switch's status, and the current Wi-Fi
-    association plus a fresh scan (`agent/src/wifi.rs`)."""
+    device-settings snapshot, the Petkit-cloud kill switch's status, the current Wi-Fi
+    association plus a fresh scan (`agent/src/wifi.rs`), every enrolled cat, the classifier's
+    current identification, and the crop the pending-face image entity is showing
+    (`agent/src/faces.rs`'s `Gallery`/`review_target`/`identify_target`)."""
 
     state: FeederState
     schedule: ScheduleState
@@ -33,6 +46,10 @@ class KibbleData:
     cloud: CloudState
     wifi: WifiState
     wifi_scan: tuple[WifiNetwork, ...]
+    cats: tuple[CatInfo, ...]
+    identify: IdentifyResult
+    review_face: ReviewFace
+    pending_face_count: int
 
 
 class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
@@ -62,6 +79,10 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             cloud = await self.client.cloud()
             wifi = await self.client.wifi()
             wifi_scan = tuple(await self.client.wifi_scan())
+            cats = tuple(await self.client.cats())
+            identify = await self.client.identify()
+            review_face = await self.client.review_face()
+            pending_face_count = len(await self.client.pending_faces())
             return KibbleData(
                 state=state,
                 schedule=schedule,
@@ -69,6 +90,10 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 cloud=cloud,
                 wifi=wifi,
                 wifi_scan=wifi_scan,
+                cats=cats,
+                identify=identify,
+                review_face=review_face,
+                pending_face_count=pending_face_count,
             )
         except KibbleError as err:
             raise UpdateFailed(str(err)) from err
@@ -158,3 +183,23 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     async def async_wifi_forget(self, ssid: str) -> None:
         await self.client.wifi_forget(ssid)
         await self.async_request_refresh()
+
+    async def async_label_face(self, crop_id: str, cat: str) -> None:
+        await self.client.label_face(crop_id, cat)
+        await self.async_request_refresh()
+
+    async def async_unlabel_face(self, crop_id: str, cat: str) -> None:
+        await self.client.unlabel_face(crop_id, cat)
+        await self.async_request_refresh()
+
+    async def async_add_cat(self, name: str) -> None:
+        await self.client.add_cat(name)
+        await self.async_request_refresh()
+
+    async def async_identify_now(self) -> IdentifyResult:
+        """Force an immediate `GET /identify` (bypassing the poll cache) and refresh so the
+        `last_seen_pet`/presence entities reflect it right away. Returns the result for the
+        `kibble.identify` action's response data."""
+        result = await self.client.identify()
+        await self.async_request_refresh()
+        return result
