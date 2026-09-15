@@ -647,3 +647,107 @@ of the encoder, on-device execution of the encoder, live RTSP ffprobe/ffmpeg dec
 track, and live telnet read-back of writer output). The one gap -- real audible playback through
 the vendor's speaker -- is narrowed to a single, precisely-located, unrecovered detail: how a
 writer announces new data via registry slot 7, which this session chose not to guess at live.
+
+---
+
+# Registry slot 7 decoded, implemented, tested: byte-correct, still not audible
+
+Author: AudioAnnounce (successor to AudioFinish). Device 192.168.4.85, telnet only, continuous
+read-only sampler (`/tmp/slot7mon`, structurally read-only: `O_RDONLY`+`PROT_READ` mmap only, no
+semaphore/AX_AO/IPC call anywhere in its source) armed *before* requesting each of two real app
+talkbacks. All findings below are from those two live captures plus one live write test, not
+inference.
+
+## 13.2 The `auido-out` slot-7 announce formula, proven (not guessed)
+
+A 120s clean capture (524 raw / 283 deduplicated `chan=2` records -- second independent sample of
+the vendor's own duplicate-write defect from `docs`'s earlier session: 241 pairs + 42 singles, zero
+triples, upgrading it from "intermittent" to confirmed-usual) pinned slot 7's real-time behavior:
+
+- Only 2 of the slot's 7 trailer fields ever move (relative offset `0x14` and `0x18`); the name
+  field and offsets `0x10`/`0x1c`(=1024=`DATA_START`, constant)/`0x20`/`0x24`/`0x28` never changed
+  across 300 real transitions.
+- Both fields update **once per deduplicated frame, never once per raw record**: the raw-record
+  count between consecutive slot-7 updates was *always even* (histogram 0,2,4,6,8,10 -- never
+  odd) across 300 samples, and updates land ~62.5ms apart on average, matching the real 64ms AAC
+  frame period rather than the raw record rate. `SndFrm` increments by exactly 1 on 293/299
+  consecutive slot-7-driven ticks -- essentially one `AX_AO_SendFrame` per unique frame.
+- **Offset `0x14` = the announced record's own global ring sequence number**: for every one of 292
+  real transitions, the new value exactly equals some real `chan=2` record's own `seq` field --
+  292/292, zero mismatches, against ~1700 distinct candidate values (probability of coincidence
+  ~0). Not a correlation -- an exact match.
+- **Offset `0x18`**: ruled out as a monotonic-microsecond clock by direct arithmetic (a real such
+  field's total delta across a session must equal real elapsed time regardless of sampling gaps;
+  this capture's total delta was 2.11s-worth against a real 120.1s span, 57x short). Consistent
+  instead with the record's own ring byte offset: always inside `[DATA_START, RING_LEN)`, never
+  decreased, and moved 50-1200x slower than the combined multi-channel ring position sampled by
+  this project's own poller over the same span -- the signature of a cursor tracking only the
+  sparse audio-out sub-stream, not every channel. Not byte-exact provable from this capture (the
+  sampler didn't log each `chan=2` record's own ring offset, only its header fields) -- a one-line
+  fix, already applied to the sampler source for a future session.
+
+## 13.3 Implemented, deployed, tested live: byte-correct writes, still silent
+
+`audioout::announce_audio_out` (new in `agent/src/audioout.rs`) writes exactly 8 bytes -- one
+`pwrite`, not two -- covering slot 7's relative `0x14..0x1c`, immediately after (never before,
+never speculatively) each successful ring-record write: `0x14 = target.global_seq + 1` (the exact
+value `build_record` already put in the record's own header), `0x18 = target.offset as u32` (the
+exact ring position that record now lives at). Every other byte in the 44-byte slot is left
+untouched. 236 unit tests pass (2 new, verifying the exact 8-byte placement and that the announced
+values match `build_record`'s own header fields byte-for-byte).
+
+Deployed live (backup `kibbled.pre-announce`, md5 `f862cc2e52cb14aacb461027c82e3788`, verified
+identical to the running binary before swapping; new binary md5 `4ba7a8a7014930be8818b0d31d66d2d2`;
+supervisor-relaunched PID confirmed running that exact md5 via `/proc/<pid>/exe`). Full health gate
+before and after (per this project's standing rule): `media`/`agora`/`cloud`/`ctrl`/`watchdog` all
+continuous uptime, mic `AI` `GetFrm`/`RlsFrm` climbing together with no new `FifoFull`/
+`DispatchFail`, `ADEC`/`AENC` unchanged, RTSP `/main` (h264 1728x1080@25fps+aac) and `/sub` both
+confirmed healthy via live `ffprobe` before and after, HTTP `/state` responsive throughout.
+
+**Test**: `POST /speak` with a 1.5s quiet 440Hz tone. **Result**: 26 real `write_frame` calls fired
+in a 1.600s window (matches the clip), confirmed by slot 7's `0x14` incrementing by exactly 1, 26
+times straight, zero gaps (292385→292410), `0x18` climbing in step every time -- the announce
+mechanism itself executed exactly as designed, every time. `SndFrm`/`GetFrm`/`Writei`: 1842 before,
+1842 after. **Delta zero. Not audible.** Nothing degraded (this is a clean "doesn't work", not a
+regression) -- full numbers above. The new binary was left running (additive, backward compatible,
+passed the full health gate) rather than reverted.
+
+## 13.4 Why, and the concrete next step: `speak_start`/`speaker_enable` decoded
+
+Applying `docs/24-onboard-ai.md`'s own proven method (symbolically execute the GOT-indirected
+handler-registration idiom, cross-validate against a known example) to `media`'s own registrar
+(`0x16320`-`0x165a0`, 27 calls to the shared `register()` helper at `0x337c8`) recovered all 27
+entries with **zero unmatched handlers**, re-deriving OnboardAI's own `0x24 = recv_pet_face_pic_info`
+exactly and adding, disassembly-confirmed:
+
+| msg_id | handler | size | behavior (disassembled) |
+|---|---|---:|---|
+| `0xa` | `dispatch_handler_speak_start` | 10B | trampoline -> `0x31750`: if a global flag != 1, sets it to 1 and calls `pthread_create(&g_thread [0x76ca8], attr=NULL, start=0x30765, arg=NULL)`; if the flag is already 1, returns an error (idempotent against double-start) |
+| `0xb` | `dispatch_handler_speak_stop` | 28B | calls `time()`, stores the result to a global, then calls a real cleanup function at `0x318ec` (not fully traced) |
+| `0x18` | `dispatch_handler_speaker_enable` | 4B | **literal no-op**: `movs r0,#0; bx lr` -- does nothing at all |
+| `0x2` | `dispatch_handler_play_aac_file` | 284B | the already-understood canned-prompt path (§6) |
+
+Neither `speak_start`'s trampoline nor `0x31750` reads any payload byte from the dispatched
+message -- the handler takes no meaningful payload; an empty/zero-length send should be sufficient.
+The `pthread_create` start routine at `0x30765` is a large (1200+ bytes, not yet fully traced),
+un-named (static) function with real polling-loop shape: `pthread_self`/`clock_gettime` calls, a
+comparison against `0x1387` (5000, decimal) on a microsecond delta -- matching the documented "not
+recv audio-out data over 5s, exist audio_out_thread" idle-timeout string exactly -- and further
+internal calls not yet resolved. This is very likely `audio_out_thread` itself, or immediately
+adjacent to it.
+
+**Working conclusion**: `audio_out_thread` most likely only starts polling registry slot 7 once a
+real `speak_start` (msg_id `0xa` to `media`'s own queue) has spawned it; a bare ring/registry write
+with no prior start signal has nothing listening. `speak_stop` (`0xb`) appears to do real cleanup
+work beyond a flag flip, so probably is required to avoid a leaked thread/handle if the
+`pthread_create` guard flag is meant to be reset by it -- not yet confirmed which side clears the
+guard. Sending either message was **not attempted this session** -- per standing instruction, a bus
+message to `media` (the camera/microphone owner) needs the handler's behavior understood and
+explicit approval first, and the exact interaction with a concurrent real app talkback (would our
+session and a real call fight over the same guard flag / thread?) is not yet answered.
+
+**Acceptance status**: (b) from the assignment's two acceptance paths -- a precisely decoded
+announce protocol (13.2, proven exact) plus the specific, evidenced reason the write alone still
+cannot drive playback (13.3's clean negative + 13.4's msg_id-gating hypothesis) -- is met. (a),
+audible playback, is not yet met; the concrete, scoped next step is disassembling `0x30765`/
+`0x318ec` fully and requesting approval to send `speak_start`/`speak_stop`, not guessing further.

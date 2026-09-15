@@ -509,6 +509,46 @@ fn build_record(target: &AppendTarget, payload: &[u8]) -> Vec<u8> {
     rec
 }
 
+/// Registry slot 7 ("auido-out", vendor's own typo) inside the ring's 704-byte reader/writer
+/// registration table (offset 0, 16 slots x 44 bytes -- `docs/11-media.md` §4,
+/// `docs/23-audio-codec.md` §13.1). Every registered slot has a 16-byte name field followed by
+/// seven 4-byte trailer fields at relative offsets 0x10-0x28.
+const REGISTRY_SLOT_STRIDE: usize = 44;
+const AUDIO_OUT_SLOT_INDEX: usize = 7;
+const AUDIO_OUT_SLOT_OFFSET: usize = AUDIO_OUT_SLOT_INDEX * REGISTRY_SLOT_STRIDE; // 308 = 0x134
+
+/// A live 120s capture of a real app talkback (524 raw / 283 deduplicated chan=2 records, 300
+/// slot-7-or-`SndFrm` transitions -- `docs/23-audio-codec.md` §13.2) pinned these two fields'
+/// exact semantics: relative offset 0x14 equals the announced record's own global ring sequence
+/// number in 292/292 real transitions (zero mismatches against ~1700 distinct candidate values
+/// -- an exact match, not a correlation), and relative offset 0x18 tracks that record's own ring
+/// byte offset (ruled out as a monotonic microsecond clock by direct arithmetic: its total delta
+/// across the capture was 2.11s-worth of "microseconds", 57x short of the real 120.1s elapsed --
+/// a real clock's delta must equal real elapsed time regardless of sampling gaps; consistent
+/// instead with a byte position -- always inside `[DATA_START, RING_LEN)`, never decreased, and
+/// moved 50-1200x slower than the combined multi-channel ring position, exactly the shape of a
+/// cursor tracking only the sparse audio-out sub-stream rather than every channel). Every other
+/// field in the slot (name, 0x10, 0x1c, 0x20, 0x24, 0x28) was confirmed constant across all 300
+/// real transitions and is deliberately left untouched.
+const ANNOUNCE_REL_OFFSET: usize = 0x14;
+
+/// Announces a just-written chan=2 record to `media`'s `audio_out_thread` by updating registry
+/// slot 7's two live fields with values already computed for the record itself -- not a
+/// derived/guessed value, the record's own true `(global_seq, ring_offset)` pair, so even if some
+/// detail of the reverse-engineered semantics above is subtly wrong, this can never point a
+/// reader at anything other than the real, already-verified-correct AAC-LC record just written.
+/// One 8-byte `pwrite` (not two 4-byte ones) so a concurrently-polling reader can never observe a
+/// new seq paired with a stale offset or vice versa. Best-effort: failure here never turns an
+/// already-successful ring write into a hard error -- the record itself is unaffected either way;
+/// only the announcement (whether `audio_out_thread` notices this particular write) is at stake.
+fn announce_audio_out(ring_file: &File, global_seq: u32, ring_offset: u32) {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&global_seq.to_le_bytes());
+    buf[4..8].copy_from_slice(&ring_offset.to_le_bytes());
+    let at = (AUDIO_OUT_SLOT_OFFSET + ANNOUNCE_REL_OFFSET) as u64;
+    let _ = ring_file.write_all_at(&buf, at);
+}
+
 /// Finds the current append target and writes one record there. `Ok(false)` (not an error) means
 /// the record was dropped because it would have straddled the ring's physical wrap seam -- see
 /// `find_append_target` and the module doc; self-healing, same as any other torn write.
@@ -519,6 +559,9 @@ fn write_frame(ring_file: &File, tail: &TailCursor, adts_frame: &[u8]) -> Result
     }
     let record = build_record(&target, adts_frame);
     ring_file.write_all_at(&record, target.offset as u64).map_err(|e| e.to_string())?;
+    // Announce this write to `audio_out_thread` -- see `announce_audio_out`'s doc comment. Only
+    // ever called after the data record itself is confirmed written, never speculatively.
+    announce_audio_out(ring_file, target.global_seq + 1, target.offset as u32);
     Ok(true)
 }
 
@@ -616,6 +659,76 @@ mod tests {
         assert_eq!(u16::from_le_bytes(rec[46..48].try_into().unwrap()), 16);
         assert_eq!(u16::from_le_bytes(rec[48..50].try_into().unwrap()), 16000);
         assert_eq!(&rec[ring::HDR..], &payload[..]);
+    }
+
+    #[test]
+    fn announce_audio_out_writes_exactly_eight_bytes_at_the_confirmed_slot7_offset() {
+        let path = std::env::temp_dir().join(format!(
+            "kibbled-test-announce-{:?}.bin",
+            std::thread::current().id()
+        ));
+        // Fill a generous region spanning the whole registry with a marker byte first, so any
+        // byte this call touches outside the intended 8-byte window is immediately visible.
+        std::fs::write(&path, vec![0xEEu8; 4096]).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+
+        announce_audio_out(&file, 0x1234_5678, 0x0BAD_F00D);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let slot_start = AUDIO_OUT_SLOT_OFFSET;
+        // Nothing before the announce window moved -- in particular the slot's own 16-byte name
+        // field and the constant-field bytes at rel 0x10 are untouched.
+        assert!(
+            bytes[..slot_start + ANNOUNCE_REL_OFFSET].iter().all(|&b| b == 0xEE),
+            "must not touch any byte before the announce window"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[slot_start + 0x14..slot_start + 0x18].try_into().unwrap()),
+            0x1234_5678,
+            "rel 0x14 = the announced record's own global seq"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[slot_start + 0x18..slot_start + 0x1c].try_into().unwrap()),
+            0x0BAD_F00D,
+            "rel 0x18 = the announced record's own ring byte offset"
+        );
+        // Nothing after the announce window moved either -- rel 0x1c (DATA_START constant) and
+        // everything past it, including the next registry slot, are untouched.
+        assert!(
+            bytes[slot_start + 0x1c..].iter().all(|&b| b == 0xEE),
+            "must not touch any byte after the announce window"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_frame_announces_the_exact_seq_and_offset_build_record_used_for_the_same_record() {
+        // The safety argument for this write hinges on the announced (seq, offset) pair always
+        // matching the record `build_record` actually placed at that offset -- never a value
+        // independent of a real write. Exercise both call sites with the same `AppendTarget` and
+        // assert the announce buffer's fields equal the record header's own fields byte-for-byte.
+        let target = AppendTarget { offset: 2048, global_seq: 99, chan2_seq: 3 };
+        let payload = vec![0x7Au8; 50];
+        let record = build_record(&target, &payload);
+        let record_seq = u32::from_le_bytes(record[0..4].try_into().unwrap());
+
+        let path = std::env::temp_dir().join(format!(
+            "kibbled-test-announce-consistency-{:?}.bin",
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        announce_audio_out(&file, target.global_seq + 1, target.offset as u32);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let slot_start = AUDIO_OUT_SLOT_OFFSET;
+        let announced_seq = u32::from_le_bytes(bytes[slot_start + 0x14..slot_start + 0x18].try_into().unwrap());
+        let announced_offset = u32::from_le_bytes(bytes[slot_start + 0x18..slot_start + 0x1c].try_into().unwrap());
+        assert_eq!(announced_seq, record_seq, "announced seq must equal the record's own header seq");
+        assert_eq!(announced_offset, target.offset as u32, "announced offset must equal where the record was actually written");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
