@@ -20,9 +20,15 @@ CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
 DEFAULT_PORT = 8765
 DEFAULT_RTSP_PORT = 8554
 DEFAULT_RTSP_PATH = "/sub"
-# kibbled reads /dev/shm/config_shm with plain loads, so polling is nearly free on the
-# device; the limit is the feeder's single-client HTTP server, not the data.
-DEFAULT_SCAN_INTERVAL = 10
+# kibbled reads /dev/shm/config_shm with plain loads, so the DATA is nearly free; the limit is
+# the feeder's effectively serial HTTP server, shared with the vendor's encoder on one small ARM
+# core (load average ~8 at rest). Measured: a healthy single request is 0.6-1.5s, so one poll
+# cycle of ~12 calls is 8-18s of honest work. A 10s interval therefore started a new cycle
+# before the previous one could finish -- cycles overlapped, queued behind each other, timed
+# out, and every entity went unavailable on a device that was answering fine. 45s is comfortably
+# longer than the worst measured cycle, and nothing here (bowl fill, desiccant days, cached
+# schedule) changes meaningfully faster than that.
+DEFAULT_SCAN_INTERVAL = 45
 
 MANUFACTURER = "Petkit"
 MODEL = "YumShare Dual 2"
