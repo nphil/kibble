@@ -258,7 +258,13 @@ class KibbleCatPresentBinarySensor(KibbleEntity, BinarySensorEntity):
     def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
         super().__init__(coordinator, f"cat_present_{slugify(cat_name)}")
         self._cat_name = cat_name
-        self._attr_translation_placeholders = {"cat_name": cat_name}
+        # Display-only capitalisation. The agent stores a cat's name verbatim (it is also the
+        # directory name under /opt/kibble/faces), so a lowercase name produced a lowercase
+        # friendly name -- "Cat Feeder pending present" -- which reads as a typo next to every
+        # other sentence-case entity. Matching on `self._cat_name` stays exact; only the label
+        # changes, and an already-capitalised or multi-word name is left alone.
+        display = cat_name[:1].upper() + cat_name[1:] if cat_name else cat_name
+        self._attr_translation_placeholders = {"cat_name": display}
 
     @property
     def is_on(self) -> bool:
