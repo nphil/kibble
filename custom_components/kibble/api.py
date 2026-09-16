@@ -18,14 +18,18 @@ from aiohttp import ClientError, ClientTimeout
 
 _LOGGER = logging.getLogger(__name__)
 
-TIMEOUT = ClientTimeout(total=4)
+TIMEOUT = ClientTimeout(total=8)
 # `coordinator.py`'s `_async_update_data` makes up to a dozen of these calls back-to-back
 # under one aggregate `POLL_TIMEOUT` (see its module docstring) and the feeder's HTTP server
 # is single-client -- a stuck call must fail fast enough that the *whole* poll cycle still
 # finishes well inside `DEFAULT_SCAN_INTERVAL`, not just this one request inside its own
-# window. 4s is short enough for that budget and long enough that the feeder's normal
-# (non-congested) response time -- config_shm reads are "nearly free" (see const.py) -- never
-# trips it.
+# window.
+#
+# 8s, not 4s: measured on the real device, a healthy `GET /state` takes 0.6-1.5s (serial HTTP
+# server, sharing an ARM core with the vendor encoder at load ~8), and a request that is merely
+# queued behind another consumer can exceed 4s while the feeder is perfectly fine. 4s therefore
+# produced spurious failures; 8s distinguishes "busy" from "down" without letting one call eat
+# the whole cycle.
 #
 # The fail-safe connect sequence (agent/src/wifi.rs) budgets up to ~30s for association plus a
 # DHCP lease before rolling back; this request has to outlive that, not the short window every

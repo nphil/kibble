@@ -110,7 +110,13 @@ _LOGGER = logging.getLogger(__name__)
 # them there are or what each one's own `api.TIMEOUT` allows individually -- see the module
 # docstring. Comfortably under `DEFAULT_SCAN_INTERVAL` so a stuck cycle aborts, rather than
 # piling up against the next one.
-POLL_TIMEOUT = 8.0
+#
+# Sized from measurement, not taste: the feeder answers a single `GET /state` in 0.6-1.5s when
+# healthy (its HTTP server is effectively serial and shares the box with the vendor's encoder at
+# a load average around 8). A dozen sequential calls is therefore ~8-18s of honest work, so the
+# original 8.0 guaranteed a timeout on every cycle and made every entity unavailable on a device
+# that was answering perfectly. 25s leaves headroom under the 30s scan interval.
+POLL_TIMEOUT = 25.0
 
 # See the module docstring's reasoning: this is a count of poll cycles, not seconds.
 CONSECUTIVE_FAILURES_FOR_UNAVAILABLE = 3
