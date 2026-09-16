@@ -42,7 +42,10 @@
 //!                                   timeout, ~25s)
 //!   GET    /events/<file>           one detection's raw crop bytes (`image/jpeg`), for every
 //!                                   class (`face`/`visit`/`eat`) -- `Detection.image` names it
-//!   GET    /faces/pending           pending face crops awaiting a human label (see faces.rs)
+//!   GET    /faces/pending           `[{"name","ts","vendor_pet_id","guess":{"cat","score"}|null}]`
+//!                                   pending face crops awaiting a human label, newest last (see
+//!                                   faces.rs); `ts`/`vendor_pet_id` are parsed from the
+//!                                   filename, `guess` is the classifier's cached verdict
 //!   GET    /faces/pending/<name>    one pending crop's raw JPEG bytes
 //!   POST   /faces/label             {"name": "...", "cat": "..."}  moves a pending crop into
 //!                                   permanent, cat-named storage
@@ -53,8 +56,12 @@
 //!                                   most recently labelled crop (see faces.rs's review_target)
 //!   GET    /faces/current/info      {"status":"pending"|"labelled"|"none","name","cat"} --
 //!                                   metadata for the image above
-//!   GET    /cats                    [{"name","samples","last_seen"}] every enrolled cat
-//!                                   (see catid.rs/faces.rs's Gallery)
+//!   GET    /faces/samples/<cat>     `[{"name","ts"}]` every labelled sample of one cat, oldest
+//!                                   first; unknown cat is a 404
+//!   GET    /faces/samples/<cat>/<name>  one labelled sample's raw JPEG bytes
+//!   GET    /cats                    [{"name","samples","last_seen","avatar"}] every enrolled
+//!                                   cat (see catid.rs/faces.rs's Gallery); `avatar` is the
+//!                                   sample name nearest the cat's centroid, or null
 //!   POST   /cats                    {"name": "..."}  pre-register a cat with zero samples
 //!   GET    /identify                {"cat","score","second_best","crop","source","ts"} --
 //!                                   Kibble's own classifier's best guess for the newest
@@ -344,6 +351,9 @@ fn route(
         ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery),
         ("GET", "/faces/current") => faces_current_get(),
         ("GET", "/faces/current/info") => json_response(faces_current_info_json()),
+        ("GET", p) if p.starts_with("/faces/samples/") => {
+            faces_samples_route(&p["/faces/samples/".len()..])
+        }
         ("GET", "/cats") => cats_get(gallery),
         ("POST", "/cats") => cats_post(req, gallery),
         ("GET", "/identify") => json_response(identify_json(gallery)),
@@ -430,9 +440,58 @@ fn json_response(r: Result<String, String>) -> Response {
 }
 
 fn faces_pending_json() -> Result<String, String> {
-    let names = faces::list_pending().map_err(|e| e.to_string())?;
-    let items: Vec<String> = names.iter().map(|n| format!("\"{}\"", n.escape_debug())).collect();
+    let crops = faces::list_pending_full().map_err(|e| e.to_string())?;
+    let items: Vec<String> = crops.iter().map(pending_crop_json).collect();
     Ok(format!("[{}]", items.join(",")))
+}
+
+fn pending_crop_json(c: &faces::PendingCrop) -> String {
+    let vendor_pet_id = c.vendor_pet_id.map_or("null".to_string(), |v| v.to_string());
+    let guess = match &c.guess {
+        Some(g) => format!(r#"{{"cat":"{}","score":{}}}"#, g.cat.escape_debug(), g.score),
+        None => "null".to_string(),
+    };
+    format!(
+        r#"{{"name":"{}","ts":{},"vendor_pet_id":{},"guess":{}}}"#,
+        c.name.escape_debug(),
+        c.ts,
+        vendor_pet_id,
+        guess,
+    )
+}
+
+/// Routes both `GET /faces/samples/<cat>` (`rest` has no further `/`) and
+/// `GET /faces/samples/<cat>/<name>` (the rest of the path after the first `/`).
+fn faces_samples_route(rest: &str) -> Response {
+    match rest.split_once('/') {
+        Some((cat, name)) => faces_sample_get(cat, name),
+        None => faces_samples_json(rest),
+    }
+}
+
+fn faces_samples_json(cat: &str) -> Response {
+    match faces::list_samples(cat) {
+        Ok(samples) => {
+            let items: Vec<String> = samples
+                .iter()
+                .map(|s| format!(r#"{{"name":"{}","ts":{}}}"#, s.name.escape_debug(), s.ts))
+                .collect();
+            Response::Json(format!("[{}]", items.join(",")))
+        }
+        Err(faces::FaceError::InvalidCat(_)) => Response::BadRequest("invalid cat".into()),
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn faces_sample_get(cat: &str, name: &str) -> Response {
+    match faces::read_sample(cat, name) {
+        Ok(bytes) => Response::Blob("image/jpeg", bytes),
+        Err(faces::FaceError::InvalidName) => Response::BadRequest("invalid file name".into()),
+        Err(faces::FaceError::InvalidCat(_)) => Response::BadRequest("invalid cat".into()),
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
 }
 
 fn faces_pending_get(name: &str) -> Response {

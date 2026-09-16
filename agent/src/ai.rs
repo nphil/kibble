@@ -108,6 +108,17 @@
 //! did not locate the writer (most likely `libalgo.so` builds that exact filename with a runtime
 //! `snprintf` this static pass could not string-match, or a shell hand-off step exists outside
 //! the three pulled binaries). Flagged as an open item rather than guessed.
+//!
+//! ## Update: the classifier's guess is cached beside the crop, and `-unknown` can heal later
+//!
+//! [`faces::Gallery::identify`]'s verdict for a freshly captured `"face"` crop is written beside
+//! it as a `.guess` sidecar ([`faces::save_pending_guess`]) the moment it's known -- one small
+//! on-change write, never a timer -- so `GET /faces/pending` never has to re-run the classifier
+//! just to answer a read. Separately, a crop can be written before its `track` event lands
+//! (`pet_id` comes from `config_shm`, on this same 1 s tick, but not necessarily the same tick as
+//! the crop), leaving it named `-unknown`; every new track this loop observes calls
+//! [`faces::associate_track`], which retroactively renames any `-unknown` crop within
+//! [`faces::TRACK_ASSOCIATION_WINDOW_SECS`] of that track's `start_time` to the real `pet_id`.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -519,11 +530,18 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
                     if let Ok(pending_name) = faces::save_pending(&bytes, None) {
                         let pending_path = Path::new(faces::PENDING_DIR).join(&pending_name);
                         match faces::ensure_embedding(&pending_path) {
-                            Ok(feat) => {
-                                if let catid::Verdict::Known { cat: found_cat, .. } = gallery.identify(&feat) {
+                            Ok(feat) => match gallery.identify(&feat) {
+                                catid::Verdict::Known { cat: found_cat, score, .. } => {
+                                    let guess = faces::Guess { cat: found_cat.clone(), score };
+                                    if let Err(e) = faces::save_pending_guess(&pending_name, &guess) {
+                                        eprintln!(
+                                            "kibbled: ai: save guess for {pending_name}: {e}"
+                                        );
+                                    }
                                     cat = Some(found_cat);
                                 }
-                            }
+                                catid::Verdict::Unknown { .. } => {}
+                            },
                             Err(e) => {
                                 eprintln!("kibbled: ai: embed {}: {e}", pending_path.display())
                             }
@@ -538,7 +556,11 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
         if let Some(track) = shm.pet_track() {
             let key = track_key(&track);
             if key.is_some() && key != last_track {
-                feed.push_track(track.latest().unwrap());
+                let entry = track.latest().unwrap();
+                if let Err(e) = faces::associate_track(entry.pet_id, entry.start_time) {
+                    eprintln!("kibbled: ai: associate_track: {e}");
+                }
+                feed.push_track(entry);
             }
             last_track = key;
         }

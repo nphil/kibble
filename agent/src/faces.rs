@@ -14,17 +14,28 @@
 //! is not attached (it lives in the same unreachable bus message).
 //!
 //! Layout: `PENDING_DIR/<unix>-<label>.jpg` (label is `pet_id` if one is ever available, else
-//! `"unknown"`) plus a same-name `.emb` sidecar once its embedding has been computed (eagerly at
-//! capture time by `ai.rs`, or lazily by [`ensure_embedding`] the first time anything needs one),
-//! capped at [`MAX_PENDING`] files with the oldest evicted by mtime. A human names a pending crop
-//! with `POST /faces/label` ([`label`]), which moves both files to `<FACES_ROOT>/<cat>/<same
-//! filename>` -- permanent storage, outside the cap, one directory per label -- and feeds the
-//! embedding into that cat's running centroid ([`Gallery::on_labelled`]). [`unlabel`] is the exact
-//! inverse, for a mistaken label or the first half of a re-label. [`SKIP_BUCKET`]/
-//! [`NOT_A_CAT_BUCKET`] are two reserved `cat` values (this module's own doc already anticipated
-//! both, before any of this existed): a crop labelled into either still leaves the review queue
-//! and keeps its embedding on record, but is never counted as "a cat" -- excluded from
-//! `GET /cats` and never fed to the classifier.
+//! `"unknown"`) plus, once computed, two same-stem sidecars: `.emb` (its embedding, eagerly at
+//! capture time by `ai.rs`, or lazily by [`ensure_embedding`] the first time anything needs one)
+//! and `.guess` (the classifier's verdict at capture time, via [`save_pending_guess`] -- absent
+//! when the classifier didn't confidently match an enrolled cat). A crop written before its
+//! vendor `track` event lands keeps the `-unknown` label until [`associate_track`] renames it
+//! (and its sidecars) to the real `pet_id`, within [`TRACK_ASSOCIATION_WINDOW_SECS`] of the
+//! track's own `start_time` -- see `ai.rs`'s module doc for why the crop can arrive several
+//! minutes early. Pending is capped at [`MAX_PENDING`] `.jpg` crops (sidecars ride along, never
+//! counted themselves) with the oldest evicted by mtime. A human names a pending crop with
+//! `POST /faces/label` ([`label`]), which moves the crop and its sidecars to
+//! `<FACES_ROOT>/<cat>/<same filename>` -- permanent storage, outside the cap, one directory per
+//! label -- and feeds the embedding into that cat's running centroid ([`Gallery::on_labelled`]).
+//! [`unlabel`] is the exact inverse for the `.jpg`/`.emb` pair, for a mistaken label or the first
+//! half of a re-label; the `.guess` is dropped rather than restored, since it was the
+//! classifier's opinion *before* a human ever looked, stale the moment a human did.
+//! [`SKIP_BUCKET`]/[`NOT_A_CAT_BUCKET`] are two reserved `cat` values (this module's own doc
+//! already anticipated both, before any of this existed): a crop labelled into either still
+//! leaves the review queue and keeps its embedding on record, but is never counted as "a cat" --
+//! excluded from `GET /cats` and never fed to the classifier. Each enrolled cat's `GET /cats`
+//! entry also reports an `"avatar"`: [`list_samples`]'s crop whose cached embedding is nearest
+//! the cat's own centroid, the sample that looks most like the trained identity rather than
+//! merely the newest one.
 
 use std::collections::HashMap;
 use std::fs;
@@ -79,8 +90,11 @@ fn save_pending_in(dir: &Path, bytes: &[u8], pet_id: Option<u32>) -> io::Result<
     Ok(name)
 }
 
-/// Delete oldest-by-mtime files until at most `cap` remain. Pure filesystem logic (no clock
-/// dependency beyond mtimes the OS already sets), so it's directly unit-testable.
+/// Delete oldest-by-capture-time crops until at most `cap` real crops (`.jpg` files) remain.
+/// Sidecars (`.emb`, `.guess`) never count against the cap themselves -- only a crop's own `.jpg`
+/// mtime decides eviction order -- and ride along with whichever crop they belong to, so eviction
+/// never leaves an orphaned sidecar pointing at a `.jpg` that's already gone. Pure filesystem
+/// logic (no clock dependency beyond mtimes the OS already sets), so it's directly unit-testable.
 fn evict_oldest_if_over_cap(dir: &Path, cap: usize) -> io::Result<()> {
     let mut entries: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -89,7 +103,11 @@ fn evict_oldest_if_over_cap(dir: &Path, cap: usize) -> io::Result<()> {
             if !meta.is_file() {
                 return None;
             }
-            Some((meta.modified().ok()?, e.path()))
+            let path = e.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+                return None;
+            }
+            Some((meta.modified().ok()?, path))
         })
         .collect();
     if entries.len() <= cap {
@@ -98,14 +116,10 @@ fn evict_oldest_if_over_cap(dir: &Path, cap: usize) -> io::Result<()> {
     entries.sort_by_key(|(mtime, _)| *mtime);
     for (_, path) in entries.iter().take(entries.len() - cap) {
         fs::remove_file(path)?;
+        let _ = fs::remove_file(embedding_path_for(path));
+        let _ = fs::remove_file(guess_path_for(path));
     }
     Ok(())
-}
-
-/// `GET /faces/pending`: filenames only, newest last. Missing directory (nothing captured yet)
-/// is an empty list, not an error.
-pub fn list_pending() -> io::Result<Vec<String>> {
-    list_pending_in(Path::new(PENDING_DIR))
 }
 
 fn list_pending_in(dir: &Path) -> io::Result<Vec<String>> {
@@ -117,13 +131,29 @@ fn list_pending_in(dir: &Path) -> io::Result<Vec<String>> {
     let mut entries: Vec<(SystemTime, String)> = read
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
             let name = e.file_name().into_string().ok()?;
+            if !name.ends_with(".jpg") {
+                return None;
+            }
+            let mtime = e.metadata().ok()?.modified().ok()?;
             Some((mtime, name))
         })
         .collect();
     entries.sort();
     Ok(entries.into_iter().map(|(_, name)| name).collect())
+}
+
+/// Parses `ts` and `vendor_pet_id` out of a crop's own filename -- `{ts}-{petid|unknown}.jpg`,
+/// the convention this module's doc lays out (shared by pending crops and labelled samples
+/// alike, since [`label`] preserves the filename). `None` for anything that doesn't match --
+/// should never happen for a name this module generated itself, but callers read names straight
+/// off disk.
+pub fn parse_pending_name(name: &str) -> Option<(u64, Option<u32>)> {
+    let stem = name.strip_suffix(".jpg")?;
+    let (ts_str, label) = stem.split_once('-')?;
+    let ts = ts_str.parse::<u64>().ok()?;
+    let vendor_pet_id = if label == "unknown" { None } else { label.parse::<u32>().ok() };
+    Some((ts, vendor_pet_id))
 }
 
 #[derive(Debug)]
@@ -180,12 +210,16 @@ fn label_in(pending_dir: &Path, faces_root: &Path, name: &str, cat: &str) -> Res
         return Err(FaceError::NotFound);
     }
     let src_emb = embedding_path_for(&src);
+    let src_guess = guess_path_for(&src);
     let dest_dir = faces_root.join(cat);
     fs::create_dir_all(&dest_dir).map_err(FaceError::Io)?;
     let dest = dest_dir.join(name);
     fs::rename(&src, &dest).map_err(FaceError::Io)?;
     if src_emb.is_file() {
         let _ = fs::rename(&src_emb, embedding_path_for(&dest));
+    }
+    if src_guess.is_file() {
+        let _ = fs::rename(&src_guess, guess_path_for(&dest));
     }
     Ok(())
 }
@@ -250,9 +284,80 @@ pub fn ensure_embedding(jpg_path: &Path) -> Result<[f32; embed::EMBED_DIM], Embe
     Ok(feat)
 }
 
-/// `POST /faces/unlabel {"name": "...", "cat": "..."}`: the exact inverse of [`label`] -- moves a
-/// previously-labelled crop (and its `.emb` sidecar, if any) back into the pending review queue.
-/// A full re-label is this followed by [`label`] into the correct cat.
+/// Sidecar path for a crop's cached classifier guess: same directory and stem, `.guess`
+/// extension -- same convention as [`embedding_path_for`]'s `.emb`.
+fn guess_path_for(jpg_path: &Path) -> PathBuf {
+    jpg_path.with_extension("guess")
+}
+
+/// The classifier's verdict on a pending crop, cached beside it at capture time by
+/// [`save_pending_guess`] -- see the module doc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Guess {
+    pub cat: String,
+    pub score: f32,
+}
+
+/// Writes a `.guess` sidecar as flat JSON (`{"cat":"...","score":...}`) -- this module both
+/// writes and reads it, and reuses `http::json_field` to parse it back rather than pulling in a
+/// JSON crate, matching this project's established convention (see `http.rs`'s own doc comment).
+fn save_guess_file(jpg_path: &Path, guess: &Guess) -> io::Result<()> {
+    let json = format!(r#"{{"cat":"{}","score":{}}}"#, guess.cat.escape_debug(), guess.score);
+    fs::write(guess_path_for(jpg_path), json)
+}
+
+/// Reads a `.guess` sidecar written by [`save_guess_file`]. `None` for anything that doesn't
+/// parse cleanly, including "no such file" -- a crop the classifier didn't confidently match
+/// never gets one, and that is indistinguishable from (and treated identically to) "not cached".
+fn load_guess(jpg_path: &Path) -> Option<Guess> {
+    let text = fs::read_to_string(guess_path_for(jpg_path)).ok()?;
+    let cat = crate::http::json_field(&text, "cat")?.to_string();
+    let score: f32 = crate::http::json_field(&text, "score")?.parse().ok()?;
+    Some(Guess { cat, score })
+}
+
+/// `ai.rs::poll_loop` calls this right after [`Gallery::identify`] returns a confident match for
+/// a freshly captured pending crop -- one small on-change write per newly identified face, never
+/// on a timer and never per poll tick (an unmatched/unknown crop simply never gets a `.guess`
+/// file, which [`load_guess`] already treats identically to "no verdict yet").
+pub fn save_pending_guess(name: &str, guess: &Guess) -> io::Result<()> {
+    save_guess_file(&Path::new(PENDING_DIR).join(name), guess)
+}
+
+/// One pending crop as `GET /faces/pending` reports it: everything encoded in the filename plus
+/// whatever the classifier thought at capture time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingCrop {
+    pub name: String,
+    pub ts: u64,
+    pub vendor_pet_id: Option<u32>,
+    pub guess: Option<Guess>,
+}
+
+/// `GET /faces/pending`'s full shape -- see [`PendingCrop`] -- sorted by `ts` ascending (newest
+/// last), matching the endpoint's contract.
+pub fn list_pending_full() -> io::Result<Vec<PendingCrop>> {
+    list_pending_full_in(Path::new(PENDING_DIR))
+}
+
+fn list_pending_full_in(dir: &Path) -> io::Result<Vec<PendingCrop>> {
+    let mut crops: Vec<PendingCrop> = list_pending_in(dir)?
+        .into_iter()
+        .filter_map(|name| {
+            let (ts, vendor_pet_id) = parse_pending_name(&name)?;
+            let guess = load_guess(&dir.join(&name));
+            Some(PendingCrop { name, ts, vendor_pet_id, guess })
+        })
+        .collect();
+    crops.sort_by_key(|c| c.ts);
+    Ok(crops)
+}
+
+/// `POST /faces/unlabel {"name": "...", "cat": "..."}`: the exact inverse of [`label`] for the
+/// `.jpg`/`.emb` pair -- moves a previously-labelled crop (and its `.emb` sidecar, if any) back
+/// into the pending review queue. Any `.guess` sidecar is dropped rather than restored -- see
+/// [`unlabel_in`]'s own comment for why. A full re-label is this followed by [`label`] into the
+/// correct cat.
 pub fn unlabel(cat: &str, name: &str) -> Result<(), FaceError> {
     unlabel_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR), cat, name)?;
     mark_faces_changed();
@@ -271,13 +376,68 @@ fn unlabel_in(faces_root: &Path, pending_dir: &Path, cat: &str, name: &str) -> R
         return Err(FaceError::NotFound);
     }
     let src_emb = embedding_path_for(&src);
+    // The guess is a snapshot of what the classifier thought *before* a human ever looked at this
+    // crop; once labelled, that snapshot is stale, so unlabelling drops it rather than restoring
+    // it to the pending queue -- see the module doc.
+    let src_guess = guess_path_for(&src);
     fs::create_dir_all(pending_dir).map_err(FaceError::Io)?;
     let dest = pending_dir.join(name);
     fs::rename(&src, &dest).map_err(FaceError::Io)?;
     if src_emb.is_file() {
         let _ = fs::rename(&src_emb, embedding_path_for(&dest));
     }
+    let _ = fs::remove_file(&src_guess);
     Ok(())
+}
+
+/// Window within which a pending crop written before its `track` event lands -- filename still
+/// says `-unknown` -- is retroactively associated with the vendor's `pet_id`. `ai.rs`'s module
+/// doc records crops arriving up to ~3 minutes *before* their track's own `start_time`; 300s
+/// covers that with margin in either direction (a `track` tick landing fractionally early against
+/// wall-clock skew costs nothing to also accept).
+pub const TRACK_ASSOCIATION_WINDOW_SECS: u64 = 300;
+
+/// Renames every pending `{ts}-unknown.jpg` crop (and its sidecars) whose `ts` is within
+/// [`TRACK_ASSOCIATION_WINDOW_SECS`] of `start_time` to `{ts}-{pet_id}.jpg` -- the vendor's own
+/// identification landing after the crop was already written (`ai.rs`'s module doc, "Update
+/// 2026-09-16"). Returns the renamed crops' new names. Pure filesystem logic against `dir`, so
+/// it's directly unit-testable; [`associate_track`] wires it to the real pending directory.
+pub fn associate_track_in(dir: &Path, pet_id: u32, start_time: u64) -> io::Result<Vec<String>> {
+    let mut renamed = Vec::new();
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(renamed),
+        Err(e) => return Err(e),
+    };
+    for entry in read.filter_map(|e| e.ok()) {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Some(ts_str) = name.strip_suffix("-unknown.jpg") else { continue };
+        let Ok(ts) = ts_str.parse::<u64>() else { continue };
+        if ts.abs_diff(start_time) > TRACK_ASSOCIATION_WINDOW_SECS {
+            continue;
+        }
+        let new_name = format!("{ts}-{pet_id}.jpg");
+        let src = dir.join(&name);
+        let dest = dir.join(&new_name);
+        if dest.exists() {
+            continue; // already associated (e.g. a repeated track tick) -- never overwrite
+        }
+        fs::rename(&src, &dest)?;
+        let _ = fs::rename(embedding_path_for(&src), embedding_path_for(&dest));
+        let _ = fs::rename(guess_path_for(&src), guess_path_for(&dest));
+        renamed.push(new_name);
+    }
+    Ok(renamed)
+}
+
+/// Wires [`associate_track_in`] to the real pending directory and marks the push channel dirty
+/// when anything actually changed -- called from `ai.rs`'s poll loop on every new track event.
+pub fn associate_track(pet_id: u32, start_time: u64) -> io::Result<Vec<String>> {
+    let renamed = associate_track_in(Path::new(PENDING_DIR), pet_id, start_time)?;
+    if !renamed.is_empty() {
+        mark_faces_changed();
+    }
+    Ok(renamed)
 }
 
 /// One permanently-labelled crop, as found under a `FACES_ROOT/<cat>/` directory.
@@ -326,6 +486,72 @@ fn list_labelled_in(faces_root: &Path) -> io::Result<Vec<LabelledCrop>> {
         }
     }
     Ok(out)
+}
+
+/// One labelled sample as `GET /faces/samples/<cat>` reports it: name plus capture time, parsed
+/// from the filename exactly like a pending crop's ([`parse_pending_name`]) -- labelling
+/// preserves the filename, so the same parser applies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    pub name: String,
+    pub ts: u64,
+}
+
+/// `GET /faces/samples/<cat>`: every labelled crop under that cat's directory, oldest first.
+/// `cat` is validated exactly like [`label`]'s -- no traversal, and the `pending` staging
+/// directory itself is never a valid `cat` (mirrors [`list_enrolled_cats_in`]'s guard against the
+/// same phantom-cat bug). An unknown `cat` is [`FaceError::NotFound`].
+pub fn list_samples(cat: &str) -> Result<Vec<Sample>, FaceError> {
+    list_samples_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR), cat)
+}
+
+fn list_samples_in(faces_root: &Path, pending_dir: &Path, cat: &str) -> Result<Vec<Sample>, FaceError> {
+    if !is_safe_name(cat) {
+        return Err(FaceError::InvalidCat(cat.to_string()));
+    }
+    let pending_name = pending_dir.file_name().and_then(|s| s.to_str()).unwrap_or("pending");
+    if cat == pending_name {
+        return Err(FaceError::NotFound);
+    }
+    let read = match fs::read_dir(faces_root.join(cat)) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(FaceError::NotFound),
+        Err(e) => return Err(FaceError::Io(e)),
+    };
+    let mut samples: Vec<Sample> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let (ts, _) = parse_pending_name(&name)?;
+            Some(Sample { name, ts })
+        })
+        .collect();
+    samples.sort_by_key(|s| s.ts);
+    Ok(samples)
+}
+
+/// `GET /faces/samples/<cat>/<name>`: the raw JPEG bytes. Same path-safety rules as
+/// [`read_pending`] for `name`, and the same `cat` rules as [`list_samples`].
+pub fn read_sample(cat: &str, name: &str) -> Result<Vec<u8>, FaceError> {
+    read_sample_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR), cat, name)
+}
+
+fn read_sample_in(faces_root: &Path, pending_dir: &Path, cat: &str, name: &str) -> Result<Vec<u8>, FaceError> {
+    if !is_safe_name(cat) {
+        return Err(FaceError::InvalidCat(cat.to_string()));
+    }
+    if !is_safe_name(name) {
+        return Err(FaceError::InvalidName);
+    }
+    let pending_name = pending_dir.file_name().and_then(|s| s.to_str()).unwrap_or("pending");
+    if cat == pending_name {
+        return Err(FaceError::NotFound);
+    }
+    match fs::read(faces_root.join(cat).join(name)) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(FaceError::NotFound),
+        Err(e) => Err(FaceError::Io(e)),
+    }
 }
 
 /// The single most recently labelled crop across every (non-reserved) cat, if any -- the
@@ -462,6 +688,26 @@ fn list_enrolled_cats_in(faces_root: &Path, pending_dir: &Path) -> Vec<String> {
     out
 }
 
+/// The labelled sample whose embedding is nearest (highest cosine similarity) to `cat`'s current
+/// centroid -- what `GET /cats`'s `"avatar"` shows: the crop that looks most like the cat's
+/// trained identity, not merely the most recently labelled one. `None` when the cat has no
+/// samples yet (an empty, [`Gallery::add_cat`]-enrolled directory) or nothing embeds cleanly.
+fn nearest_sample(cat_model: &catid::CatModel, crops: &[LabelledCrop]) -> Option<String> {
+    crops
+        .iter()
+        .filter(|c| c.cat == cat_model.name)
+        .filter_map(|c| {
+            let mut normalized = ensure_embedding(&c.jpg_path).ok()?;
+            if !catid::l2_normalize(&mut normalized) {
+                return None;
+            }
+            let score = cat_model.cosine_to(&normalized)?;
+            Some((score, c.name.clone()))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, name)| name)
+}
+
 impl Gallery {
     /// Builds the classifier from every labelled crop on disk, computing (and caching) any
     /// embedding that isn't already cached, and re-registers every enrolled cat directory even
@@ -500,21 +746,31 @@ impl Gallery {
     }
 
     /// `GET /cats`: every enrolled cat with at least one sample or explicitly pre-created via
-    /// [`Gallery::add_cat`], sorted by name for a stable listing.
+    /// [`Gallery::add_cat`], sorted by name for a stable listing. `avatar` is [`nearest_sample`]'s
+    /// pick, `null` for a sample-less cat.
     pub fn cats_json(&self) -> String {
-        let classifier = self.inner.lock().unwrap();
-        let mut cats: Vec<&catid::CatModel> = classifier.cats().collect();
+        // Cloned out from under the lock before any filesystem work (`nearest_sample` reads
+        // cached embeddings off disk) -- `CatModel` is cheap to clone and this keeps the mutex
+        // held for microseconds instead of however long disk I/O takes.
+        let mut cats: Vec<catid::CatModel> = {
+            let classifier = self.inner.lock().unwrap();
+            classifier.cats().cloned().collect()
+        };
         cats.sort_by(|a, b| a.name.cmp(&b.name));
         let last_seen = last_seen_by_cat();
+        let crops = list_labelled().unwrap_or_default();
         let items: Vec<String> = cats
             .iter()
             .map(|c| {
                 let seen = last_seen.get(c.name.as_str()).map_or("null".to_string(), u64::to_string);
+                let avatar = nearest_sample(c, &crops)
+                    .map_or("null".to_string(), |n| format!("\"{}\"", n.escape_debug()));
                 format!(
-                    r#"{{"name":"{}","samples":{},"last_seen":{}}}"#,
+                    r#"{{"name":"{}","samples":{},"last_seen":{},"avatar":{}}}"#,
                     c.name.escape_debug(),
                     c.count,
-                    seen
+                    seen,
+                    avatar,
                 )
             })
             .collect();
@@ -868,5 +1124,293 @@ mod tests {
         assert!(is_reserved_bucket(SKIP_BUCKET));
         assert!(is_reserved_bucket(NOT_A_CAT_BUCKET));
         assert!(!is_reserved_bucket("Rashy"));
+    }
+
+    #[test]
+    fn parse_pending_name_parses_ts_and_vendor_pet_id() {
+        assert_eq!(parse_pending_name("1700000000-101321488.jpg"), Some((1700000000, Some(101321488))));
+        assert_eq!(parse_pending_name("1700000000-unknown.jpg"), Some((1700000000, None)));
+    }
+
+    #[test]
+    fn parse_pending_name_rejects_anything_that_does_not_match_the_convention() {
+        assert_eq!(parse_pending_name("not-a-crop.txt"), None);
+        assert_eq!(parse_pending_name("nope.jpg"), None);
+        assert_eq!(parse_pending_name("abc-unknown.jpg"), None);
+    }
+
+    #[test]
+    fn list_pending_excludes_sidecar_files() {
+        let dir = temp_dir("list-pending-sidecars");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1-unknown.jpg"), b"jpg").unwrap();
+        fs::write(dir.join("1-unknown.emb"), b"emb").unwrap();
+        fs::write(dir.join("1-unknown.guess"), b"guess").unwrap();
+        assert_eq!(list_pending_in(&dir).unwrap(), vec!["1-unknown.jpg".to_string()]);
+    }
+
+    #[test]
+    fn list_pending_full_reports_ts_vendor_pet_id_and_guess() {
+        let dir = temp_dir("pending-full");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("100-7.jpg"), b"x").unwrap();
+        save_guess_file(&dir.join("100-7.jpg"), &Guess { cat: "Pancake".to_string(), score: 0.83 }).unwrap();
+        fs::write(dir.join("200-unknown.jpg"), b"x").unwrap();
+        let crops = list_pending_full_in(&dir).unwrap();
+        assert_eq!(crops.len(), 2);
+        assert_eq!(crops[0].name, "100-7.jpg");
+        assert_eq!(crops[0].ts, 100);
+        assert_eq!(crops[0].vendor_pet_id, Some(7));
+        assert_eq!(crops[0].guess, Some(Guess { cat: "Pancake".to_string(), score: 0.83 }));
+        assert_eq!(crops[1].name, "200-unknown.jpg");
+        assert_eq!(crops[1].vendor_pet_id, None);
+        assert_eq!(crops[1].guess, None);
+    }
+
+    #[test]
+    fn list_pending_full_sorts_newest_last_by_ts_regardless_of_write_order() {
+        let dir = temp_dir("pending-full-sort");
+        fs::create_dir_all(&dir).unwrap();
+        // Written newest-first on disk; the returned order must still be ts-ascending.
+        fs::write(dir.join("300-unknown.jpg"), b"x").unwrap();
+        fs::write(dir.join("100-unknown.jpg"), b"x").unwrap();
+        fs::write(dir.join("200-unknown.jpg"), b"x").unwrap();
+        let names: Vec<String> = list_pending_full_in(&dir).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["100-unknown.jpg", "200-unknown.jpg", "300-unknown.jpg"]);
+    }
+
+    #[test]
+    fn label_moves_the_guess_sidecar_alongside_the_crop_when_present() {
+        let pending = temp_dir("label-guess-pending");
+        let root = temp_dir("label-guess-root");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("1-unknown.jpg"), b"crop").unwrap();
+        save_guess_file(&pending.join("1-unknown.jpg"), &Guess { cat: "Kitty".to_string(), score: 0.9 }).unwrap();
+        label_in(&pending, &root, "1-unknown.jpg", "Rashy").unwrap();
+        assert!(!pending.join("1-unknown.guess").exists());
+        assert_eq!(
+            load_guess(&root.join("Rashy").join("1-unknown.jpg")),
+            Some(Guess { cat: "Kitty".to_string(), score: 0.9 })
+        );
+    }
+
+    #[test]
+    fn unlabel_drops_the_guess_sidecar_without_restoring_it_to_pending() {
+        let root = temp_dir("unlabel-guess-root");
+        let pending = temp_dir("unlabel-guess-pending");
+        fs::create_dir_all(root.join("Rashy")).unwrap();
+        fs::write(root.join("Rashy").join("1-unknown.jpg"), b"crop").unwrap();
+        save_guess_file(
+            &root.join("Rashy").join("1-unknown.jpg"),
+            &Guess { cat: "Kitty".to_string(), score: 0.9 },
+        )
+        .unwrap();
+        unlabel_in(&root, &pending, "Rashy", "1-unknown.jpg").unwrap();
+        assert!(!root.join("Rashy").join("1-unknown.guess").exists());
+        assert!(pending.join("1-unknown.jpg").exists());
+        assert_eq!(load_guess(&pending.join("1-unknown.jpg")), None);
+    }
+
+    #[test]
+    fn eviction_counts_only_jpg_crops_and_removes_their_sidecars() {
+        let dir = temp_dir("evict-sidecars");
+        fs::create_dir_all(&dir).unwrap();
+        let mut names = Vec::new();
+        for i in 0..5u64 {
+            let name = format!("{i}-unknown.jpg");
+            let path = dir.join(&name);
+            fs::write(&path, b"x").unwrap();
+            save_embedding(&path, &[0.0f32; embed::EMBED_DIM]).unwrap();
+            save_guess_file(&path, &Guess { cat: "Rashy".to_string(), score: 0.5 }).unwrap();
+            let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i);
+            fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+            names.push(name);
+        }
+        evict_oldest_if_over_cap(&dir, 3).unwrap();
+        let remaining = list_pending_in(&dir).unwrap();
+        assert_eq!(remaining.len(), 3, "{remaining:?}");
+        // The two oldest crops, and only their sidecars, are gone.
+        for name in &names[..2] {
+            let stem = name.strip_suffix(".jpg").unwrap();
+            assert!(!dir.join(format!("{stem}.emb")).exists(), "{name} .emb should be gone");
+            assert!(!dir.join(format!("{stem}.guess")).exists(), "{name} .guess should be gone");
+        }
+        // The three newest crops keep their sidecars.
+        for name in &names[2..] {
+            let stem = name.strip_suffix(".jpg").unwrap();
+            assert!(dir.join(format!("{stem}.emb")).exists(), "{name} .emb should survive");
+            assert!(dir.join(format!("{stem}.guess")).exists(), "{name} .guess should survive");
+        }
+    }
+
+    #[test]
+    fn associate_track_renames_a_crop_exactly_at_the_window_boundary() {
+        let dir = temp_dir("track-boundary-in");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1000-unknown.jpg"), b"x").unwrap();
+        // start_time - ts == TRACK_ASSOCIATION_WINDOW_SECS exactly -- still within the window.
+        let renamed = associate_track_in(&dir, 42, 1000 + TRACK_ASSOCIATION_WINDOW_SECS).unwrap();
+        assert_eq!(renamed, vec![format!("1000-42.jpg")]);
+        assert!(dir.join("1000-42.jpg").exists());
+        assert!(!dir.join("1000-unknown.jpg").exists());
+    }
+
+    #[test]
+    fn associate_track_leaves_a_crop_one_second_outside_the_window_alone() {
+        let dir = temp_dir("track-boundary-out");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1000-unknown.jpg"), b"x").unwrap();
+        let renamed = associate_track_in(&dir, 42, 1000 + TRACK_ASSOCIATION_WINDOW_SECS + 1).unwrap();
+        assert!(renamed.is_empty());
+        assert!(dir.join("1000-unknown.jpg").exists());
+    }
+
+    #[test]
+    fn associate_track_accepts_a_track_landing_before_the_crops_own_timestamp_too() {
+        let dir = temp_dir("track-symmetric");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1000-unknown.jpg"), b"x").unwrap();
+        let renamed = associate_track_in(&dir, 42, 1000 - 100).unwrap();
+        assert_eq!(renamed, vec!["1000-42.jpg".to_string()]);
+    }
+
+    #[test]
+    fn associate_track_moves_sidecars_along_with_the_renamed_crop() {
+        let dir = temp_dir("track-sidecars");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("1000-unknown.jpg");
+        fs::write(&src, b"x").unwrap();
+        save_embedding(&src, &[0.0f32; embed::EMBED_DIM]).unwrap();
+        save_guess_file(&src, &Guess { cat: "Kitty".to_string(), score: 0.7 }).unwrap();
+        associate_track_in(&dir, 42, 1000).unwrap();
+        assert!(dir.join("1000-42.emb").exists());
+        assert_eq!(
+            load_guess(&dir.join("1000-42.jpg")),
+            Some(Guess { cat: "Kitty".to_string(), score: 0.7 })
+        );
+    }
+
+    #[test]
+    fn associate_track_ignores_crops_already_associated_with_a_real_pet_id() {
+        let dir = temp_dir("track-already-known");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1000-9.jpg"), b"x").unwrap();
+        let renamed = associate_track_in(&dir, 42, 1000).unwrap();
+        assert!(renamed.is_empty());
+        assert!(dir.join("1000-9.jpg").exists());
+    }
+
+    #[test]
+    fn associate_track_never_overwrites_an_existing_destination() {
+        let dir = temp_dir("track-collision");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1000-unknown.jpg"), b"source").unwrap();
+        fs::write(dir.join("1000-42.jpg"), b"already there").unwrap();
+        let renamed = associate_track_in(&dir, 42, 1000).unwrap();
+        assert!(renamed.is_empty());
+        assert_eq!(fs::read(dir.join("1000-unknown.jpg")).unwrap(), b"source");
+        assert_eq!(fs::read(dir.join("1000-42.jpg")).unwrap(), b"already there");
+    }
+
+    #[test]
+    fn list_samples_returns_a_cats_crops_sorted_by_ts() {
+        let root = temp_dir("samples-root");
+        let pending = temp_dir("samples-pending");
+        fs::create_dir_all(root.join("Rashy")).unwrap();
+        fs::write(root.join("Rashy").join("200-unknown.jpg"), b"x").unwrap();
+        fs::write(root.join("Rashy").join("100-unknown.jpg"), b"x").unwrap();
+        let samples = list_samples_in(&root, &pending, "Rashy").unwrap();
+        let names: Vec<String> = samples.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["100-unknown.jpg".to_string(), "200-unknown.jpg".to_string()]);
+    }
+
+    #[test]
+    fn list_samples_reports_not_found_for_an_unknown_cat() {
+        let root = temp_dir("samples-missing-root");
+        let pending = temp_dir("samples-missing-pending");
+        fs::create_dir_all(&root).unwrap();
+        assert!(matches!(list_samples_in(&root, &pending, "Ghost"), Err(FaceError::NotFound)));
+    }
+
+    #[test]
+    fn list_samples_rejects_the_pending_staging_directory_as_a_cat() {
+        let root = temp_dir("samples-pending-guard-root");
+        let pending = root.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("1-unknown.jpg"), b"x").unwrap();
+        assert!(matches!(list_samples_in(&root, &pending, "pending"), Err(FaceError::NotFound)));
+    }
+
+    #[test]
+    fn read_sample_returns_the_raw_bytes() {
+        let root = temp_dir("read-sample-root");
+        let pending = temp_dir("read-sample-pending");
+        fs::create_dir_all(root.join("Rashy")).unwrap();
+        fs::write(root.join("Rashy").join("1-unknown.jpg"), b"crop bytes").unwrap();
+        assert_eq!(read_sample_in(&root, &pending, "Rashy", "1-unknown.jpg").unwrap(), b"crop bytes");
+    }
+
+    #[test]
+    fn read_sample_rejects_traversal_in_either_the_cat_or_the_name() {
+        let root = temp_dir("read-sample-bad-root");
+        let pending = temp_dir("read-sample-bad-pending");
+        assert!(matches!(
+            read_sample_in(&root, &pending, "../escape", "a.jpg"),
+            Err(FaceError::InvalidCat(_))
+        ));
+        assert!(matches!(
+            read_sample_in(&root, &pending, "Rashy", "../a.jpg"),
+            Err(FaceError::InvalidName)
+        ));
+    }
+
+    #[test]
+    fn read_sample_reports_not_found_for_a_missing_file() {
+        let root = temp_dir("read-sample-missing-root");
+        let pending = temp_dir("read-sample-missing-pending");
+        fs::create_dir_all(root.join("Rashy")).unwrap();
+        assert!(matches!(
+            read_sample_in(&root, &pending, "Rashy", "ghost.jpg"),
+            Err(FaceError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn nearest_sample_picks_the_crop_closest_to_the_cats_centroid() {
+        let root = temp_dir("nearest-sample");
+        fs::create_dir_all(root.join("Rashy")).unwrap();
+        let a = root.join("Rashy").join("1-unknown.jpg");
+        let b = root.join("Rashy").join("2-unknown.jpg");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let mut feat_a = [0.0f32; embed::EMBED_DIM];
+        feat_a[0] = 1.0;
+        let mut feat_b = [0.0f32; embed::EMBED_DIM];
+        feat_b[0] = 1.0;
+        feat_b[1] = 1.0;
+        save_embedding(&a, &feat_a).unwrap();
+        save_embedding(&b, &feat_b).unwrap();
+
+        // Centroid is built from `a` alone, so `a` is an exact match (cosine 1.0) and `b` -- a
+        // different direction -- scores lower.
+        let mut classifier = catid::Classifier::new();
+        classifier.label("Rashy", &feat_a);
+        let cat_model = classifier.cats().next().expect("just labelled");
+
+        let crops = vec![
+            LabelledCrop {
+                cat: "Rashy".to_string(),
+                name: "1-unknown.jpg".to_string(),
+                jpg_path: a.clone(),
+                mtime: SystemTime::now(),
+            },
+            LabelledCrop {
+                cat: "Rashy".to_string(),
+                name: "2-unknown.jpg".to_string(),
+                jpg_path: b.clone(),
+                mtime: SystemTime::now(),
+            },
+        ];
+        assert_eq!(nearest_sample(cat_model, &crops), Some("1-unknown.jpg".to_string()));
     }
 }

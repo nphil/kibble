@@ -121,7 +121,9 @@ impl CatModel {
 
     /// Cosine similarity of an already-normalised query against this cat's centroid direction.
     /// `None` if this cat has no samples (nothing to compare against) or its sum is degenerate.
-    fn cosine_to(&self, query_normalized: &[f32; EMBED_DIM]) -> Option<f32> {
+    /// `pub`: `faces.rs`'s `GET /cats` `"avatar"` selection (nearest labelled sample to the
+    /// centroid) is the one caller outside this module, and the minimal accessor it needs.
+    pub fn cosine_to(&self, query_normalized: &[f32; EMBED_DIM]) -> Option<f32> {
         if self.count == 0 {
             return None;
         }
