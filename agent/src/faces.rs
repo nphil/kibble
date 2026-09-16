@@ -420,17 +420,27 @@ pub struct Gallery {
 }
 
 /// Every cat directory under [`FACES_ROOT`], including ones with no crops yet, excluding the
-/// reserved buckets (`pending`, `other`, `not_a_cat`). Used by [`Gallery::load`] so an enrolled
-/// cat survives a restart before it has its first labelled sample.
+/// reserved buckets ([`RESERVED_BUCKETS`]) and the pending-crop staging directory. Used by
+/// [`Gallery::load`] so an enrolled cat survives a restart before it has its first labelled
+/// sample.
+///
+/// `pending` lives *inside* `FACES_ROOT` but is not a reserved bucket (it is a staging area, not
+/// a label), so it has to be excluded explicitly -- otherwise it is enrolled as a cat named
+/// "pending", which is exactly what happened the first time this function shipped.
 fn list_enrolled_cats() -> Vec<String> {
-    let Ok(read) = fs::read_dir(FACES_ROOT) else { return Vec::new() };
+    list_enrolled_cats_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR))
+}
+
+fn list_enrolled_cats_in(faces_root: &Path, pending_dir: &Path) -> Vec<String> {
+    let pending_name = pending_dir.file_name().and_then(|s| s.to_str()).unwrap_or("pending");
+    let Ok(read) = fs::read_dir(faces_root) else { return Vec::new() };
     let mut out = Vec::new();
     for entry in read.filter_map(|e| e.ok()) {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_safe_name(&name) && !is_reserved_bucket(&name) {
+        if is_safe_name(&name) && !is_reserved_bucket(&name) && name != pending_name {
             out.push(name);
         }
     }
@@ -550,6 +560,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kibble-faces-test-{tag}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A cat enrolled but not yet labelled is only an empty directory; it must still be listed,
+    /// or `Gallery::load` forgets it on the next restart (observed live: two cats added, gone
+    /// after the following deploy).
+    #[test]
+    fn enrolled_cats_include_sample_less_directories() {
+        let root = temp_dir("enrolled");
+        let pending = root.join("pending");
+        fs::create_dir_all(root.join("Kitty")).unwrap();
+        fs::create_dir_all(root.join("Pancake")).unwrap();
+        fs::create_dir_all(&pending).unwrap();
+        assert_eq!(list_enrolled_cats_in(&root, &pending), vec!["Kitty", "Pancake"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `pending` lives inside `FACES_ROOT` but is a staging area, not a label -- listing it
+    /// enrolled a phantom cat named "pending", which shipped once and was caught in HA.
+    #[test]
+    fn enrolled_cats_exclude_pending_and_reserved_buckets() {
+        let root = temp_dir("buckets");
+        let pending = root.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::create_dir_all(root.join(SKIP_BUCKET)).unwrap();
+        fs::create_dir_all(root.join(NOT_A_CAT_BUCKET)).unwrap();
+        fs::create_dir_all(root.join("Kitty")).unwrap();
+        assert_eq!(list_enrolled_cats_in(&root, &pending), vec!["Kitty"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
