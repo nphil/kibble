@@ -1102,7 +1102,7 @@ mod tests {
             Entry { id: "off".into(), minute_of_day: 8 * 60, amount_l: 1, amount_r: 1, enabled: false },
         ];
         let schedule = Schedule::seed_for_test(path.clone(), entries);
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let now = tz.local_to_utc(localtime::Civil { year: 2026, month: 1, day: 15 }, 6 * 3600);
         let json = schedule.snapshot_json(&tz, now, false);
         assert!(json.contains(r#""scheduler_enabled":false"#));

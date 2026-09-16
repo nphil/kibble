@@ -99,6 +99,7 @@ mod embed;
 mod faces;
 mod feed_capture;
 mod g711;
+mod health;
 mod http;
 mod md5;
 mod persist;
@@ -134,6 +135,7 @@ const DEFAULT_BIND: &str = "0.0.0.0:8765";
 const RTSP_BIND: &str = "0.0.0.0:8554";
 
 fn main() {
+    let health = health::record_start();
     let bind = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_BIND.to_string());
 
     match backup::backup_once() {
@@ -147,6 +149,11 @@ fn main() {
             "kibbled: could not back up /opt/user.conf: {e} (continuing — settings writes never touch that file)"
         ),
     }
+    eprintln!(
+        "kibbled: start_count={} (this boot; {} = 1 means first start since /opt/kibble/health.json was last cleared)",
+        health.start_count,
+        health.start_count
+    );
 
     let shm = Shm::open().unwrap_or_else(|e| die(&format!("open {}: {e}", state::SHM_PATH)));
     // Shared, not leaked: the request-handling closure below borrows it for the life of the
@@ -224,6 +231,7 @@ fn main() {
             &tail,
             &speaker_owner,
             &gallery,
+            health,
         )
     });
 }
@@ -246,10 +254,11 @@ fn route(
     tail: &Arc<ring::TailCursor>,
     speaker_owner: &Arc<audioout::SpeakerOwner>,
     gallery: &faces::Gallery,
+    health: health::Health,
 ) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
-        ("GET", "/state") => Response::Json(shm.snapshot().to_json()),
+        ("GET", "/state") => Response::Json(state_json(shm, health)),
         ("GET", "/config") => Response::Json(settings::to_json(shm)),
         ("POST", "/config") => config_write(req),
         ("POST", "/feed") => feed(req, ble, capture),
@@ -294,12 +303,48 @@ fn route(
         ("GET", "/wifi/scan") => Response::Json(wifi::scan_json()),
         ("POST", "/wifi/connect") => wifi_connect(req),
         ("POST", "/wifi/forget") => wifi_forget(req),
+        ("GET", "/audio") => Response::Json(audio_status_json()),
+        ("POST", "/audio") => audio_write(req),
         ("POST", "/speak") => speak(req, tail, speaker_owner),
         ("GET", "/clips") => Response::Json(clips_json()),
         (method, p) if p.starts_with("/clips/") => {
             clip_route(method, &p["/clips/".len()..], req, tail, speaker_owner)
         }
         _ => Response::NotFound,
+    }
+}
+
+/// Merges kibbled's own process-health fields (docs/23-audio-codec.md §19 -- visible restart
+/// tracking, so a crash loop shows up on a dashboard instead of needing a kernel-log
+/// investigation) onto the vendor-state JSON `Snapshot::to_json` already builds, rather than
+/// teaching `state.rs` (which is otherwise only about the vendor's own `config_shm`) about
+/// kibbled's own bookkeeping.
+fn state_json(shm: &Shm, health: health::Health) -> String {
+    let base = shm.snapshot().to_json();
+    let exit_code = health::last_exit_code().map_or("null".to_string(), |c| c.to_string());
+    format!(
+        r#"{},"kibbled_start_count":{},"kibbled_last_start_unix":{},"kibbled_last_exit_code":{}}}"#,
+        &base[..base.len() - 1],
+        health.start_count,
+        health.last_start_unix,
+        exit_code,
+    )
+}
+
+/// `GET /audio`: whether the off-by-default audio gate (`audioout::enabled`,
+/// docs/23-audio-codec.md §19) is currently on.
+fn audio_status_json() -> String {
+    format!(r#"{{"enabled":{}}}"#, audioout::enabled())
+}
+
+fn audio_write(req: &Request) -> Response {
+    let enabled = match json_field(&req.body_str(), "enabled") {
+        Some(v) => v != "false",
+        None => return Response::BadRequest(r#""enabled" is required"#.into()),
+    };
+    match audioout::set_enabled(enabled) {
+        Ok(()) => Response::Json(format!(r#"{{"enabled":{enabled}}}"#)),
+        Err(e) => Response::Error(e.to_string()),
     }
 }
 

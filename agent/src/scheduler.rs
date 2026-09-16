@@ -18,9 +18,15 @@
 //!    was down.
 //! 2. **DST/clock-change safe.** Every cycle recomputes "is this due" from the current wall
 //!    clock via [`localtime::Tz::local_to_utc`] (never a cached UTC instant plus 86400) -- see
-//!    that module's doc for why this device's DST rule is hardcoded rather than read from the OS
-//!    (`/etc/localtime` is deleted at boot, `docs/02-boot.md`). A manual clock change is handled
-//!    identically: there is no cached "next deadline" anywhere in this module, only "now".
+//!    `localtime.rs`'s own doc for why this device's zone is read live from `config_shm`
+//!    (`state::Shm::timezone_name`) rather than from the OS (`/etc/localtime` is deleted at
+//!    boot, `docs/02-boot.md` -- a real trap: a naive `libc::localtime_r` port would silently
+//!    compute everything as UTC and no developer-machine test would ever catch it) or from a
+//!    single hardcoded rule (a device some day reconfigured to a zone this project has no DST
+//!    rule for must never silently feed at the wrong hour -- `main.rs` refuses to spawn this
+//!    module's thread at all in that case; see [`localtime::tz_for_iana_name`]). A manual clock
+//!    change is handled identically: there is no cached "next deadline" anywhere in this module,
+//!    only "now".
 //! 3. **Per-occurrence duplicate-fire tracking survives restarts.**
 //!    [`schedule::Schedule::claim_fire`] persists, per entry id, the local calendar date of the
 //!    last occurrence it resolved (dispensed or missed) to `/opt/kibble/schedule.json` -- the
@@ -36,12 +42,17 @@
 //!    §11.1 item 4 states this exact tradeoff as correct: "a possible extra late feed is bounded
 //!    and recoverable... an unrecorded double-feed is not bounded at all."
 //!
-//! ## Disabled by default
+//! ## Disabled by default, two independent ways to enable
 //!
-//! Set [`ENV_ENABLED`] to `1` or `true` to turn this on; anything else (including unset, the
-//! default) leaves the whole thread unspawned -- `main.rs` never even opens the extra bus sender
-//! dispensing needs. **No automated test in this project ever dispenses real food** -- every
-//! test below injects a [`Dispenser`] stub; see that trait's doc for why.
+//! Set [`ENV_ENABLED`] to `1`/`true`, **or** [`SETTINGS_KEY`] to a nonzero value in
+//! `/opt/kibble/settings.json` (`desired::PATH` -- the same plaintext, human-editable file
+//! `POST /config` already persists into), to turn this on; leaving both unset/off (the default)
+//! leaves the whole thread unspawned -- `main.rs` never even opens the extra bus sender
+//! dispensing needs. The settings-file path exists specifically so enabling this never requires
+//! editing `/opt/app_init.sh` (the boot hook) just to add an environment variable -- write one
+//! key to a file kibbled already reads instead. **No automated test in this project ever
+//! dispenses real food** -- every test below injects a [`Dispenser`] stub; see that trait's doc
+//! for why.
 
 use std::sync::Arc;
 use std::thread;
@@ -100,7 +111,7 @@ pub fn spawn(schedule: Arc<Schedule>, ble: Sender) {
     thread::spawn(move || {
         let dispenser = BusDispenser { ble };
         loop {
-            tick(&schedule, &dispenser, &localtime::DEVICE_TZ, now_utc());
+            tick(&schedule, &dispenser, &localtime::EASTERN, now_utc());
             thread::sleep(TICK_INTERVAL);
         }
     });
@@ -212,7 +223,7 @@ mod tests {
 
     #[test]
     fn entry_not_yet_due_today_does_not_fire() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("notdue");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("dinner", 18 * 60)]);
         // Pre-resolve yesterday's occurrence so this test isolates *today's* not-yet-due
@@ -232,7 +243,7 @@ mod tests {
 
     #[test]
     fn disabled_entry_never_fires_even_when_overdue() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("disabled");
         let mut e = entry("off", 7 * 60);
         e.enabled = false;
@@ -246,7 +257,7 @@ mod tests {
 
     #[test]
     fn exactly_due_now_fires() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("exact");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = StubDispenser::new();
@@ -260,7 +271,7 @@ mod tests {
 
     #[test]
     fn missed_by_10_seconds_still_dispenses() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("missed10s");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = StubDispenser::new();
@@ -273,7 +284,7 @@ mod tests {
 
     #[test]
     fn missed_by_10_hours_is_skipped_not_dispensed() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("missed10h");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = StubDispenser::new();
@@ -286,7 +297,7 @@ mod tests {
 
     #[test]
     fn missed_occurrence_is_never_retried_on_a_later_tick_the_same_day() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("missedlatch");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = StubDispenser::new();
@@ -301,7 +312,7 @@ mod tests {
 
     #[test]
     fn dst_transition_uses_the_correct_local_instant_not_a_flat_86400_step() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("dst");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("evening", 17 * 60 + 25)]);
         let dispenser = StubDispenser::new();
@@ -342,7 +353,7 @@ mod tests {
                 Ok(())
             }
         }
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("recordfirst");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let due = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
@@ -354,7 +365,7 @@ mod tests {
 
     #[test]
     fn restart_after_a_crash_between_record_and_dispense_never_double_feeds() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("restartmid");
         let due = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
         {
@@ -378,7 +389,7 @@ mod tests {
 
     #[test]
     fn duplicate_fire_is_suppressed_across_a_full_restart() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("duprestart");
         let due = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
         {
@@ -405,7 +416,7 @@ mod tests {
                 Err("simulated bus failure".into())
             }
         }
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("dispensefail");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = FailingDispenser { calls: StdMutex::new(0) };
@@ -425,12 +436,12 @@ mod tests {
         let path = tmp_path("tickrace");
         let schedule = Arc::new(Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]));
         let dispenser = Arc::new(StubDispenser::new());
-        let due = localtime::DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
+        let due = localtime::EASTERN.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let schedule = Arc::clone(&schedule);
                 let dispenser = Arc::clone(&dispenser);
-                std::thread::spawn(move || tick(&schedule, dispenser.as_ref(), &localtime::DEVICE_TZ, due))
+                std::thread::spawn(move || tick(&schedule, dispenser.as_ref(), &localtime::EASTERN, due))
             })
             .collect();
         for h in handles {
@@ -444,7 +455,7 @@ mod tests {
 
     #[test]
     fn scheduler_advances_to_the_next_days_occurrence_without_refiring_the_prior_one() {
-        let tz = localtime::DEVICE_TZ;
+        let tz = localtime::EASTERN;
         let path = tmp_path("advance");
         let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
         let dispenser = StubDispenser::new();

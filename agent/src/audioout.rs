@@ -71,6 +71,40 @@ use crate::ring::{self, TailCursor};
 /// Where `tools/aacenc/build.sh` deploys its output, alongside `kibbled` itself.
 pub const AACENC_PATH: &str = "/opt/kibble/aacenc";
 
+/// Off-by-default safety gate (docs/23-audio-codec.md §19): presence of this file is the *only*
+/// thing that allows any code in this module to touch `media`'s bus queue or the ring's
+/// `CHAN_AUDIO_OUT` slot. Absent by default on a fresh `/opt/kibble` -- audio stays fully inert
+/// until a human explicitly turns it on via `POST /audio {"enabled": true}`. This exists because
+/// an earlier, flag-less build sent an unconditional `speak_stop` from every process start
+/// (`SpeakerOwner::new()`, now deleted below) and silently ended a real household talkback
+/// session mid-call the one time `kibbled` happened to restart during one -- see §19 for the
+/// full incident. Checked at the single chokepoint every audio-output path shares
+/// ([`SpeakerOwner::try_acquire`]), not scattered across every caller, so there is exactly one
+/// place this guarantee can be gotten wrong.
+const AUDIO_ENABLED_PATH: &str = "/opt/kibble/audio_enabled";
+
+/// `true` iff a human has explicitly turned audio on (see [`AUDIO_ENABLED_PATH`]'s doc comment).
+/// A plain existence check, not a parsed value -- there is nothing to parse wrong.
+pub fn enabled() -> bool {
+    std::path::Path::new(AUDIO_ENABLED_PATH).exists()
+}
+
+/// Flips the flag [`enabled`] reads. Creating the file is the only "on" state; removing it (or
+/// it never having existed) is "off" -- `remove_file`'s `NotFound` is not an error here, since
+/// "already off" is a completely normal request to make.
+pub fn set_enabled(on: bool) -> io::Result<()> {
+    if on {
+        std::fs::write(AUDIO_ENABLED_PATH, b"")
+    } else {
+        match std::fs::remove_file(AUDIO_ENABLED_PATH) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+
 /// One AAC-LC access unit's sample count at 16kHz -- the encoder's own fixed frame length
 /// (`docs/23-audio-codec.md` §2.1: `AACENC_GRANULE_LENGTH` is never overridden, so it stays at
 /// FDK's 1024-sample default), and the ring's own real-time cadence unit.
@@ -135,17 +169,28 @@ pub struct SpeakerOwner(AtomicBool);
 
 impl SpeakerOwner {
     pub fn new() -> Arc<Self> {
-        // Best-effort, non-fatal: clears a guard flag a previous kibbled crash may have left
-        // stuck at `1` (docs/23-audio-codec.md §17.4 -- nothing else ever clears it, and
-        // stopping when nothing is running is itself a harmless, logged no-op on the vendor
-        // side). Runs exactly once, here, so `main.rs` doesn't need its own startup hook.
-        AudioOutThread::clear_stale_guard_flag();
+        // No vendor bus message and no ring access happens here, deliberately: a process start
+        // must never be able to send a command that could end a session it does not own.
+        // docs/23-audio-codec.md §19 -- an earlier version of this function sent an
+        // unconditional `speak_stop` here to clear a crash-stuck guard flag, and the one time
+        // `kibbled` happened to restart during a real household talkback, that autonomous send
+        // ended the vendor's own live session mid-call. If a stale-flag cleanup is ever needed
+        // again it must be an explicit, audio-flag-gated action a human asks for -- see
+        // `try_acquire` below for the one gate every audio-output path shares -- never something
+        // that fires on process start, a crash-loop, or any other non-request-triggered path.
         Arc::new(Self(AtomicBool::new(false)))
     }
 
-    /// Claims exclusive ownership, or returns the reason it couldn't: another kibbled-internal
-    /// session already holds it, or the vendor's own uplink looks active.
+    /// Claims exclusive ownership, or returns the reason it couldn't: audio is off, a live app
+    /// talk session looks active, or another kibbled-internal session already holds it. This is
+    /// the single chokepoint every audio-output path shares (`/speak`, `/clips/<name>/play`, the
+    /// RTSP backchannel) -- gating it here, once, is what makes "nothing touches `media` or the
+    /// ring unless `enabled()` is true" a real guarantee instead of a convention callers could
+    /// forget (docs/23-audio-codec.md §19).
     pub fn try_acquire(self: &Arc<Self>) -> Result<OwnerGuard, &'static str> {
+        if !enabled() {
+            return Err("audio is disabled (POST /audio {\"enabled\":true} to enable)");
+        }
         if call_active() {
             return Err("a live app talk session appears active (/proc/ax_proc/aenc)");
         }
@@ -185,12 +230,6 @@ impl AudioOutThread {
     fn start() -> Result<Self, SpeakError> {
         send(bus::msg::SPEAK_START)?;
         Ok(Self)
-    }
-
-    fn clear_stale_guard_flag() {
-        if let Err(e) = send(bus::msg::SPEAK_STOP) {
-            eprintln!("kibbled: startup speak_stop: {e}");
-        }
     }
 }
 

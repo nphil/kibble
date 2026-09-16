@@ -8,23 +8,31 @@
 //! declaration, the pattern this project already uses for `mq_open`/`flock` rather than pulling in
 //! the `libc` crate) would silently compute everything as UTC, not the device's real, configured
 //! zone -- wrong, and wrong in a way a unit test running on a developer machine (which usually
-//! *does* have `/etc/localtime`) would never catch. So this module hardcodes the one DST rule this
-//! device actually needs and computes it in pure, dependency-free, fully unit-testable Rust.
+//! *does* have `/etc/localtime`) would never catch. So this module computes DST arithmetic in
+//! pure, dependency-free, fully unit-testable Rust instead, against a zone read live from the
+//! device (see below) rather than from any OS-level source.
 //!
-//! **The zone:** `docs/07-config.md` and `appendix-config-layout.json` both independently confirm
-//! `config_shm`'s own `usr.user_info.timezone_name` reads `"America/New_York"` (and
-//! `usr.user_info.timezone` reads the matching `-4.0` float, EDT, in the same live capture) --
-//! this is Nitin's real, configured zone, not a guess. `docs/28-schedule-encoding.md` §11.1 item 2
-//! requires DST-safe local-time arithmetic; [`DEVICE_TZ`] plus [`Tz::local_to_utc`] is that
-//! arithmetic, re-derived from the current wall clock on every call rather than ever caching a
-//! fixed UTC instant.
+//! ## The zone is read from the device, not hardcoded
 //!
-//! **The rule:** DST runs from 02:00 local standard time on the second Sunday of March to 02:00
-//! local daylight time on the first Sunday of November (the U.S. Energy Policy Act of 2005,
-//! in effect every year since 2007 -- no exceptions or year-dependent variation to account for).
-//! If this device is ever reconfigured to a different zone, [`DEVICE_TZ`] is the one constant to
-//! change; nothing else in this module is US-specific (`Tz` itself is a plain fixed-offset-plus-
-//! one-DST-rule type, not hardcoded to any particular zone).
+//! `docs/07-config.md` and `appendix-config-layout.json` both independently confirm
+//! `config_shm`'s own `usr.user_info.timezone_name` field carries the device's real, cloud-
+//! configured zone as a plain string (e.g. `"America/New_York"`, cross-checked live against the
+//! matching `-4.0` `usr.user_info.timezone` float, EDT, in the same capture) -- `state.rs` reads
+//! it (`Shm::timezone_name`) at startup. This module does **not** hardcode "the device's zone is
+//! X"; [`tz_for_iana_name`] is a small, explicit table of the U.S. zones it knows a DST rule for
+//! (every zone shares the identical *dates*, only the fixed offset differs, or -- Arizona,
+//! Hawaii, Puerto Rico -- there is no DST at all). A name outside that table returns `None`, and
+//! `main.rs` **refuses to run the scheduler at all** rather than guess -- STUDY-schedule-
+//! encoding.md §11.1 item 2 requires DST-safe arithmetic, and a device some day reconfigured to
+//! an unrecognized zone must never silently feed at the wrong local hour. Every decision
+//! recomputes from the current wall clock every tick, via [`Tz::local_to_utc`], never a cached
+//! UTC instant plus 86400.
+//!
+//! **The rule**, for every DST-observing U.S. zone: 02:00 local standard time on the second
+//! Sunday of March to 02:00 local daylight time on the first Sunday of November (the U.S. Energy
+//! Policy Act of 2005, in effect every year since 2007 -- no exceptions or year-dependent
+//! variation to account for). A non-DST zone (Arizona, Hawaii, Puerto Rico) just sets
+//! `dst_offset_secs == std_offset_secs`.
 //!
 //! ## The two edge cases every DST rule has, resolved explicitly (not left to chance)
 //!
@@ -114,8 +122,37 @@ pub struct Tz {
     pub dst_offset_secs: i64,
 }
 
-/// This device's real, confirmed zone -- see the module doc for the evidence.
-pub const DEVICE_TZ: Tz = Tz { std_offset_secs: -5 * 3600, dst_offset_secs: -4 * 3600 };
+pub const EASTERN: Tz = Tz { std_offset_secs: -5 * 3600, dst_offset_secs: -4 * 3600 };
+pub const CENTRAL: Tz = Tz { std_offset_secs: -6 * 3600, dst_offset_secs: -5 * 3600 };
+pub const MOUNTAIN: Tz = Tz { std_offset_secs: -7 * 3600, dst_offset_secs: -6 * 3600 };
+pub const PACIFIC: Tz = Tz { std_offset_secs: -8 * 3600, dst_offset_secs: -7 * 3600 };
+pub const ALASKA: Tz = Tz { std_offset_secs: -9 * 3600, dst_offset_secs: -8 * 3600 };
+/// Arizona does not observe DST (a long-standing, permanent state exception, not a data gap).
+pub const ARIZONA: Tz = Tz { std_offset_secs: -7 * 3600, dst_offset_secs: -7 * 3600 };
+/// Hawaii does not observe DST.
+pub const HAWAII: Tz = Tz { std_offset_secs: -10 * 3600, dst_offset_secs: -10 * 3600 };
+/// Puerto Rico (Atlantic Standard Time) does not observe DST.
+pub const PUERTO_RICO: Tz = Tz { std_offset_secs: -4 * 3600, dst_offset_secs: -4 * 3600 };
+
+/// Resolves an IANA zone name (as read from `config_shm`'s `usr.user_info.timezone_name`, e.g.
+/// via `state::Shm::timezone_name`) to a [`Tz`] this module knows how to compute DST for.
+/// `None` for anything outside this explicit table -- including a real, valid IANA name this
+/// table simply doesn't cover yet -- by design (see the module doc): guessing a DST rule for an
+/// unrecognized zone risks a feed at the wrong local hour, which is worse than refusing to
+/// schedule at all.
+pub fn tz_for_iana_name(name: &str) -> Option<Tz> {
+    match name {
+        "America/New_York" | "America/Detroit" | "America/Indiana/Indianapolis" => Some(EASTERN),
+        "America/Chicago" => Some(CENTRAL),
+        "America/Denver" | "America/Boise" => Some(MOUNTAIN),
+        "America/Los_Angeles" => Some(PACIFIC),
+        "America/Anchorage" => Some(ALASKA),
+        "America/Phoenix" => Some(ARIZONA),
+        "Pacific/Honolulu" => Some(HAWAII),
+        "America/Puerto_Rico" => Some(PUERTO_RICO),
+        _ => None,
+    }
+}
 
 impl Tz {
     fn observes_dst(&self) -> bool {
@@ -258,23 +295,23 @@ mod tests {
         // Independently verified: `datetime(2026,9,16,17,25,tzinfo=ZoneInfo("America/New_York"))
         // .timestamp()` == 1789593900.
         let date = Civil { year: 2026, month: 9, day: 16 };
-        assert_eq!(DEVICE_TZ.local_to_utc(date, 17 * 3600 + 25 * 60), 1_789_593_900);
-        assert!(DEVICE_TZ.is_dst(1_789_593_900), "September must be DST");
+        assert_eq!(EASTERN.local_to_utc(date, 17 * 3600 + 25 * 60), 1_789_593_900);
+        assert!(EASTERN.is_dst(1_789_593_900), "September must be DST");
     }
 
     #[test]
     fn plain_winter_day_is_standard_time() {
         let date = Civil { year: 2026, month: 1, day: 15 };
-        assert_eq!(DEVICE_TZ.local_to_utc(date, 7 * 3600 + 30 * 60), 1_768_480_200);
-        assert!(!DEVICE_TZ.is_dst(1_768_480_200));
+        assert_eq!(EASTERN.local_to_utc(date, 7 * 3600 + 30 * 60), 1_768_480_200);
+        assert!(!EASTERN.is_dst(1_768_480_200));
     }
 
     #[test]
     fn to_local_is_the_exact_inverse_of_local_to_utc_on_ordinary_days() {
         let date = Civil { year: 2026, month: 9, day: 16 };
         let sod = 17 * 3600 + 25 * 60;
-        let utc = DEVICE_TZ.local_to_utc(date, sod);
-        assert_eq!(DEVICE_TZ.to_local(utc), (date, sod));
+        let utc = EASTERN.local_to_utc(date, sod);
+        assert_eq!(EASTERN.to_local(utc), (date, sod));
     }
 
     // --- DST-safety: no drift across the transition (STUDY-schedule-encoding.md \u00a711.1 item 2) --
@@ -283,26 +320,26 @@ mod tests {
     fn same_local_time_of_day_stays_the_same_local_time_across_the_spring_transition() {
         // 2026-03-07 (before "spring forward") and 2026-03-09 (after) both at 17:25 local --
         // independently verified against Python zoneinfo: 1772922300 and 1773091500.
-        let before = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 3, day: 7 }, 17 * 3600 + 25 * 60);
-        let after = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 3, day: 9 }, 17 * 3600 + 25 * 60);
+        let before = EASTERN.local_to_utc(Civil { year: 2026, month: 3, day: 7 }, 17 * 3600 + 25 * 60);
+        let after = EASTERN.local_to_utc(Civil { year: 2026, month: 3, day: 9 }, 17 * 3600 + 25 * 60);
         assert_eq!(before, 1_772_922_300);
         assert_eq!(after, 1_773_091_500);
         // Two calendar days apart, minus the one hour "spring forward" loses -- proves this is
         // real timezone-aware arithmetic, not a cached UTC instant plus a flat 2*86400.
         assert_eq!(after - before, 2 * 86_400 - 3600);
         // And both, converted back, really do read 17:25 local -- the whole point of item 2.
-        assert_eq!(DEVICE_TZ.to_local(before).1, 17 * 3600 + 25 * 60);
-        assert_eq!(DEVICE_TZ.to_local(after).1, 17 * 3600 + 25 * 60);
+        assert_eq!(EASTERN.to_local(before).1, 17 * 3600 + 25 * 60);
+        assert_eq!(EASTERN.to_local(after).1, 17 * 3600 + 25 * 60);
     }
 
     #[test]
     fn same_local_time_of_day_stays_the_same_local_time_across_the_fall_transition() {
-        let before = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 10, day: 30 }, 17 * 3600 + 25 * 60);
-        let after = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 11, day: 2 }, 17 * 3600 + 25 * 60);
+        let before = EASTERN.local_to_utc(Civil { year: 2026, month: 10, day: 30 }, 17 * 3600 + 25 * 60);
+        let after = EASTERN.local_to_utc(Civil { year: 2026, month: 11, day: 2 }, 17 * 3600 + 25 * 60);
         // Three calendar days apart, plus the one hour "fall back" gains.
         assert_eq!(after - before, 3 * 86_400 + 3600);
-        assert_eq!(DEVICE_TZ.to_local(before).1, 17 * 3600 + 25 * 60);
-        assert_eq!(DEVICE_TZ.to_local(after).1, 17 * 3600 + 25 * 60);
+        assert_eq!(EASTERN.to_local(before).1, 17 * 3600 + 25 * 60);
+        assert_eq!(EASTERN.to_local(after).1, 17 * 3600 + 25 * 60);
     }
 
     // --- DST edge cases: the skipped and repeated hour, resolved explicitly ----------------
@@ -312,9 +349,9 @@ mod tests {
         // 2026-11-01 01:30 local occurs twice. Independently verified against Python zoneinfo:
         // fold=0 (still-EDT, first) == 1793511000; fold=1 (already-EST, second) == 1793514600.
         let date = Civil { year: 2026, month: 11, day: 1 };
-        let resolved = DEVICE_TZ.local_to_utc(date, 1 * 3600 + 30 * 60);
+        let resolved = EASTERN.local_to_utc(date, 1 * 3600 + 30 * 60);
         assert_eq!(resolved, 1_793_511_000, "must resolve to the earlier (still-daylight) instant");
-        assert!(DEVICE_TZ.is_dst(resolved), "the earlier instant is still on daylight time");
+        assert!(EASTERN.is_dst(resolved), "the earlier instant is still on daylight time");
     }
 
     #[test]
@@ -323,7 +360,7 @@ mod tests {
         // computed by hand-replicating this exact algorithm in Python and cross-checked against
         // the real transition instant (1_772_953_200, i.e. 02:00:00 EST becomes 03:00:00 EDT).
         let date = Civil { year: 2026, month: 3, day: 8 };
-        let resolved = DEVICE_TZ.local_to_utc(date, 2 * 3600 + 30 * 60);
+        let resolved = EASTERN.local_to_utc(date, 2 * 3600 + 30 * 60);
         assert_eq!(resolved, 1_772_955_000);
         assert!(resolved > 1_772_953_200, "must resolve to after the real transition instant, never before it");
     }
@@ -333,20 +370,20 @@ mod tests {
     #[test]
     fn next_occurrence_is_today_if_still_ahead_else_tomorrow() {
         // "now" = 2026-01-15 08:00:00 local.
-        let now = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 8 * 3600);
+        let now = EASTERN.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 8 * 3600);
         assert_eq!(now, 1_768_482_000);
         // An 07:00 entry already passed today -> next occurrence is tomorrow's 07:00.
-        assert_eq!(next_occurrence_utc(&DEVICE_TZ, 7 * 60, now), 1_768_564_800);
+        assert_eq!(next_occurrence_utc(&EASTERN, 7 * 60, now), 1_768_564_800);
         // A 09:00 entry hasn't happened yet today -> next occurrence is today's 09:00.
-        assert_eq!(next_occurrence_utc(&DEVICE_TZ, 9 * 60, now), 1_768_485_600);
+        assert_eq!(next_occurrence_utc(&EASTERN, 9 * 60, now), 1_768_485_600);
     }
 
     #[test]
     fn next_occurrence_right_at_the_boundary_is_still_today() {
-        let now = DEVICE_TZ.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 8 * 3600);
+        let now = EASTERN.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 8 * 3600);
         // An entry due at exactly "now" has not yet strictly passed -> still today (a caller
         // evaluating "is it due" at this exact instant should see it as due-now, not tomorrow).
-        assert_eq!(next_occurrence_utc(&DEVICE_TZ, 8 * 60, now), now);
+        assert_eq!(next_occurrence_utc(&EASTERN, 8 * 60, now), now);
     }
 
     // --- a zone with no DST rule at all behaves as plain fixed offset -----------------------
