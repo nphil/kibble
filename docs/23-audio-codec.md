@@ -1842,21 +1842,113 @@ of agora's double-write" is [MED] by construction rather than [HIGH] by control.
 "15+ s clean" acceptance run therefore did not pass today for a reason outside this project;
 the rollback control is the one-ask experiment that would settle it.
 
-### 20.4 Design decision for live talkback
+### 20.4 Design decision for live talkback -- superseded by §20.6
 
-Option (b) -- **chunked-file near-real-time talkback over `play_aac_file`** -- is the one
-path proven audible from `kibbled`, and §20.1's back-to-back test shows `media` serializes
-queued files gaplessly, so ~0.5-1 s chunks give continuous speech at ~1 s latency with zero
-ring or mutex exposure and no dependence on the unexplained `speak_start` start-position
-protocol. Options (a)/(c) stay closed until the [OPEN] item in §20.2 is resolved (a
-`speak_start` payload capture, e.g. from `agora`'s send buffer, would do it). The RTSP
-backchannel (docs/20) should feed a `LiveSession`-shaped encoder whose drainer writes
-chunk files and sends `PLAY_AAC_FILE` per chunk, reusing `play_path`'s `SndFrm` wait.
+This section originally picked **chunked files** over `play_aac_file`, reasoning from §20.1's
+back-to-back test (two queued files, `SndFrm` +46 continuous, no plateau). The listening tests
+in §20.6 refuted that: the driver counter cannot see a gap at a file boundary, and every
+boundary is audible. The shipped design is one `play_aac_file` on a **named pipe** (§20.6.2).
+Options (a)/(c) -- mimicking `speak_start` or the bookmark trick -- stay closed, and are no
+longer needed: the [OPEN] item in §20.2 (how the vendor's consumer learns its start position)
+is now only of archaeological interest, since nothing shipped touches the ring at all.
 
 ### 20.5 Tooling left on the device (all tmpfs)
 
 `/tmp/ringmon` (this session's build: args `<secs> <log> [tick_ms] [row_ms]`), `/tmp/sendmsg`
 (older build stamping `src=1`; handlers ignore it), `/tmp/s1.sh` (0.28 s shell sampler),
-`/tmp/kt.aac`. `kibbled`'s stdout/stderr still go to `/dev/null` (§19.5's `app_init.sh` log
-split remains undeployed), so `spawn_playback`'s `played/handed-off` line is not yet
-observable on-device.
+`/tmp/kt.aac`, `/tmp/toneA.aac` + `/tmp/tc*.aac` (§20.6's test tones). `kibbled`'s
+stdout/stderr still go to `/dev/null` (§19.5's `app_init.sh` log split is deployed but writes
+to `/tmp/kibbled.log` only while the supervisor loop owns the process; a hand-restarted
+`kibbled` inherits the telnet session's `/dev/null`), which is why `PlaybackStats` is now also
+served on `GET /audio` as `last_session` -- see §20.7.
+
+## 20.6 Listening tests: what the frame counter cannot see, and the design that came out of it
+
+Author: Main, 2026-09-16 (later the same session). Every result below is Nitin listening to the
+feeder in the room; `SndFrm` agreed with every prediction in all of them, which is exactly the
+point -- **the driver counter proves delivery, not continuity.** Test audio: a 4.000 s 440 Hz
+tone, ADTS AAC-LC/16 kHz/mono, 64 frames.
+
+| # | how the same 64 frames were delivered | `SndFrm` | heard |
+|---|---|---|---|
+| A | one file, one `play_aac_file` | +64 | clean, continuous (the reference) |
+| B | sixteen 4-frame files (250 ms), queued back to back | +64 | **gaps/stutter at the boundaries** |
+| C | one `play_aac_file` on a **named pipe**, fed in 250 ms bursts | +64 | clicks and pops |
+| D | same pipe, fed one frame per 64 ms (real-time cadence) | +64 | **rapid pops throughout** |
+| E | same pipe, fed one frame per 30 ms (ahead of real time), 4-frame pre-roll | +64 | **clean and continuous**, one pop at the start and one at the end |
+
+Conclusions, in the order they change the design:
+
+1. **Queued files are not gapless [HIGH].** §20.1's `SndFrm` +46 "continuous" reading was a
+   false negative: `media` serializes the files (no overlap, no loss) but the decoder/AO
+   restart between them, and the counter advances either way. Chunking is dead.
+2. **One `play_aac_file` can consume a FIFO [HIGH].** `media`'s worker `fopen`/`fread`s the
+   path it is given with no seeking (§18.2), so a named pipe works: one bus message, one
+   decoder session, no boundaries, EOF when the writer closes. Thread count confirms a single
+   worker for the whole session (28 → 29 → 28), and the pipe is `O_RDWR|O_NONBLOCK` on our
+   side so a stalled reader surfaces as `WouldBlock` instead of parking the drainer forever.
+3. **Starvation is the whole audio-quality story [HIGH].** D vs E is one variable -- feed rate
+   vs real time -- and it is the difference between unusable and clean. The AO's own buffer is
+   ~300 ms (`PeriodSize=160`, `AoDepth=30` at 16 kHz), so a feeder that is merely *on time*
+   underruns constantly. Hence the shipped `LiveSession`: an 8-frame (512 ms) pre-roll before
+   the first byte reaches `media`, a filler thread that encodes silence whenever the client's
+   PCM falls more than 6 frames behind the session's own 16 kHz sample clock, and 4 frames of
+   tail silence before EOF (E's start/end pops).
+4. **The sample clock must start with the client's first audio, not with the session [HIGH].**
+   The first Scrypted-driven run inserted 20 silence frames because the clock started at
+   `LiveSession::start` while ffmpeg was still spawning; anchoring it on the first real `feed`
+   dropped that to **zero** silence frames across every run since.
+
+### 20.6.1 End-to-end acceptance, through Scrypted, on the shipped build [HIGH]
+
+`kibbled` md5 `6af73cb5f1ca81e68d4b888cd81cca2d`. Sessions driven by a real WebRTC talkback
+(browser mic → Scrypted's WebRTC plugin → Kibble Scrypted mixin → RTSP backchannel → this
+pipe), read back from `GET /audio`'s `last_session`:
+
+| source | frames handed to `media` | frames the AO emitted | silence inserted | max lag |
+|---|---|---|---|---|
+| `node intercom.mjs` (ffmpeg → Scrypted intercom) | 193 | 193 | 0 | 3 frames |
+| browser WebRTC, 10 s hold | 161 | 161 | 0 | 4 frames |
+| the Kibble card's own hold-to-talk button, 8 s | 130 | 130 | 0 | 2 frames |
+
+Zero dropped frames and zero synthesized silence in every run -- i.e. no gaps, which is more
+than the vendor's own app manages (§20.3: it double-writes every frame and plays at half speed).
+
+### 20.6.2 The shipped path, end to end
+
+```
+phone/browser mic --Opus--> Scrypted WebRTC plugin (sendrecv audio transceiver)
+  --> Kibble Scrypted mixin's Intercom --ffmpeg--> L16/16000 RTP
+  --> kibbled RTSP backchannel (trackID=2, interleaved 4-5, PT 98)
+  --> aacenc (ADTS AAC-LC/16 kHz) --> /tmp/kibble-talk.aac (FIFO)
+  --> one play_aac_file --> media's decoder + AO --> the feeder's speaker
+```
+
+Wideband throughout: the SDP now offers `L16/16000` (PT 98) ahead of PCMU/PCMA, and the plugin
+sends 16 kHz PCM, so nothing is companded or band-limited to 8 kHz between the caller's Opus and
+the feeder's own AAC encoder. G.711 remains for generic ONVIF/go2rtc clients.
+
+Latency budget: 512 ms pre-roll + one encoder frame (64 ms) + the AO's own ~300 ms buffer, so
+roughly 0.9 s mouth-to-speaker, plus whatever WebRTC adds (single-digit ms on the LAN).
+Lowering the pre-roll trades directly against pop-free playback -- test E is the evidence.
+
+### 20.7 What changed in the agent
+
+- `audioout.rs`: the ring writer is **deleted** (`publish`, `lock_ring_mutex`,
+  `WritableRegistry`, `find_append_target`, `build_record`, `write_frame`, plus
+  `speak_start`/`speak_stop` and `AudioOutThread`) -- `media` never consumed one record of it
+  across four sessions of byte-level work, and nothing shipped needs the ring. `ring.rs`'s
+  `TailCursor` and `Header::chan_seq`, which existed only to feed that writer, are gone too.
+- `LiveSession` is now the FIFO streamer described above; `play_path`/`play_bytes` serve
+  `/speak` and `/clips/<name>/play` from ordinary files.
+- `SpeakerOwner::try_acquire` additionally refuses while `media`'s `speak_start` guard flag
+  (`0x767f0`, read from `/proc/<pid>/mem`) is set -- the direct "a real app talkback is running"
+  signal (§19.1/§20.2) -- alongside the existing `/proc/ax_proc/aenc` check. A live session
+  re-checks both every 16 frames and aborts rather than playing over a household talkback.
+- `PlaybackStats` gained `frames_played` (the `SndFrm` delta -- the only ground truth for "it
+  made sound"), `silence_frames` and `max_lag_frames`, and the last session is served on
+  `GET /audio` as `last_session`, since the supervisor still discards `kibbled`'s stderr.
+- `/opt/kibble/audio_enabled` stays the single gate and is **on** now that the household uses
+  the feature; §19.4's hard requirement is met structurally rather than by the flag: no
+  code path outside an explicit `/speak`, `/clips/<name>/play` or RTSP-backchannel `PLAY`
+  can reach `media`'s audio path, and process start sends nothing at all.

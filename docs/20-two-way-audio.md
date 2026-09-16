@@ -1,75 +1,79 @@
-# Two-way audio: how Home Assistant does it, and what Kibble must implement
+# Two-way audio: shipped architecture
 
-Requirement (Nitin, 2026-09-15): the feeder's camera must appear **as an entity on the Kibble
-device itself** in Home Assistant, with full two-way audio, done the way Home Assistant natively
-does two-way audio for cameras — not as a separate integration's device, and not only via Scrypted.
+Requirement (Nitin, 2026-09-15, refined 2026-09-16): the feeder's camera and its two-way audio
+must be usable from Home Assistant **and** from HomeKit, with **Scrypted as the single source of
+truth** for all audio/video — one consumer of the feeder's streams, not one per client.
 
-## How HA actually does it
+## The path, as built
 
-From the [camera entity docs](https://developers.home-assistant.io/docs/core/entity/camera/):
-two-way audio rides on **WebRTC**, not HLS. There are two routes.
+```
+phone / HA dashboard / HomeKit  --Opus/WebRTC-->  Scrypted (Unraid, GPU box)
+                                                   │  WebRTC plugin: sendrecv audio
+                                                   │  Rebroadcast: the one persistent RTSP pull
+                                                   ▼
+                                        Kibble Scrypted mixin (Intercom)
+                                                   │  ffmpeg → L16/16000 RTP
+                                                   ▼
+                          kibbled RTSP backchannel (trackID=2, interleaved 4-5, PT 98)
+                                                   │  aacenc → ADTS AAC-LC/16 kHz
+                                                   ▼
+                     /tmp/kibble-talk.aac (FIFO) → one play_aac_file → media → speaker
+```
 
-1. **Native WebRTC** — the entity declares `CameraEntityFeature.STREAM` and implements
-   `async_handle_async_webrtc_offer` + `async_on_webrtc_candidate` (and optionally
-   `close_webrtc_session`). The integration then owns the whole peer connection. Note the doc's
-   warning: implementing these tells the frontend the camera is WebRTC-only, with **no HLS
-   fallback**.
-2. **A WebRTC provider** — the entity just returns a `stream_source()` (our RTSP URL) and
-   `CameraEntityFeature.STREAM`, and HA's bundled **go2rtc** provider converts RTSP to WebRTC.
-   Audio flows back to the camera when the source offers a return path.
+Outgoing (mic) audio rides the same Scrypted stream: `kibbled` puts the ring's `chan=1` records
+on the RTSP session as an AAC track with zero re-encode
+([23-audio-codec.md](23-audio-codec.md) §14), Scrypted's prebuffer reports `h264/aac`, and every
+consumer — HA, HomeKit, the Scrypted app, NVR recording — reads Scrypted's rebroadcast.
 
-**Kibble uses route 2.** Rationale: it is far less code than owning ICE/DTLS/SRTP in the
-integration, it keeps HLS and recording working, it reuses the go2rtc that ships with HA, and — the
-decisive point — the return path it needs is the *same* RTSP audio backchannel that Scrypted's
-ONVIF intercom needs ([scrypted-onboarding.md](scrypted-onboarding.md)). One implementation in
-`kibbled` satisfies both consumers.
+**Why not HA's own go2rtc provider (the original plan):** it would open a second RTSP session on
+the feeder for video and a third for the backchannel, on a device whose own server only keeps a
+spare slot for one transient session. Routing everything through Scrypted keeps the feeder at one
+persistent consumer, reuses the intercom HomeKit already drives, and puts the heavy work on the
+server that has the GPU. HA is a client of Scrypted, not a second camera stack.
 
-## What that means for `kibbled`
+## The pieces
 
-| piece | requirement | status |
+| piece | where | status |
 |---|---|---|
-| RTSP video | H.264 from the frame ring, no re-encode | **done** ([19-frame-ring.md](19-frame-ring.md)) |
-| RTSP audio, camera → client | mic audio as an RTP track | **done** — ADTS AAC-LC 16 kHz mono straight from the ring ([23-audio-codec.md](23-audio-codec.md) §14) |
-| RTSP backchannel, client → camera | a second `m=audio` section marked `a=sendonly`, negotiated when the client sends `Require: www.onvif.org/ver20/backchannel`; accept G.711 µ-law/A-law (what Scrypted's intercom offers) and/or Opus (what HomeKit sends before conversion) | negotiated + decoded (23 §14); speaker hand-off not yet wired to the proven path |
-| Play received audio | decode and hand to the speaker | **one-way proven**: `media`'s own `play_aac_file` (23 §18.2/§20.1) plays any ADTS file, serializes queued files gaplessly; `/speak` and clip play use it. Live talkback design: chunked files over the same path (23 §20.4) |
+| RTSP video + mic AAC, zero re-encode | `agent/src/rtsp.rs` | done ([19-frame-ring.md](19-frame-ring.md), 23 §14) |
+| RTSP backchannel, client → feeder | `agent/src/rtsp.rs`, `backchannel.rs` | done — offers `L16/16000` (PT 98) first, G.711 for generic clients |
+| Speaker playback | `agent/src/audioout.rs` | done — one `play_aac_file` on a FIFO (23 §20.6) |
+| Scrypted intercom | `scrypted-plugin/src/{mixin,rtspBackchannel}.ts` | done — ffmpeg → L16/16000, low-delay flags |
+| HA camera + talk UI | `kibble-card` v0.3.0 (`scrypted_id` config) | done — WebRTC through the Scrypted HA integration's proxy, hold-to-talk |
+| HomeKit two-way | Scrypted HomeKit mixin | works once the Kibble mixin is ordered before it (below) |
 
-### The two genuine unknowns
+## Setup notes that are easy to get wrong
 
-**Outgoing audio.** Microphone audio *is* in the frame ring (`chan=1`, ~60 ms cadence, ~35 kbps,
-header says 16 kHz / 16-bit), but it is demonstrably **not raw PCM** (entropy and byte-histogram
-tests) and **not raw Opus** (a byte-exact Ogg/Opus container parsed fine; libopus rejected the
-payloads). Until that codec is identified, the stream is video-only — `noAudio` in Scrypted, and no
-outgoing audio over WebRTC. Next step: check whether it is AAC-LC in a raw/ADTS-less form (the
-vendor links FDK-AAC for playback, so an AAC *encoder* is plausibly in the same library), or a
-Telink/Axera-specific ADPCM variant. Trying `libfdk_aac` against the raw payload is a five-minute
-experiment once someone is at a keyboard.
+- **Mixin order in Scrypted matters.** The Kibble mixin provides `Intercom`; the WebRTC and
+  HomeKit mixins only offer two-way audio if they can *see* it, i.e. if Kibble sits **before**
+  them in the camera's mixin list. With Kibble last, WebRTC answers with the audio m-line
+  rejected (`m=audio 0`) and there is no return path at all — which is exactly how this looked
+  broken for a day. Current order: Rebroadcast, **Kibble Feeder**, WebRTC, Snapshot, Adaptive
+  Streaming, HomeKit, NVR, NVR Object Detection, Accelerated Motion, Events recorder.
+- **`noAudio` must be `false`** on the RTSP Camera device so Scrypted negotiates the mic track
+  (`prebuffer:detectedCodec` = `h264/aac`).
+- **HA's Kibble integration** keeps `stream_url` pointed at Scrypted's rebroadcast URL, so its
+  camera entity (snapshots, HLS, automations) never touches the feeder directly either.
+- **`/opt/kibble/audio_enabled`** gates every speaker path on the feeder. It is on; nothing but an
+  explicit `/speak`, `/clips/<name>/play` or backchannel `PLAY` can reach `media`'s audio path
+  (23 §19.4, §20.7).
 
-**Incoming audio.** The vendor's own talkback (Agora) feeds a dedicated `audio_out_thread` inside
-`media`, consuming a channel literally named `audio-out` (vendor typo, present in both the binary's
-strings and the live reader registry), which calls `AX_AO_SendFrame` with **raw 16 kHz 16-bit PCM**.
-That is the format to produce. What is *not* established is whether a second process can push into
-that hand-off, or whether it is reachable only from inside `media` — i.e. whether Kibble must
-instead replace the vendor's audio path. That is the next thing to establish, and it decides
-whether talkback is a small feature or a large one.
+## The camera entity
 
-## The entity, when it lands
-
-On the existing Kibble device (so it appears inside the same device card, not a second device):
+`custom_components/kibble/camera.py`, on the existing Kibble device (not a second one):
 
 ```python
 class KibbleCamera(KibbleEntity, Camera):
     _attr_supported_features = CameraEntityFeature.STREAM
 
     async def stream_source(self) -> str:
-        return f"rtsp://{host}:8554/sub"      # substream: 1152x720, H.264, 25 fps
+        return self.coordinator.rtsp_url          # Scrypted's rebroadcast when configured
 
     async def async_camera_image(self, width=None, height=None) -> bytes:
-        ...                                   # hardware JPEG via the agent
+        ...                                       # hardware JPEG via the agent
 ```
 
 Snapshots come from the device's hardware JPEG encoder (`AX_VENC_JpegEncodeOneFrame`), so a still
-costs nothing on the ARM cores.
-
-Scrypted remains useful in parallel — NVR recording, object detection, and the HomeKit accessory
-alongside Nitin's other cameras — and reads the same RTSP URL. The HA camera entity is not a
-duplicate of it: it is what makes the feeder self-contained if Scrypted is ever not in the path.
+costs nothing on the ARM cores. Live view and talkback in the dashboard come from the card's
+Scrypted WebRTC session, not from this entity — HLS through `stream_source` remains the fallback
+for anything that wants a plain camera entity (automations, notifications, Assist).
