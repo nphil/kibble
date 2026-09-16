@@ -56,10 +56,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
     async getDetectionInput(detectionId: string): Promise<MediaObject> {
         const crop = this.crops.get(detectionId);
         if (!crop)
-            throw new Error(
-                `kibble: no cached crop for ${detectionId} -- only "face"-class detections ever have ` +
-                'one, and even those are a best-effort match (see README\'s "what is real" section)',
-            );
+            throw new Error(`kibble: no cached crop for ${detectionId} -- this detection's own "image" field was null (see types.ts)`);
         return this.createMediaObject(crop, 'image/jpeg');
     }
 
@@ -158,12 +155,11 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         const config = this.getConfig();
 
         const onDevice: HonestDetectionResult = { className: raw.class };
-        let crop: Buffer | undefined;
+        const crop = raw.image ? await this.tryFetchCrop(config.host, config.httpPort, raw.image) : undefined;
+        if (crop)
+            this.cacheCrop(detectionId, crop);
 
         if (raw.class === 'face') {
-            crop = await this.tryFetchMatchingCrop(config.host, config.httpPort);
-            if (crop)
-                this.cacheCrop(detectionId, crop);
             const identify = await this.tryIdentify(config.host, config.httpPort);
             if (identify?.cat && identify.cat !== 'unknown') {
                 onDevice.label = identify.cat;
@@ -185,20 +181,16 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         } satisfies ObjectsDetected);
     }
 
-    /** `RawDetection.image` names a file the agent never exposes over HTTP for any class (see
-     * `types.ts`). The one real, documented workaround: a `class: "face"` crop is *also* written
-     * to the agent's face-review queue in the same tick, so `GET /faces/current` -- fetched
-     * immediately, while its own `/faces/current/info` still reports `"pending"` -- is very
-     * likely (not guaranteed) the same bytes. `"visit"`/`"eat"` detections have no such queue and
-     * get no crop; `getDetectionInput` for those honestly throws instead of guessing. */
-    private async tryFetchMatchingCrop(host: string, port: number): Promise<Buffer | undefined> {
+    /** `RawDetection.image` names a file under the agent's `EVENTS_DIR`, served directly via
+     * `GET /events/<file>` for every class (added upstream after this plugin's own README
+     * flagged the gap -- see the "Agent-side TODO" section's history for the prior face-only
+     * `/faces/current` workaround this replaced). Events with no image at all (`image: null`)
+     * simply get no crop; `getDetectionInput` for those honestly throws instead of guessing. */
+    private async tryFetchCrop(host: string, port: number, image: string): Promise<Buffer | undefined> {
         try {
-            const info = await agentGetJson<{ status: string }>(host, port, '/faces/current/info', 5_000);
-            if (info.status !== 'pending')
-                return undefined;
-            return await agentGetBuffer(host, port, '/faces/current', 5_000);
+            return await agentGetBuffer(host, port, `/events/${image}`, 5_000);
         } catch (e) {
-            this.console.warn(`kibble: /faces/current fetch failed: ${(e as Error).message}`);
+            this.console.warn(`kibble: GET /events/${image} fetch failed: ${(e as Error).message}`);
             return undefined;
         }
     }
