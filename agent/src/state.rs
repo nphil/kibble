@@ -20,6 +20,10 @@ pub mod off {
     /// usr section
     pub const DESICCANT_DAYS: usize = 4656;
     pub const VOLUME: usize = 4664;
+    /// `usr.user_info.timezone_name`, IANA zone string (e.g. `"America/New_York"`) --
+    /// `docs/07-config.md`/`appendix-config-layout.json`, confidence HIGH. Field capacity is
+    /// 24 bytes; the confirmed live sample fills 16 of them.
+    pub const TIMEZONE_NAME: usize = 4388;
     /// dev section
     pub const SERIAL: usize = 4768;
     pub const FIRMWARE: usize = 4860;
@@ -124,7 +128,16 @@ impl Shm {
         }
     }
 
+    /// `usr.user_info.timezone_name` -- the device's real, cloud-configured IANA zone, read live
+    /// rather than assumed. Empty if `config_shm` hasn't been populated yet (before the vendor's
+    /// own `loaded` flag goes up) or if the field is genuinely blank.
+    pub fn timezone_name(&self) -> String {
+        self.str(off::TIMEZONE_NAME, 24)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
+        let timezone_name = self.timezone_name();
+        let scheduler_tz_supported = crate::localtime::tz_for_iana_name(&timezone_name).is_some();
         Snapshot {
             serial: self.str(off::SERIAL, 32),
             firmware: self.str(off::FIRMWARE, 16),
@@ -135,6 +148,8 @@ impl Shm {
             bowl_fill_1: self.bowl_fill(off::BOWL_FILL_1),
             bowl_fill_2: self.bowl_fill(off::BOWL_FILL_2),
             event_counter: self.u8(off::EVENT_COUNTER),
+            timezone_name,
+            scheduler_tz_supported,
         }
     }
 }
@@ -156,6 +171,13 @@ pub struct Snapshot {
     pub bowl_fill_1: Option<u32>,
     pub bowl_fill_2: Option<u32>,
     pub event_counter: u8,
+    /// `usr.user_info.timezone_name`, as read live from `config_shm` -- see
+    /// `Shm::timezone_name`.
+    pub timezone_name: String,
+    /// Whether `localtime::tz_for_iana_name` recognizes [`Snapshot::timezone_name`] -- `false`
+    /// means the scheduler (`scheduler.rs`) refuses to run even if enabled, per
+    /// STUDY-schedule-encoding.md §11.1 item 2's "fail closed, never guess a DST rule" rule.
+    pub scheduler_tz_supported: bool,
 }
 
 impl Snapshot {
@@ -167,7 +189,8 @@ impl Snapshot {
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
-                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"event_counter":{}}}"#
+                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"event_counter":{},"#,
+                r#""timezone_name":"{}","scheduler_tz_supported":{}}}"#
             ),
             self.serial.escape_debug(),
             self.firmware.escape_debug(),
@@ -178,6 +201,47 @@ impl Snapshot {
             opt(self.bowl_fill_1),
             opt(self.bowl_fill_2),
             self.event_counter,
+            self.timezone_name.escape_debug(),
+            self.scheduler_tz_supported,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Snapshot {
+        Snapshot {
+            serial: "SN123".into(),
+            firmware: "895".into(),
+            ble_firmware: 159,
+            volume: 6,
+            desiccant_days: 30,
+            feeding: false,
+            bowl_fill_1: Some(50),
+            bowl_fill_2: None,
+            event_counter: 3,
+            timezone_name: "America/New_York".into(),
+            scheduler_tz_supported: true,
+        }
+    }
+
+    #[test]
+    fn to_json_includes_timezone_fields() {
+        let json = sample().to_json();
+        assert!(json.contains(r#""timezone_name":"America/New_York""#));
+        assert!(json.contains(r#""scheduler_tz_supported":true"#));
+        assert!(json.contains(r#""bowl_fill":[50,null]"#));
+    }
+
+    #[test]
+    fn to_json_reports_unsupported_zone_honestly() {
+        let mut s = sample();
+        s.timezone_name = "Europe/London".into();
+        s.scheduler_tz_supported = false;
+        let json = s.to_json();
+        assert!(json.contains(r#""timezone_name":"Europe/London""#));
+        assert!(json.contains(r#""scheduler_tz_supported":false"#));
     }
 }

@@ -202,19 +202,35 @@ fn main() {
     persist::spawn_reconciler(Arc::clone(&shm));
     wifi::spawn_reconciler();
 
-    // Disabled by default -- see `scheduler.rs`'s module doc. Only when explicitly enabled do we
-    // even open the second bus sender the tick thread dispenses through.
-    let scheduler_enabled = scheduler::enabled_from_env();
-    if scheduler_enabled {
-        let scheduler_ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
-            .unwrap_or_else(|e| die(&format!("open ble queue for scheduler: {e}")));
-        scheduler::spawn(Arc::clone(&schedule), scheduler_ble);
-        eprintln!(
-            "kibbled: scheduler ENABLED ({}=1) -- will dispense directly at each enabled entry's local time",
-            scheduler::ENV_ENABLED
-        );
-    } else {
-        eprintln!("kibbled: scheduler disabled (default) -- set {}=1 to enable", scheduler::ENV_ENABLED);
+    // Read the device's real, configured zone once at startup (STUDY-schedule-encoding.md
+    // §11.1 item 2 / localtime.rs's own doc): refuse to run the scheduler at all, loudly, rather
+    // than guess a DST rule, if it isn't one this project has a table for. Disabled by default
+    // either way -- see `scheduler.rs`'s module doc for the two independent ways to turn it on.
+    let timezone_name = shm.timezone_name();
+    let tz = localtime::tz_for_iana_name(&timezone_name);
+    let scheduler_flag_on = scheduler::enabled();
+    let scheduler_enabled = scheduler_flag_on && tz.is_some();
+    match (scheduler_flag_on, tz) {
+        (true, Some(_)) => {
+            let scheduler_ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
+                .unwrap_or_else(|e| die(&format!("open ble queue for scheduler: {e}")));
+            scheduler::spawn(Arc::clone(&schedule), scheduler_ble, tz.unwrap());
+            eprintln!(
+                "kibbled: scheduler ENABLED (zone={timezone_name:?}) -- will dispense directly at each enabled entry's local time"
+            );
+        }
+        (true, None) => eprintln!(
+            "kibbled: scheduler flag is ON but config_shm reports timezone {timezone_name:?}, which \
+             kibbled has no DST rule for -- REFUSING to schedule (a feed at the wrong local time is \
+             worse than no feed at all; see GET /state's scheduler_tz_supported, and extend \
+             localtime::tz_for_iana_name to add this zone)"
+        ),
+        (false, _) => eprintln!(
+            "kibbled: scheduler disabled (default) -- set {}=1 or {:?}=1 in {} to enable",
+            scheduler::ENV_ENABLED,
+            scheduler::SETTINGS_KEY,
+            crate::desired::PATH
+        ),
     }
 
     let _ = http::serve(listener, |req| {
@@ -225,6 +241,7 @@ fn main() {
             &ble_adv,
             &schedule,
             scheduler_enabled,
+            tz,
             &feeds,
             &ai_feed,
             &capture,
@@ -248,6 +265,7 @@ fn route(
     ble_adv: &BleAdv,
     schedule: &Schedule,
     scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
     capture: &feed_capture::FeedCapture,
@@ -274,12 +292,12 @@ fn route(
         ("GET", "/streams") => Response::Json(rtsp::streams_json(feeds)),
         ("GET", "/cloud") => Response::Json(cloud::status_json()),
         ("POST", "/cloud") => cloud_write(req),
-        ("GET", "/schedule") => Response::Json(schedule_status_json(schedule, scheduler_enabled)),
-        ("PUT", "/schedule") => put_schedule(req, schedule, ble, scheduler_enabled),
-        ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble, scheduler_enabled),
-        ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble, scheduler_enabled),
+        ("GET", "/schedule") => Response::Json(schedule_status_json(schedule, scheduler_enabled, tz)),
+        ("PUT", "/schedule") => put_schedule(req, schedule, ble, scheduler_enabled, tz),
+        ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble, scheduler_enabled, tz),
+        ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble, scheduler_enabled, tz),
         ("POST", "/schedule/entry/enabled") => {
-            post_schedule_entry_enabled(req, schedule, ble, scheduler_enabled)
+            post_schedule_entry_enabled(req, schedule, ble, scheduler_enabled, tz)
         }
         ("GET", "/events") => Response::Json(ai_feed.snapshot_json()),
         ("GET", "/events/stream") => events_stream(query, ai_feed),
@@ -688,28 +706,46 @@ fn send_feed(ble: &Sender, f: FeedCtrl) -> Response {
     }
 }
 
-fn put_schedule(req: &Request, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
+fn put_schedule(
+    req: &Request,
+    schedule: &Schedule,
+    ble: &Sender,
+    scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
+) -> Response {
     let entries = match schedule::parse_entries(&req.body_str()) {
         Ok(v) => v,
         Err(e) => return Response::BadRequest(e),
     };
-    schedule_result(schedule.replace(entries, ble, schedule::now_unix()), schedule, scheduler_enabled)
+    schedule_result(schedule.replace(entries, ble, schedule::now_unix()), schedule, scheduler_enabled, tz)
 }
 
-fn post_schedule_entry(req: &Request, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
+fn post_schedule_entry(
+    req: &Request,
+    schedule: &Schedule,
+    ble: &Sender,
+    scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
+) -> Response {
     let entry = match schedule::parse_entry(&req.body_str()) {
         Ok(e) => e,
         Err(e) => return Response::BadRequest(e),
     };
-    schedule_result(schedule.add(entry, ble, schedule::now_unix()), schedule, scheduler_enabled)
+    schedule_result(schedule.add(entry, ble, schedule::now_unix()), schedule, scheduler_enabled, tz)
 }
 
-fn delete_schedule_entry(query: &str, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
+fn delete_schedule_entry(
+    query: &str,
+    schedule: &Schedule,
+    ble: &Sender,
+    scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
+) -> Response {
     let id = match schedule::entry_id_from_query(query) {
         Some(id) => id,
         None => return Response::BadRequest("missing ?id=".into()),
     };
-    schedule_result(schedule.remove(id, ble, schedule::now_unix()), schedule, scheduler_enabled)
+    schedule_result(schedule.remove(id, ble, schedule::now_unix()), schedule, scheduler_enabled, tz)
 }
 
 fn post_schedule_entry_enabled(
@@ -717,6 +753,7 @@ fn post_schedule_entry_enabled(
     schedule: &Schedule,
     ble: &Sender,
     scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
 ) -> Response {
     let id = match json_field(&req.body_str(), "id").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
@@ -726,24 +763,31 @@ fn post_schedule_entry_enabled(
         Some(v) => v != "false",
         None => return Response::BadRequest("missing \"enabled\"".into()),
     };
-    schedule_result(schedule.set_enabled(&id, enabled, ble, schedule::now_unix()), schedule, scheduler_enabled)
+    schedule_result(schedule.set_enabled(&id, enabled, ble, schedule::now_unix()), schedule, scheduler_enabled, tz)
 }
 
 /// `GET /schedule`'s body: the cache plus, per entry, its next local fire time and last
-/// resolved outcome -- see `schedule::Schedule::snapshot_json`. `now_utc`/[`localtime::DEVICE_TZ`]
-/// are computed fresh on every call (never cached), matching `scheduler.rs`'s own "always
-/// recompute from the current wall clock" rule.
-fn schedule_status_json(schedule: &Schedule, scheduler_enabled: bool) -> String {
-    schedule.snapshot_json(&localtime::DEVICE_TZ, schedule::now_unix() as i64, scheduler_enabled)
+/// resolved outcome -- see `schedule::Schedule::snapshot_json`. `tz` is `None` exactly when
+/// `main.rs` couldn't resolve the device's configured zone (see `localtime::tz_for_iana_name`),
+/// in which case every entry's `next_fire_utc` reads `null` -- never a guess. `now_utc` is
+/// computed fresh on every call (never cached), matching `scheduler.rs`'s own "always recompute
+/// from the current wall clock" rule.
+fn schedule_status_json(schedule: &Schedule, scheduler_enabled: bool, tz: Option<localtime::Tz>) -> String {
+    schedule.snapshot_json(tz, schedule::now_unix() as i64, scheduler_enabled)
 }
 
 /// Shared success/error -> HTTP mapping for every schedule mutation: on success, echo the fresh
 /// cache so a client sees the effect immediately with no extra `GET`; `Invalid` is a 400 (the
 /// caller's fault -- bad input, unknown id, over the cap), `Internal` is a 500 (ours -- cache I/O,
 /// bus send).
-fn schedule_result(result: Result<(), schedule::Error>, schedule: &Schedule, scheduler_enabled: bool) -> Response {
+fn schedule_result(
+    result: Result<(), schedule::Error>,
+    schedule: &Schedule,
+    scheduler_enabled: bool,
+    tz: Option<localtime::Tz>,
+) -> Response {
     match result {
-        Ok(()) => Response::Json(schedule_status_json(schedule, scheduler_enabled)),
+        Ok(()) => Response::Json(schedule_status_json(schedule, scheduler_enabled, tz)),
         Err(schedule::Error::Invalid(m)) => Response::BadRequest(m),
         Err(schedule::Error::Internal(m)) => Response::Error(m),
     }

@@ -66,8 +66,29 @@ use crate::schedule::{Entry, Outcome, Schedule};
 /// leaves it off -- see the module doc's safety section.
 pub const ENV_ENABLED: &str = "KIBBLE_SCHEDULER_ENABLED";
 
+/// The `/opt/kibble/settings.json` (`desired::PATH`) key that enables the scheduler when set to
+/// any nonzero value -- the file-based alternative to [`ENV_ENABLED`], so enabling this never
+/// requires editing the boot hook.
+pub const SETTINGS_KEY: &str = "scheduler_enabled";
+
 pub fn enabled_from_env() -> bool {
     matches!(std::env::var(ENV_ENABLED).as_deref(), Ok("1") | Ok("true") | Ok("TRUE") | Ok("True"))
+}
+
+/// Whether `/opt/kibble/settings.json` currently has [`SETTINGS_KEY`] set to a nonzero value.
+pub fn enabled_from_settings_file() -> bool {
+    settings_say_enabled(&crate::desired::load())
+}
+
+/// Pure decision, split out from [`enabled_from_settings_file`] for testing without touching the
+/// real, hardcoded `desired::PATH`.
+fn settings_say_enabled(entries: &[(String, u32)]) -> bool {
+    entries.iter().any(|(k, v)| k == SETTINGS_KEY && *v != 0)
+}
+
+/// The scheduler is on if *either* mechanism says so -- see the module doc.
+pub fn enabled() -> bool {
+    enabled_from_env() || enabled_from_settings_file()
 }
 
 /// How late a missed fire may still be caught up (STUDY-schedule-encoding.md §11.1 item 1:
@@ -105,13 +126,15 @@ impl Dispenser for BusDispenser {
     }
 }
 
-/// Spawns the background tick thread. Only ever called when [`enabled_from_env`] is true --
-/// `main.rs` does not even open the bus sender otherwise.
-pub fn spawn(schedule: Arc<Schedule>, ble: Sender) {
+/// Spawns the background tick thread against the given (already-resolved-and-confirmed-
+/// supported) `tz`. Only ever called when [`enabled`] is true *and* `main.rs` has a [`Tz`] for
+/// the device's configured zone -- see the module doc's item 2. `main.rs` does not even open
+/// the extra bus sender dispensing needs unless both hold.
+pub fn spawn(schedule: Arc<Schedule>, ble: Sender, tz: Tz) {
     thread::spawn(move || {
         let dispenser = BusDispenser { ble };
         loop {
-            tick(&schedule, &dispenser, &localtime::EASTERN, now_utc());
+            tick(&schedule, &dispenser, &tz, now_utc());
             thread::sleep(TICK_INTERVAL);
         }
     });
@@ -503,5 +526,64 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_ENABLED);
         }
+    }
+
+    #[test]
+    fn settings_say_enabled_reads_the_documented_key() {
+        assert!(!settings_say_enabled(&[]));
+        assert!(!settings_say_enabled(&[("scheduler_enabled".into(), 0)]));
+        assert!(settings_say_enabled(&[("scheduler_enabled".into(), 1)]));
+        // Any nonzero value counts, matching write_setting's own bool convention elsewhere.
+        assert!(settings_say_enabled(&[("other_key".into(), 1), ("scheduler_enabled".into(), 5)]));
+        assert!(!settings_say_enabled(&[("not_scheduler_enabled".into(), 1)]));
+    }
+
+    // --- flash-write discipline: a tick must never rewrite state that hasn't changed -----------
+
+    #[test]
+    fn tick_with_nothing_newly_due_does_not_rewrite_the_state_file() {
+        // /opt is flash with finite erase cycles -- a periodic rewrite-on-every-tick would be a
+        // real wear problem at TICK_INTERVAL=15s. Uses the inode number (not mtime, which some
+        // filesystems only resolve to whole seconds) as proof no `Cache::save` (temp file +
+        // rename) happened: `save()` always produces a fresh inode at `path`, even for
+        // byte-identical content, so an unchanged inode is direct evidence of zero writes.
+        use std::os::unix::fs::MetadataExt;
+        let tz = localtime::EASTERN;
+        let path = tmp_path("nowrite");
+        let schedule = Schedule::seed_for_test(path.clone(), vec![entry("dinner", 18 * 60)]);
+        // Pre-resolve yesterday so only the genuinely-nothing-to-do path is exercised.
+        schedule.claim_fire("dinner", "2026-01-14", Outcome::Missed, 0).unwrap();
+        let ino_before = fs::metadata(&path).unwrap().ino();
+        let dispenser = StubDispenser::new();
+        let now = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 10 * 3600); // hours before due
+        for _ in 0..5 {
+            tick(&schedule, &dispenser, &tz, now);
+        }
+        let ino_after = fs::metadata(&path).unwrap().ino();
+        assert_eq!(ino_before, ino_after, "a tick with nothing newly due must never rewrite schedule.json");
+        assert_eq!(dispenser.calls().len(), 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tick_after_an_occurrence_resolves_does_not_rewrite_again_on_later_ticks() {
+        use std::os::unix::fs::MetadataExt;
+        let tz = localtime::EASTERN;
+        let path = tmp_path("nowrite-after");
+        let schedule = Schedule::seed_for_test(path.clone(), vec![entry("breakfast", 7 * 60)]);
+        let dispenser = StubDispenser::new();
+        let due = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 7 * 3600);
+        tick(&schedule, &dispenser, &tz, due); // resolves both yesterday (missed) and today (dispensed)
+        let ino_after_resolve = fs::metadata(&path).unwrap().ino();
+        for i in 1..=5i64 {
+            tick(&schedule, &dispenser, &tz, due + i * 60);
+        }
+        let ino_after_more_ticks = fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            ino_after_resolve, ino_after_more_ticks,
+            "once an occurrence is resolved, later same-day ticks must never rewrite the file again"
+        );
+        assert_eq!(dispenser.calls().len(), 1, "still exactly the one dispense from the initial resolve");
+        let _ = fs::remove_file(&path);
     }
 }

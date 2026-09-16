@@ -492,7 +492,7 @@ impl Schedule {
     /// Body for `GET /schedule`: the cache -- see the module docs for why that is authoritative
     /// -- plus, per entry, when it will next fire and what happened the last time the scheduler
     /// (`scheduler.rs`) resolved it.
-    pub fn snapshot_json(&self, tz: &Tz, now_utc: i64, scheduler_enabled: bool) -> String {
+    pub fn snapshot_json(&self, tz: Option<Tz>, now_utc: i64, scheduler_enabled: bool) -> String {
         let guard = self.cache.lock().unwrap();
         let entries: Vec<String> = guard
             .entries
@@ -639,11 +639,10 @@ impl Schedule {
 /// One entry's `GET /schedule` JSON, including scheduler-derived fields (`next_fire_utc`,
 /// `last_fired_*`) -- kept separate from [`Entry::to_json`] (the on-disk persistence shape,
 /// which has no business knowing about timezones or "now").
-fn entry_status_json(e: &Entry, fired: Option<&FiredRecord>, tz: &Tz, now_utc: i64) -> String {
-    let next_fire_json = if e.enabled {
-        localtime::next_occurrence_utc(tz, e.minute_of_day, now_utc).to_string()
-    } else {
-        "null".to_string()
+fn entry_status_json(e: &Entry, fired: Option<&FiredRecord>, tz: Option<Tz>, now_utc: i64) -> String {
+    let next_fire_json = match (e.enabled, tz) {
+        (true, Some(tz)) => localtime::next_occurrence_utc(&tz, e.minute_of_day, now_utc).to_string(),
+        _ => "null".to_string(),
     };
     let (last_date_json, last_outcome_json) = match fired {
         Some(r) => (format!("\"{}\"", r.date.escape_debug()), format!("\"{}\"", r.outcome.as_str())),
@@ -1104,12 +1103,26 @@ mod tests {
         let schedule = Schedule::seed_for_test(path.clone(), entries);
         let tz = localtime::EASTERN;
         let now = tz.local_to_utc(localtime::Civil { year: 2026, month: 1, day: 15 }, 6 * 3600);
-        let json = schedule.snapshot_json(&tz, now, false);
+        let json = schedule.snapshot_json(Some(tz), now, false);
         assert!(json.contains(r#""scheduler_enabled":false"#));
         assert!(json.contains(r#""id":"morning""#));
         assert!(json.contains("\"next_fire_utc\":"), "enabled entry must carry a next-fire value");
         assert!(json.contains(r#""id":"off""#));
         assert!(json.contains(r#""next_fire_utc":null"#), "a disabled entry never fires");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// STUDY-schedule-encoding.md §11.1 item 2: an unrecognized zone must never guess -- every
+    /// entry's `next_fire_utc` must read `null`, even one that is enabled, when `tz` is `None`.
+    #[test]
+    fn snapshot_json_with_no_supported_timezone_shows_no_next_fire_for_anyone() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-notz-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let entries = vec![Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true }];
+        let schedule = Schedule::seed_for_test(path.clone(), entries);
+        let json = schedule.snapshot_json(None, 1_700_000_000, false);
+        assert!(json.contains(r#""id":"morning""#));
+        assert!(json.contains(r#""next_fire_utc":null"#), "no zone -> never claim a next fire, even for an enabled entry");
         let _ = fs::remove_file(&path);
     }
 }
