@@ -39,7 +39,7 @@ The agent uses **280 KB of RSS**, one thread, and no external dependencies.
 | Per-auger targeting | encoded correctly, **not honoured by firmware** -- both augers spin regardless, so a one-hopper request delivers about double into the divider-less bowl |
 | Live state (feeding, bowl fill, desiccant, firmware) | working |
 | Schedule | working -- Kibble owns it, not the MCU ([docs/16-schedule.md](docs/16-schedule.md)); a live fire was observed dispensing |
-| Camera via Scrypted | working -- RTSP `h264/aac`, plus a mixin that turns the agent's `/events` into Scrypted detections ([docs](docs/scrypted-onboarding.md)) |
+| Camera via Scrypted | working -- RTSP `h264/aac`, plus a mixin that turns the agent's `/events` into Scrypted detections ([scrypted-plugin/](scrypted-plugin/README.md)) |
 | Two-way audio (speaker out) | blocked: the vendor's `audio_out_thread` never consumes our ring writes ([docs/20-two-way-audio.md](docs/20-two-way-audio.md)) |
 | Detections in HA | working -- `sensor.*_last_detection`, `sensor.*_detections_today`, `image.*_last_detection`, and a row in the Lovelace card |
 | Cat identification | enrolment and the classifier work ([docs/27-cat-id.md](docs/27-cat-id.md)), but the device has produced no face crops yet, so nothing has been identified in anger |
