@@ -60,6 +60,13 @@ class KibbleMediaError(KibbleError):
     `except` clause to tell "HA couldn't prepare this audio" from "the agent rejected it"."""
 
 
+class KibbleNotFoundError(KibbleError):
+    """A byte-fetch (`event_bytes`/`pending_bytes`/`sample_bytes`) named a crop the agent no
+    longer has -- distinct from a generic `KibbleError` so `views.py` can 404 instead of 502
+    (the crop is legitimately gone, e.g. relabelled or evicted under us; the agent itself is
+    fine)."""
+
+
 @dataclass(frozen=True, slots=True)
 class FeederState:
     """One snapshot of the feeder, as reported by `GET /state`."""
@@ -233,11 +240,16 @@ class WifiState:
 
 @dataclass(frozen=True, slots=True)
 class CatInfo:
-    """One enrolled cat, as reported by `GET /cats` (`agent/src/faces.rs`'s `Gallery`)."""
+    """One enrolled cat, as reported by `GET /cats` (`agent/src/faces.rs`'s `Gallery`).
+
+    `avatar` is the sample filename nearest that cat's running centroid -- the crop the cats
+    card shows as the cat's round avatar (`GET /faces/samples/<cat>/<avatar>`) -- `None` for a
+    pre-registered cat (`kibble.add_cat`) with zero samples yet."""
 
     name: str
     samples: int
     last_seen: int | None
+    avatar: str | None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> CatInfo:
@@ -245,6 +257,7 @@ class CatInfo:
             name=str(data.get("name", "")),
             samples=int(data.get("samples") or 0),
             last_seen=data.get("last_seen"),
+            avatar=data.get("avatar"),
         )
 
 
@@ -303,6 +316,46 @@ class ReviewFace:
         return cls(
             status=str(data.get("status", "none")), name=data.get("name"), cat=data.get("cat")
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingFace:
+    """One crop still awaiting a human label, as reported by `GET /faces/pending` (newest
+    last). `name` already encodes `ts` and `vendor_pet_id` (`{ts}-{petid|unknown}.jpg`) --
+    they are pulled out as their own fields here so callers never have to re-parse the
+    filename. A crop written before its `track` event lands starts as `vendor_pet_id: None`
+    (filename suffix `-unknown`) and is renamed by the agent once a matching track arrives.
+    `guess` is Kibble's own classifier's verdict for this exact crop, stored beside it at
+    capture time -- `None` if the classifier had nothing to say (e.g. no cats enrolled yet)."""
+
+    name: str
+    ts: int
+    vendor_pet_id: str | None
+    guess: IdentifyScore | None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> PendingFace:
+        guess = data.get("guess")
+        vendor_pet_id = data.get("vendor_pet_id")
+        return cls(
+            name=str(data.get("name", "")),
+            ts=int(data.get("ts") or 0),
+            vendor_pet_id=str(vendor_pet_id) if vendor_pet_id is not None else None,
+            guess=IdentifyScore.from_json(guess) if guess else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FaceSample:
+    """One permanently-labelled sample in a cat's gallery, as reported by `GET
+    /faces/samples/<cat>`."""
+
+    name: str
+    ts: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> FaceSample:
+        return cls(name=str(data.get("name", "")), ts=int(data.get("ts") or 0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +492,27 @@ class KibbleClient:
             except ClientError as err:
                 raise KibbleConnectionError(f"{self._base}: {err}") from err
 
+    async def _get_bytes(self, path: str) -> bytes:
+        """Raw `GET` for one JPEG crop -- shares `_request`'s connection-serialising lock (the
+        agent's HTTP server is effectively serial; see `TIMEOUT`'s comment above) but skips its
+        JSON decoding. Every `*_bytes` method below funnels through this. Raises
+        `KibbleNotFoundError` for a 404 (the crop was relabelled/evicted out from under a still-
+        open card) so callers can 404 instead of treating it as the agent being unreachable."""
+        async with self._lock:
+            try:
+                async with self._session.request(
+                    "GET", f"{self._base}{path}", timeout=TIMEOUT
+                ) as resp:
+                    if resp.status == 404:
+                        raise KibbleNotFoundError(path)
+                    if resp.status >= 400:
+                        raise KibbleError(f"{path}: HTTP {resp.status}")
+                    return await resp.read()
+            except TimeoutError as err:
+                raise KibbleConnectionError(f"{self._base} timed out") from err
+            except ClientError as err:
+                raise KibbleConnectionError(f"{self._base}: {err}") from err
+
     async def state(self) -> FeederState:
         return FeederState.from_json(await self._request("GET", "/state"))
 
@@ -544,10 +618,16 @@ class KibbleClient:
     async def cats(self) -> list[CatInfo]:
         return [CatInfo.from_json(c) for c in await self._request("GET", "/cats")]
 
-    async def pending_faces(self) -> list[str]:
-        """Filenames of every crop still awaiting a human label (`GET /faces/pending`) --
-        backs the diagnostic pending-count sensor."""
-        return list(await self._request("GET", "/faces/pending"))
+    async def pending_faces(self) -> list[PendingFace]:
+        """Every crop still awaiting a human label (`GET /faces/pending`), newest last. Backs
+        both the diagnostic pending-count sensor (via `len()`) and `kibble/faces/pending`."""
+        return [PendingFace.from_json(p) for p in await self._request("GET", "/faces/pending")]
+
+    async def faces_samples(self, cat: str) -> list[FaceSample]:
+        """Every permanently-labelled sample in `cat`'s gallery (`GET /faces/samples/<cat>`),
+        backing `kibble/faces/samples`."""
+        body = await self._request("GET", f"/faces/samples/{quote(cat, safe='')}")
+        return [FaceSample.from_json(s) for s in body]
 
     async def add_cat(self, name: str) -> None:
         """Pre-register a cat with zero samples, so it appears in the label select's options
@@ -569,6 +649,23 @@ class KibbleClient:
         """The exact inverse of `label_face` -- moves a labelled crop back to pending and
         corrects the centroid. A full re-label is this followed by another `label_face`."""
         await self._request("POST", "/faces/unlabel", {"name": crop_id, "cat": cat})
+
+    async def event_bytes(self, name: str) -> bytes:
+        """`GET /events/<name>`: one detection crop's raw JPEG bytes -- the timeline's image
+        for every class (`visit`/`eat`/`face`), via the HTTP view's `kind="event"`."""
+        return await self._get_bytes(f"/events/{quote(name, safe='')}")
+
+    async def pending_bytes(self, name: str) -> bytes:
+        """`GET /faces/pending/<name>`: one pending crop's raw JPEG bytes, via the HTTP view's
+        `kind="pending"`."""
+        return await self._get_bytes(f"/faces/pending/{quote(name, safe='')}")
+
+    async def sample_bytes(self, cat: str, name: str) -> bytes:
+        """`GET /faces/samples/<cat>/<name>`: one permanently-labelled sample's raw JPEG
+        bytes, via the HTTP view's `kind="sample/<cat>"`."""
+        return await self._get_bytes(
+            f"/faces/samples/{quote(cat, safe='')}/{quote(name, safe='')}"
+        )
 
     async def clips(self) -> list[ClipInfo]:
         return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips")]

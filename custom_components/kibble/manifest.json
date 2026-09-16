@@ -17,6 +17,8 @@
   "dependencies": [
     "bluetooth",
     "ffmpeg",
-    "media_source"
+    "http",
+    "media_source",
+    "websocket_api"
   ]
 }

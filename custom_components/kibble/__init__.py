@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, Supp
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
 
 from .api import KibbleClient, KibbleError, KibbleSpeakerBusyError
 from .const import (
@@ -19,6 +20,7 @@ from .const import (
     ATTR_CAT_NAME,
     ATTR_CLIP_NAME,
     ATTR_CROP_ID,
+    ATTR_CROP_NAME,
     ATTR_ENABLED,
     ATTR_ENTRIES,
     ATTR_ENTRY_ID,
@@ -62,10 +64,13 @@ from .const import (
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
+    SERVICE_UNLABEL_FACE,
     SERVICE_WIFI_CONNECT,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .errors import raise_agent_action_failed, raise_speaker_busy
+from .views import KibbleImageView
+from .websocket import async_setup_websocket_api
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +85,11 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+# Config-entry-only integration; `async_setup` below still exists to register the process-
+# global websocket commands and HTTP view exactly once (see its own docstring), not to accept
+# YAML configuration.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 FEED_SCHEMA = vol.Schema(
     {
@@ -180,6 +190,14 @@ LABEL_FACE_SCHEMA = vol.Schema(
     }
 )
 
+UNLABEL_FACE_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CAT): cv.string,
+        vol.Required(ATTR_CROP_NAME): cv.string,
+    }
+)
+
 ADD_CAT_SCHEMA = vol.Schema(
     {
         vol.Required("device_id"): cv.string,
@@ -268,6 +286,17 @@ async def _async_forward_platforms_isolated(
         else:
             loaded.append(platform)
     return loaded
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Component-level setup, run exactly once regardless of how many feeders are configured
+    -- registers the `kibble/*` websocket commands (`websocket.py`) and the
+    `/api/kibble/{entry_id}/image/*` HTTP view (`views.py`), both process-global and entry-
+    independent. Doing this per-entry (in `async_setup_entry` below) would try to register the
+    same command/route more than once for a second feeder."""
+    async_setup_websocket_api(hass)
+    hass.http.register_view(KibbleImageView())
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
@@ -438,6 +467,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Label face", err)
 
+    async def handle_unlabel_face(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_unlabel_face(
+                call.data[ATTR_CROP_NAME], call.data[ATTR_CAT]
+            )
+        except KibbleError as err:
+            raise_agent_action_failed("Unlabel face", err)
+
     async def handle_add_cat(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
@@ -529,6 +567,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_WIFI_CONNECT, handle_wifi_connect, WIFI_CONNECT_SCHEMA
     )
     hass.services.async_register(DOMAIN, SERVICE_LABEL_FACE, handle_label_face, LABEL_FACE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_UNLABEL_FACE, handle_unlabel_face, UNLABEL_FACE_SCHEMA
+    )
     hass.services.async_register(DOMAIN, SERVICE_ADD_CAT, handle_add_cat, ADD_CAT_SCHEMA)
     hass.services.async_register(
         DOMAIN,

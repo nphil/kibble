@@ -54,18 +54,24 @@ async def async_setup_entry(
     )
 
 
-def _image_url(entry: KibbleConfigEntry, review: ReviewFace) -> str | None:
-    """The agent's `GET /faces/current` URL, with the crop's status and name folded into a
-    cache-busting query parameter -- `agent/src/main.rs` ignores the parameter's value, but
-    `ImageEntity` only refetches (and only bumps its "last updated" timestamp) when this URL
-    *string* itself changes, so encoding *which* crop is showing into it is what makes a new
-    crop actually appear without a manual refresh. `None` (no URL at all) only when nothing has
-    ever been captured."""
+def _image_url(entry: KibbleConfigEntry, review: ReviewFace, pending_face_count: int) -> str | None:
+    """The agent's `GET /faces/current` URL, with the crop's status/name *and* the current
+    pending-queue length folded into a cache-busting query parameter -- `agent/src/main.rs`
+    ignores the parameter's value, but `ImageEntity` only refetches (and only bumps its "last
+    updated" timestamp, which is this entity's *state*) when this URL *string* itself changes,
+    so encoding *which* crop is showing into it is what makes a new crop actually appear
+    without a manual refresh. `pending_face_count` matters on its own: `review_face` names only
+    the oldest pending crop (or the most recent label once the queue is empty), so a new crop
+    arriving behind it, or an unlabel that isn't the current one, changes the *count* without
+    changing *review_face* at all -- cards watching this entity's state to know when to refetch
+    `kibble/faces/pending` need every pending-list mutation to bump it, not only ones that
+    reshuffle the front of the queue. `None` (no URL at all) only when nothing has ever been
+    captured."""
     if review.name is None:
         return None
     host = entry.data[CONF_HOST]
     port = entry.data[CONF_PORT]
-    cache_key = quote(f"{review.status}-{review.name}", safe="")
+    cache_key = quote(f"{review.status}-{review.name}-{pending_face_count}", safe="")
     return f"http://{host}:{port}/faces/current?id={cache_key}"
 
 
@@ -80,12 +86,14 @@ class KibblePendingFaceImage(KibbleEntity, ImageEntity):
         KibbleEntity.__init__(self, entry.runtime_data, "pending_face")
         ImageEntity.__init__(self, hass)
         self._entry = entry
-        self._attr_image_url = _image_url(entry, entry.runtime_data.data.review_face)
+        data = entry.runtime_data.data
+        self._attr_image_url = _image_url(entry, data.review_face, data.pending_face_count)
         self._attr_image_last_updated = dt_util.utcnow()
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        url = _image_url(self._entry, self.coordinator.data.review_face)
+        data = self.coordinator.data
+        url = _image_url(self._entry, data.review_face, data.pending_face_count)
         if url != self._attr_image_url:
             self._attr_image_url = url
             self._cached_image = None

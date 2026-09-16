@@ -16,7 +16,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from kibble.api import DetectionEvent, IdentifyResult, KibbleError, ReviewFace
 from kibble.binary_sensor import PRESENCE_WINDOW, is_present
 from kibble.const import parse_vendor_pet_ids
-from kibble.coordinator import VendorSighting, vendor_sightings
+from kibble.coordinator import KibbleCoordinator, VendorSighting, vendor_sightings
 from kibble.image import _image_url
 from kibble.select import KibbleLabelFaceSelect, cat_for_option
 
@@ -105,28 +105,64 @@ async def test_select_option_wraps_a_kibble_error_as_a_home_assistant_error() ->
     assert excinfo.value.translation_placeholders == {"action": "Label", "error": "agent unreachable"}
 
 
+# --- coordinator.async_label_face / async_unlabel_face -----------------------------------------
+
+
+def _fake_coordinator(client: AsyncMock) -> SimpleNamespace:
+    return SimpleNamespace(client=client, async_request_refresh=AsyncMock())
+
+
+async def test_async_label_face_labels_then_requests_a_refresh() -> None:
+    client = AsyncMock()
+    fake_self = _fake_coordinator(client)
+    await KibbleCoordinator.async_label_face(fake_self, "1-5.jpg", "Kitty")
+    client.label_face.assert_awaited_once_with("1-5.jpg", "Kitty")
+    fake_self.async_request_refresh.assert_awaited_once()
+
+
+async def test_async_unlabel_face_is_the_exact_inverse_call_shape() -> None:
+    """`kibble.unlabel_face`'s own wire field is `name`, not `crop_id` -- confirming the
+    coordinator still calls the client with (crop_id, cat) positionally, matching `label_face`,
+    regardless of what the HA-facing service schema calls the first argument."""
+    client = AsyncMock()
+    fake_self = _fake_coordinator(client)
+    await KibbleCoordinator.async_unlabel_face(fake_self, "1-5.jpg", "Kitty")
+    client.unlabel_face.assert_awaited_once_with("1-5.jpg", "Kitty")
+    fake_self.async_request_refresh.assert_awaited_once()
+
+
 
 # --- image._image_url -------------------------------------------------------------------------
 
 
 def test_image_url_is_none_when_nothing_has_ever_been_captured() -> None:
-    assert _image_url(_entry(), ReviewFace(status="none", name=None, cat=None)) is None
+    assert _image_url(_entry(), ReviewFace(status="none", name=None, cat=None), 0) is None
 
 
 def test_image_url_includes_host_port_and_a_cache_busting_id() -> None:
-    url = _image_url(_entry(), ReviewFace(status="pending", name="1-unknown.jpg", cat=None))
-    assert url == f"http://{HOST}:{PORT}/faces/current?id=pending-1-unknown.jpg"
+    url = _image_url(_entry(), ReviewFace(status="pending", name="1-unknown.jpg", cat=None), 1)
+    assert url == f"http://{HOST}:{PORT}/faces/current?id=pending-1-unknown.jpg-1"
 
 
 def test_image_url_changes_when_the_same_named_crop_transitions_to_labelled() -> None:
     """Even though `GET /faces/current` would serve byte-identical content for the same
-    filename either way, the URL must still change so `ImageEntity` bumps `image_last_updated`
     -- the entity's *meaning* (awaiting review vs. already reviewed) genuinely changed."""
-    pending_url = _image_url(_entry(), ReviewFace(status="pending", name="1-unknown.jpg", cat=None))
+    pending_url = _image_url(
+        _entry(), ReviewFace(status="pending", name="1-unknown.jpg", cat=None), 1
+    )
     labelled_url = _image_url(
-        _entry(), ReviewFace(status="labelled", name="1-unknown.jpg", cat="Rashy")
+        _entry(), ReviewFace(status="labelled", name="1-unknown.jpg", cat="Rashy"), 0
     )
     assert pending_url != labelled_url
+
+
+def test_image_url_changes_when_only_the_pending_count_changes() -> None:
+    """A new crop arriving behind the current one (or an unlabel that isn't the current one)
+    changes the pending count without changing which crop `review_face` names -- cards
+    watching this entity's state to know when to refetch the pending list need that count
+    folded in, or a same-review-face mutation would never bump the cache key."""
+    review = ReviewFace(status="pending", name="1-unknown.jpg", cat=None)
+    assert _image_url(_entry(), review, 1) != _image_url(_entry(), review, 2)
 
 
 # --- binary_sensor.is_present -------------------------------------------------------------------

@@ -272,6 +272,7 @@
     "schedule_card_toggle": "mdi:calendar-sync-outline",
     "wifi_connect": "mdi:wifi-plus",
     "label_face": "mdi:tag-outline",
+    "unlabel_face": "mdi:tag-off-outline",
     "add_cat": "mdi:cat",
     "identify": "mdi:magnify-scan",
     "save_clip": "mdi:content-save-outline",

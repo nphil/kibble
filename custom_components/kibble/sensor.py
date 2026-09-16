@@ -17,11 +17,14 @@ from homeassistant.components.sensor import (
 from homeassistant.const import (
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
     EntityCategory,
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntry
@@ -528,17 +531,44 @@ class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
         return attrs
 
 
-class KibbleVendorLastSeenPetSensor(KibbleEntity, SensorEntity):
+class KibbleVendorLastSeenPetSensor(KibbleEntity, RestoreEntity, SensorEntity):
     """The vendor's own on-device identifier's most recent result -- independent of Kibble's
     classifier above. State is the operator's name for the pet id (`vendor_pet_ids` option),
     the raw id as a string if it is unmapped, or unavailable until the vendor has identified
     anything since the agent started. The vendor gallery only knows cats enrolled with face
-    photos in the Petkit app (one, on this feeder), so this can only ever name those."""
+    photos in the Petkit app (one, on this feeder), so this can only ever name those.
+
+    `track` events live only in the agent's in-memory event ring (`ai.rs`'s `Feed`), unlike
+    `/events`'s detections which `ai.rs` rehydrates from disk on startup -- so `kibbled`
+    restarting (routine, e.g. an OTA or a crash) empties `vendor_sightings` even though the
+    last known sighting is still perfectly true, just not freshly re-announced yet. Without a
+    restore this went `unavailable` on every agent restart, which is wrong: nothing about the
+    *feeder* is actually unreachable. `RestoreEntity` keeps the last known sighting (state and
+    its `pet_id`/`last_identified`/`total_score` attributes) showing across that gap; a fresh
+    `vendor_sightings` entry always wins over the restored one the moment it arrives. Only a
+    genuinely unreachable feeder (`super().available`, i.e. `coordinator.last_update_success`)
+    still marks this unavailable."""
 
     _attr_translation_key = "vendor_last_seen_pet"
 
     def __init__(self, coordinator: KibbleCoordinator) -> None:
         super().__init__(coordinator, "vendor_last_seen_pet")
+        self._restored_value: str | None = None
+        self._restored_attrs: dict[str, Any] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._latest() is not None:
+            return  # a live sighting already exists this run -- nothing to restore
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+        self._restored_value = last_state.state
+        self._restored_attrs = {
+            key: value
+            for key, value in last_state.attributes.items()
+            if key in ("pet_id", "last_identified", "total_score")
+        }
 
     def _latest(self) -> VendorSighting | None:
         sightings = self.coordinator.data.vendor_sightings
@@ -546,20 +576,22 @@ class KibbleVendorLastSeenPetSensor(KibbleEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        return super().available and self._latest() is not None
+        return super().available and (
+            self._latest() is not None or self._restored_value is not None
+        )
 
     @property
     def native_value(self) -> str | None:
         s = self._latest()
-        if s is None:
-            return None
-        return s.cat if s.cat is not None else s.pet_id
+        if s is not None:
+            return s.cat if s.cat is not None else s.pet_id
+        return self._restored_value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._latest()
         if s is None:
-            return {}
+            return self._restored_attrs
         attrs: dict[str, Any] = {
             "pet_id": s.pet_id,
             "last_identified": dt_util.utc_from_timestamp(s.ts).isoformat(),

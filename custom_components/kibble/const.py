@@ -114,12 +114,17 @@ ATTR_SSID = "ssid"
 ATTR_PASSWORD = "password"
 
 SERVICE_LABEL_FACE = "label_face"
+SERVICE_UNLABEL_FACE = "unlabel_face"
 SERVICE_ADD_CAT = "add_cat"
 SERVICE_IDENTIFY = "identify"
 
 ATTR_CROP_ID = "crop_id"
 ATTR_CAT = "cat"
 ATTR_CAT_NAME = "name"
+# `kibble.unlabel_face`'s own wire field for the crop filename -- DESIGN.md's contract spells
+# it `{cat, name}`, not `{crop_id, cat}` like `label_face`; same identifier, different name
+# because that's what the two services' documented shapes each already commit to.
+ATTR_CROP_NAME = "name"
 
 # The two reserved `cat` bucket values `agent/src/faces.rs` treats specially: moved and
 # embedded like any real cat, but never counted as one (excluded from `GET /cats` and the

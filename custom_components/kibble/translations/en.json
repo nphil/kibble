@@ -483,6 +483,24 @@
         }
       }
     },
+    "unlabel_face": {
+      "name": "Unlabel face",
+      "description": "Move a labelled crop back into the pending review queue, the exact inverse of Label face.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to unlabel a crop on."
+        },
+        "cat": {
+          "name": "Cat",
+          "description": "The cat the crop is currently labelled under."
+        },
+        "name": {
+          "name": "Crop name",
+          "description": "The labelled sample's filename."
+        }
+      }
+    },
     "add_cat": {
       "name": "Add cat",
       "description": "Pre-register a cat with zero samples, so it appears as a label option before its first crop is labelled.",

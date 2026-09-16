@@ -236,6 +236,22 @@ label_face:
       selector:
         text:
 
+unlabel_face:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    cat:
+      required: true
+      selector:
+        text:
+    name:
+      required: true
+      selector:
+        text:
+
 add_cat:
   fields:
     device_id:

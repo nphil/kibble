@@ -1,0 +1,278 @@
+# The "Feeder" dashboard (url_path `cat-feeder`). Applied with
+# `xd://mcp__ha_mcp_ha_config_set_dashboard`; kept here so it is versioned. Design:
+# kibble-card/DESIGN.md. Requires HACS: kibble-card, Bubble Card >= 3.2, Mushroom, card-mod,
+# dispenser-schedule-card.
+views:
+  - title: Feeder
+    path: feeder
+    icon: mdi:bowl-mix
+    type: sections
+    max_columns: 3
+    dense_section_placement: true
+    sections:
+      # Hero: live video, bowl, feed. Two columns wide so the card's own container query
+      # puts the controls beside the stream; on a phone it stacks them underneath.
+      - type: grid
+        column_span: 2
+        cards:
+          - type: custom:kibble-card
+            device_id: 8aac9123dc81c88408b6704f72ea583d
+            settings_hash: "#settings"
+            schedule_hash: "#schedule"
+            grid_options:
+              columns: full
+              rows: auto
+
+      # Cats and status. One tile per enrolled cat; the ring colour is the cat's colour.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Cats
+            heading_style: title
+          - type: custom:mushroom-template-card
+            entity: binary_sensor.plant_room_cat_feeder_kitty_present
+            primary: Kitty
+            secondary: >-
+              {% if is_state(entity, 'on') %}At the bowl now{% else %}Last here {{ relative_time(states[entity].last_changed) }} ago{% endif %}
+            icon: mdi:cat
+            icon_color: teal
+            tap_action:
+              action: navigate
+              navigation_path: /cat-feeder/cats
+            card_mod:
+              style: |
+                mushroom-shape-icon {
+                  --icon-color: #3FA7A0;
+                  --shape-color: rgba(63, 167, 160, {{ '0.28' if is_state(config.entity, 'on') else '0.12' }});
+                }
+          - type: custom:mushroom-template-card
+            entity: binary_sensor.plant_room_cat_feeder_pancake_present
+            primary: Pancake
+            secondary: >-
+              {% if is_state(entity, 'on') %}At the bowl now{% else %}Last here {{ relative_time(states[entity].last_changed) }} ago{% endif %}
+            icon: mdi:cat
+            icon_color: purple
+            tap_action:
+              action: navigate
+              navigation_path: /cat-feeder/cats
+            card_mod:
+              style: |
+                mushroom-shape-icon {
+                  --icon-color: #9A5B9E;
+                  --shape-color: rgba(154, 91, 158, {{ '0.28' if is_state(config.entity, 'on') else '0.12' }});
+                }
+          - type: custom:mushroom-chips-card
+            alignment: start
+            chips:
+              - type: template
+                entity: sensor.plant_room_cat_feeder_detections_today
+                icon: mdi:motion-sensor
+                content: "{{ states(entity) }} today"
+                tap_action:
+                  action: more-info
+              - type: template
+                entity: sensor.plant_room_cat_feeder_wi_fi_signal
+                icon: >-
+                  {% set s = states(entity) | int(-100) %}
+                  {{ 'mdi:wifi-strength-4' if s > -55 else 'mdi:wifi-strength-3' if s > -65 else 'mdi:wifi-strength-2' if s > -75 else 'mdi:wifi-strength-1' }}
+                content: "{{ states(entity) }} dBm"
+                tap_action:
+                  action: more-info
+              - type: template
+                entity: sensor.plant_room_cat_feeder_desiccant_left
+                icon: mdi:air-filter
+                icon_color: "{{ 'red' if states(entity) | int(0) < 7 else 'disabled' }}"
+                content: "Desiccant {{ states(entity) }} days"
+                tap_action:
+                  action: more-info
+              - type: template
+                entity: switch.plant_room_cat_feeder_petkit_cloud
+                icon: "{{ 'mdi:cloud' if is_state(entity, 'on') else 'mdi:cloud-off-outline' }}"
+                icon_color: "{{ 'amber' if is_state(entity, 'on') else 'disabled' }}"
+                content: "{{ 'Petkit cloud on' if is_state(entity, 'on') else 'Local only' }}"
+                tap_action:
+                  action: navigate
+                  navigation_path: "#settings"
+              - type: template
+                icon: mdi:cog-outline
+                content: Settings
+                tap_action:
+                  action: navigate
+                  navigation_path: "#settings"
+
+      # Today: feeds and visits as one timeline.
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Today
+            heading_style: title
+          - type: custom:kibble-timeline-card
+            device_id: 8aac9123dc81c88408b6704f72ea583d
+            limit: 30
+            grid_options:
+              columns: full
+              rows: auto
+
+      # Schedule sits beside the timeline when there is room; on a phone it lives in the
+      # #schedule pop-up opened from the hero's "Next feed" line.
+      - type: grid
+        visibility:
+          - condition: screen
+            media_query: "(min-width: 1024px)"
+        cards:
+          - type: heading
+            heading: Schedule
+            heading_style: title
+            tap_action:
+              action: navigate
+              navigation_path: "#schedule"
+          - type: custom:dispenser-schedule-card
+            device:
+              type: custom
+              entity: sensor.plant_room_cat_feeder_schedule_card_state
+              max_entries: 24
+              min_amount: 1
+              max_amount: 20
+              step_amount: 1
+              status_map: ["0 -> dispensed", "1 -> failed", "2 -> pending", "3 -> dispensing"]
+              status_pattern: "(?<id>[^,]+),(?<hour>[0-9]{1,2}),(?<minute>[0-9]{1,2}),(?<amount>[0-9]{1,2}),(?<status>[0-9]);?"
+              actions:
+                add: kibble.schedule_card_add
+                edit: kibble.schedule_card_edit
+                remove: kibble.schedule_card_remove
+                toggle: kibble.schedule_card_toggle
+            unit_of_measurement:
+              one: portion
+              other: portions
+
+      # Pop-ups: hidden until their hash is navigated to.
+      - type: grid
+        cards:
+          - type: custom:bubble-card
+            card_type: pop-up
+            hash: "#schedule"
+            name: Schedule
+            icon: mdi:calendar-clock
+            popup_mode: fit-content
+            width_desktop: 540px
+            cards:
+              - type: custom:dispenser-schedule-card
+                device:
+                  type: custom
+                  entity: sensor.plant_room_cat_feeder_schedule_card_state
+                  max_entries: 24
+                  min_amount: 1
+                  max_amount: 20
+                  step_amount: 1
+                  status_map: ["0 -> dispensed", "1 -> failed", "2 -> pending", "3 -> dispensing"]
+                  status_pattern: "(?<id>[^,]+),(?<hour>[0-9]{1,2}),(?<minute>[0-9]{1,2}),(?<amount>[0-9]{1,2}),(?<status>[0-9]);?"
+                  actions:
+                    add: kibble.schedule_card_add
+                    edit: kibble.schedule_card_edit
+                    remove: kibble.schedule_card_remove
+                    toggle: kibble.schedule_card_toggle
+                unit_of_measurement:
+                  one: portion
+                  other: portions
+          - type: custom:bubble-card
+            card_type: pop-up
+            hash: "#settings"
+            name: Feeder settings
+            icon: mdi:cog-outline
+            popup_mode: fit-content
+            width_desktop: 540px
+            cards:
+              - type: custom:bubble-card
+                card_type: separator
+                name: Feeding
+                icon: mdi:bowl-mix
+              - type: custom:bubble-card
+                card_type: button
+                button_type: slider
+                entity: number.plant_room_cat_feeder_feed_amount_hopper_1
+                name: Portions from hopper 1
+                icon: mdi:numeric-1-box-outline
+                sub_button:
+                  - entity: button.plant_room_cat_feeder_feed_hopper_1
+                    icon: mdi:bowl-mix
+                    show_name: true
+                    name: Feed
+                    tap_action:
+                      action: perform-action
+                      perform_action: button.press
+                      target:
+                        entity_id: button.plant_room_cat_feeder_feed_hopper_1
+              - type: custom:bubble-card
+                card_type: button
+                button_type: slider
+                entity: number.plant_room_cat_feeder_feed_amount_hopper_2
+                name: Portions from hopper 2
+                icon: mdi:numeric-2-box-outline
+                sub_button:
+                  - entity: button.plant_room_cat_feeder_feed_hopper_2
+                    icon: mdi:bowl-mix
+                    show_name: true
+                    name: Feed
+                    tap_action:
+                      action: perform-action
+                      perform_action: button.press
+                      target:
+                        entity_id: button.plant_room_cat_feeder_feed_hopper_2
+              - type: custom:bubble-card
+                card_type: separator
+                name: Device
+                icon: mdi:cat
+              - type: custom:bubble-card
+                card_type: button
+                button_type: switch
+                entity: switch.plant_room_cat_feeder_status_led
+                name: Status light
+                icon: mdi:led-on
+              - type: custom:bubble-card
+                card_type: media-player
+                entity: media_player.plant_room_cat_feeder_speaker
+                name: Speaker volume
+                hide:
+                  play_pause_button: true
+                  previous_button: true
+                  next_button: true
+                  power_button: true
+              - type: custom:bubble-card
+                card_type: select
+                entity: select.plant_room_cat_feeder_wi_fi_network
+                name: Wi-Fi network
+                icon: mdi:wifi
+              - type: custom:bubble-card
+                card_type: separator
+                name: Cloud
+                icon: mdi:cloud-outline
+              - type: custom:bubble-card
+                card_type: button
+                button_type: switch
+                entity: switch.plant_room_cat_feeder_petkit_cloud
+                name: Petkit cloud
+                icon: mdi:cloud-outline
+                sub_button:
+                  - entity: sensor.plant_room_cat_feeder_cloud_connection
+                    show_state: true
+                    show_icon: false
+                    show_background: false
+                    tap_action:
+                      action: more-info
+
+  - title: Cats
+    path: cats
+    icon: mdi:cat
+    type: sections
+    max_columns: 1
+    sections:
+      - type: grid
+        column_span: 1
+        cards:
+          - type: custom:kibble-cats-card
+            device_id: 8aac9123dc81c88408b6704f72ea583d
+            confidence: 0.7
+            grid_options:
+              columns: full
+              rows: auto
