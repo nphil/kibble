@@ -1749,3 +1749,114 @@ new investigation in the same session.
 **Why kibbled exited at ~701.7s remains unanswered.** The new logging (once deployed) makes this
 answerable after the *next* occurrence, not this one -- there is no way to recover a cause for
 an incident that predates the log existing.
+
+## 20. `play_aac_file` plays; the vendor's talkback traced end to end; its "slow and garbled" explained
+
+Author: Main, 2026-09-16 (device uptime ~77.5-78.8 ks; `media` pid 204, `agora` pid 270). Every
+number below is from a live read; `kibbled` sent nothing to `media` outside the two labelled
+tests, and `/opt/kibble/audio_enabled` was absent for the whole session except inside them.
+
+### 20.1 `play_aac_file` (msg `0x2`) works on the first try -- one-way audio is DONE [HIGH]
+
+Test: `cp /audio/en/en_feed_start.aac /tmp/kt.aac` (8489 bytes, **23** ADTS frames, header
+`fff16040...` = AAC-LC/16 kHz/mono), predicted `SndFrm +23`, sent `sendmsg 1 0x2 /tmp/kt.aac`
+with a 0.28 s read-only sampler running (`/tmp/s1.sh`: `/proc/ax_proc/{ao,adec}`, `media`
+thread count, guard flag `0x767f0` via `/proc/204/mem`):
+
+| t (s) | threads | `SndFrm` | ADEC `SndStrm`/`DecOk`/`GetFrm` | guard |
+|---|---|---|---|---|
+| 77605.38 | 28 | 138 | 142/142/138 | 0 |
+| 77605.65 | **29** | 142 | 148/148/144 | 0 |
+| 77606.79 | 29 | 160 | 165/165/161 | 0 |
+| 77607.08 | **28** | **161** | 166/166/161 | 0 |
+
+`SndFrm` **+23 exactly**, real-time paced (~16 frames/s), one transient worker thread, guard
+flag untouched, ring untouched. Repeated through `kibbled` after the cutover below: `/speak`
+with a 65 536-sample tone → `SndFrm` 161→227 (**+66** = 64 frames + 2 encoder flush frames),
+`/clips/<name>/play` with an 18-frame clip → 227→245 (**+18**). ADEC `SndStrm` runs one ahead
+of frames per file (an end-of-stream send). Two `play_aac_file` sent back to back: `SndFrm`
+**+46** continuous, no plateau, two worker threads briefly alive -- `media` **serializes** them
+on its internal mutex and plays them gaplessly (as far as the driver counter can show) [HIGH].
+
+**Cutover (commit `4ca7545`, md5 `e50c3cca…`, live):** `/speak` encodes to ADTS, stages it at
+`/tmp/kibble-speak.aac` (tmpfs; `.part` + `rename`), sends `PLAY_AAC_FILE` with the path, polls
+`SndFrm` until the delta reaches the frame count (or nominal length + 3 s), removes the file.
+`/clips/<name>/play` sends the stored clip's own path. The finite-clip ring player is deleted;
+`LiveSession` (ring path) remains only for the backchannel decision. `SpeakerOwner::try_acquire`
+now also refuses while `0x767f0 == 1` (read from `/proc/<media>/mem`) -- the direct "a real
+talkback is running" signal -- in addition to the aenc check. Gate verified: `/speak` → 409 with
+audio off; a second `/speak` during playback → 409; `enabled:false` restored after each test.
+
+### 20.2 The comparative capture that never ran -- now run twice [HIGH]
+
+`ringmon` (read-only: `PROT_READ` mmap of the ring, `/proc/204/task` readdir, 4-byte `pread` of
+`/proc/204/mem`) at 21 Hz rows (run 1) and 4 Hz rows (run 2, 8x lighter, the control for
+sampler load), through one real app press-and-hold each. Both runs identical in every respect
+below; Nitin reported both as **"garbled and slow"**.
+
+| event | run 1 (t, s) | run 2 (t, s) |
+|---|---|---|
+| first chan=2 record written by `agora`; slot 7 word `+0x28` 1→0 | 78296.05 | 78583.97 |
+| **guard 0→1 AND `media` threads 28→29, same tick** (`speak_start` fired) | 78296.78 | 78584.84 |
+| slot 7 bookmark/cursor jump to the **3rd/4th chan=2 record** agora wrote ~0.75 s earlier | same tick | same tick |
+| last chan=2 record | 78317.71 | 78608.6 |
+| **guard 1→0, thread gone ≤50 ms later** (`speak_stop`) | 78321.02 / 78321.03 | 78611.62 / 78611.65 |
+| chan=2 records / distinct `pts_us` | **680 / 340** | **765 / 383** |
+| consecutive byte-identical pairs (same pts+len, seq+1) | 318 | 363 |
+| distinct-frame rate | 15.7/s (real time) | 15.6/s |
+| `SndFrm` during guard=1 | +381 in 24.3 s = 15.7/s | +421 in 26.8 s = 15.7/s |
+| consumer lag (global seq − slot 7 bookmark), start → end | 82 → 1167 records | 95 → 1350 records |
+
+Answers to the three step-2 questions:
+
+1. **The vendor's talkback does go through `speak_start` → `audio_out_thread`** (§17.1's [MED]
+   is now [HIGH]): guard flag and thread count change on the same 5 ms tick, twice. And
+   **`speak_stop` does end the thread**, within one sample tick, with 1100+ records still
+   unconsumed -- §17.4's "does not stop the thread" was a static-analysis miss.
+2. **`agora` writes the ring**, starting ~0.75 s *before* `speak_start`, and it writes **every
+   frame twice** (§11's intermittent defect was active in both runs today). The consumer starts
+   positioned at the 3rd/4th of those records -- *not* at the ring's current global write
+   cursor (§17.3's "starts from `ring_base->0x28`" is wrong or incomplete; the start position
+   arrives some other way, plausibly in `speak_start`'s payload -- **[OPEN]**, not investigated
+   per the stop rule, but note it would also explain §18.7: an empty-payload `speak_start`
+   from `kibbled` doing *nothing at all*).
+3. **What advances the counter:** every record of every channel bumps `ring_base->0x18`
+   (idle run: 420 records ↔ 421 seq). The consumer's bookmark advances +1 per record of *any*
+   channel as it walks (its cursor steps through 9 KB video records between 312-byte audio
+   ones), filtering chan=2 for decode -- so §17.3.1's open question is answered: **it walks
+   everything and filters** [HIGH]. Its pace is bounded by the AO at 15.7 frames/s.
+
+### 20.3 Why the talkback is "slow and garbled" [HIGH for the mechanism]
+
+`agora` delivers 31.4 chan=2 records/s (each 64 ms frame twice); `audio_out_thread` decodes
+**every** record -- no de-duplication -- and the AO plays them at 15.7/s. Result: half-speed,
+each frame heard twice (the stutter), and a backlog growing ~50 ring records/s (11 s of ring
+by the end of a 22 s hold) that `speak_stop` then discards. §11 already predicted exactly this
+from a byte-level capture on 2026-09-15 ("almost certainly what makes the stock app's own
+talkback sound slow and garbled on this unit"); today's traces close the loop from the ring
+to the driver counter. **Not caused by `kibbled`**: audio was off (no sends, `try_acquire`
+never reached), the only `kibbled` ring access is the unchanged read-only poller, and the 8x
+lighter control run reproduced it exactly. What was *not* run: a talkback with `kibbled`
+rolled back to `kibbled.pre-4ca7545` (md5 `24d6c577…`), so "today's build is not the trigger
+of agora's double-write" is [MED] by construction rather than [HIGH] by control. §19's
+"15+ s clean" acceptance run therefore did not pass today for a reason outside this project;
+the rollback control is the one-ask experiment that would settle it.
+
+### 20.4 Design decision for live talkback
+
+Option (b) -- **chunked-file near-real-time talkback over `play_aac_file`** -- is the one
+path proven audible from `kibbled`, and §20.1's back-to-back test shows `media` serializes
+queued files gaplessly, so ~0.5-1 s chunks give continuous speech at ~1 s latency with zero
+ring or mutex exposure and no dependence on the unexplained `speak_start` start-position
+protocol. Options (a)/(c) stay closed until the [OPEN] item in §20.2 is resolved (a
+`speak_start` payload capture, e.g. from `agora`'s send buffer, would do it). The RTSP
+backchannel (docs/20) should feed a `LiveSession`-shaped encoder whose drainer writes
+chunk files and sends `PLAY_AAC_FILE` per chunk, reusing `play_path`'s `SndFrm` wait.
+
+### 20.5 Tooling left on the device (all tmpfs)
+
+`/tmp/ringmon` (this session's build: args `<secs> <log> [tick_ms] [row_ms]`), `/tmp/sendmsg`
+(older build stamping `src=1`; handlers ignore it), `/tmp/s1.sh` (0.28 s shell sampler),
+`/tmp/kt.aac`. `kibbled`'s stdout/stderr still go to `/dev/null` (§19.5's `app_init.sh` log
+split remains undeployed), so `spawn_playback`'s `played/handed-off` line is not yet
+observable on-device.

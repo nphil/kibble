@@ -28,10 +28,10 @@ ONVIF intercom needs ([scrypted-onboarding.md](scrypted-onboarding.md)). One imp
 
 | piece | requirement | status |
 |---|---|---|
-| RTSP video | H.264 from the frame ring, no re-encode | **in progress** ([19-frame-ring.md](19-frame-ring.md)) |
-| RTSP audio, camera → client | mic audio as an RTP track | **blocked: codec unknown** |
-| RTSP backchannel, client → camera | a second `m=audio` section marked `a=sendonly`, negotiated when the client sends `Require: www.onvif.org/ver20/backchannel`; accept G.711 µ-law/A-law (what Scrypted's intercom offers) and/or Opus (what HomeKit sends before conversion) | not implemented |
-| Play received audio | decode and hand to the speaker | mechanism identified, unproven |
+| RTSP video | H.264 from the frame ring, no re-encode | **done** ([19-frame-ring.md](19-frame-ring.md)) |
+| RTSP audio, camera → client | mic audio as an RTP track | **done** — ADTS AAC-LC 16 kHz mono straight from the ring ([23-audio-codec.md](23-audio-codec.md) §14) |
+| RTSP backchannel, client → camera | a second `m=audio` section marked `a=sendonly`, negotiated when the client sends `Require: www.onvif.org/ver20/backchannel`; accept G.711 µ-law/A-law (what Scrypted's intercom offers) and/or Opus (what HomeKit sends before conversion) | negotiated + decoded (23 §14); speaker hand-off not yet wired to the proven path |
+| Play received audio | decode and hand to the speaker | **one-way proven**: `media`'s own `play_aac_file` (23 §18.2/§20.1) plays any ADTS file, serializes queued files gaplessly; `/speak` and clip play use it. Live talkback design: chunked files over the same path (23 §20.4) |
 
 ### The two genuine unknowns
 
