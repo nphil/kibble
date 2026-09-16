@@ -67,6 +67,14 @@ pub mod msg {
     /// UART CMD `0x09`, subaddr `2` -- see docs/26-ble-advertising.md for the full disassembly
     /// trace and why nothing here implies a timeout: that lives entirely in [`super::advertise`].
     pub const BLE_SET_ADV: u16 = 0x6001;
+    /// -> media: plays one ADTS AAC-LC file through the vendor's own canned-prompt engine
+    /// (`fopen` -> `AX_ADEC_SendStream` -> `AX_AO_SendFrame`, real-time paced by `media`
+    /// itself on a self-detaching worker thread). Payload is the plain NUL-terminated absolute
+    /// path, used verbatim -- no prefix, no lookup table, any file root can `fopen`
+    /// (`docs/23-audio-codec.md` §18.2). Proven live 2026-09-16 (§20): a 23-frame file moved
+    /// `/proc/ax_proc/ao`'s `SndFrm` by exactly +23, without touching `audio_out_thread`'s
+    /// guard flag or the ring. The only speaker path `kibbled` has ever made audible.
+    pub const PLAY_AAC_FILE: u16 = 0x2;
     /// -> media: spawns `audio_out_thread` if not already running (idempotent -- a second
     /// `speak_start` while one is already running is a disassembly-confirmed no-op, just
     /// returns `-1`; reads no payload). `docs/23-audio-codec.md` §17.1/§17.7.

@@ -31,7 +31,7 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-fn path_for(name: &str) -> PathBuf {
+pub fn path_for(name: &str) -> PathBuf {
     PathBuf::from(CLIPS_DIR).join(format!("{name}.aac"))
 }
 

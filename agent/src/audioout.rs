@@ -1,7 +1,18 @@
-//! Speaker output: encodes PCM to the same AAC-LC/16kHz/mono ADTS format the mic uses (`adts.rs`,
-//! `docs/23-audio-codec.md`) and paces it onto the ring's `CHAN_AUDIO_OUT` slot -- the same
-//! physical protocol `agora` already uses for live app talkback, confirmed live this project
-//! (every one of 548/548 captured chan=2 records decoded as valid ADTS AAC-LC/16kHz/mono).
+//! Speaker output. Two paths into `media`'s decoder/AO chain share this module:
+//!
+//! 1. **File playback** ([`play_bytes`]/[`play_path`]) -- `/speak` and `/clips/<name>/play`.
+//!    Hands `media` an ADTS AAC-LC/16kHz/mono file over its own `play_aac_file` bus message
+//!    (`bus::msg::PLAY_AAC_FILE`, `docs/23-audio-codec.md` §18.2) and `media` plays it exactly
+//!    the way it plays its own canned prompts. **Proven audible live** (§20, 2026-09-16: a
+//!    23-frame file moved `/proc/ax_proc/ao`'s `SndFrm` by exactly +23). Touches neither the
+//!    ring nor `audio_out_thread`'s guard flag.
+//! 2. **Ring publish** ([`LiveSession`], the RTSP backchannel) -- encodes PCM to the same
+//!    AAC-LC/16kHz/mono ADTS format the mic uses (`adts.rs`) and paces it onto the ring's
+//!    `CHAN_AUDIO_OUT` slot, the same physical protocol `agora` uses for live app talkback
+//!    (every one of 548/548 captured chan=2 records decoded as valid ADTS AAC-LC/16kHz/mono).
+//!    **Never yet consumed by `media`** despite byte-correct records and the vendor's own
+//!    publish protocol (`docs/23-audio-codec.md` §17.3/§17.12.4/§18.7) -- kept only for the
+//!    live-talkback design decision that §20's step-2 capture is meant to settle.
 //!
 //! ## Why AAC, not raw PCM
 //!
@@ -39,25 +50,29 @@
 //!
 //! ## Two producers, one speaker
 //!
-//! Two distinct risks share the name "two producers": (1) two *kibbled-internal* callers writing
-//! at once (a live backchannel session and a `/speak` call, say) -- prevented outright by
-//! [`SpeakerOwner`], a single in-process exclusive lock every writer (this module, `backchannel.rs`)
-//! must hold for its whole session; (2) the *vendor's own* `agora` writing during a live app
-//! talkback call at the same time `kibbled` tries to -- detected via [`call_active`], which reads
-//! `/proc/ax_proc/aenc` (confirmed live: prints only its 3-line version banner when idle, and
-//! `docs/23-audio-codec.md` independently flagged this exact file as the intended talk-session
-//! signal) and treats anything other than that exact idle banner -- including a read error -- as
-//! "a call might be active", refusing rather than risking corruption (a false positive only delays
-//! an announcement; a false negative corrupts two streams at once). Checked once before a session
-//! starts ([`SpeakerOwner::try_acquire`]) and again before every single frame during playback, so
-//! a call that starts mid-clip aborts the clip rather than interleaving with it.
+//! Two distinct risks share the name "two producers": (1) two *kibbled-internal* callers at once
+//! (a live backchannel session and a `/speak` call, say) -- prevented outright by
+//! [`SpeakerOwner`], a single in-process exclusive lock every speaker path (this module,
+//! `backchannel.rs`) must hold for its whole session; (2) the *vendor's own* live app talkback
+//! running at the same time `kibbled` tries to play anything -- detected two independent ways,
+//! both failing closed, because the one time this project collided with a real household
+//! talkback it cut that talkback short (`docs/23-audio-codec.md` §19):
+//! [`talkback_active`] reads `audio_out_thread`'s own guard flag straight out of `media`'s
+//! memory (`1` for exactly the duration of a real app press-and-hold, §19.1's trace), and
+//! [`call_active`] reads `/proc/ax_proc/aenc` (prints only its 3-line version banner when idle;
+//! anything else, including a read error, counts as "a call might be active"). A false positive
+//! only delays an announcement; a false negative would play over, or corrupt, a real session.
+//! Both are checked before a session starts ([`SpeakerOwner::try_acquire`]); the ring path
+//! re-checks `call_active` before every frame so a call starting mid-session aborts it.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::os::raw::{c_int, c_long, c_void};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -159,12 +174,46 @@ pub fn call_active() -> bool {
     }
 }
 
-/// Exclusive in-process ownership of the speaker ring slot: `backchannel.rs`'s live session and
-/// this module's `/speak`/clip-play both write `CHAN_AUDIO_OUT`, and must never do so at the same
-/// time (see module doc, "Two producers, one speaker"). One `AtomicBool`, not a `Mutex`: ownership
-/// is held across a whole playback session (seconds to minutes) typically by a different thread
-/// than the one that acquired it -- [`OwnerGuard`] releases it on `Drop` regardless of which
-/// thread drops it.
+/// Absolute virtual address of `audio_out_thread`'s guard flag inside `/app/bin/media`
+/// (`docs/23-audio-codec.md` §17.1/§17.4: set to `1` by `speak_start`, cleared by `speak_stop`,
+/// never touched by the thread itself). `media` is a fixed-address (non-PIE) executable --
+/// `/proc/<pid>/maps` puts its text at `0x10000` on every boot this project has looked at -- so
+/// the link-time address *is* the runtime address, readable as a plain 4-byte `pread` of
+/// `/proc/<pid>/mem` with no `ptrace`, no signal, and no pause of the target (the same read-only
+/// technique §18.4 used to verify the dispatch table live).
+const MEDIA_GUARD_FLAG_ADDR: u64 = 0x767f0;
+
+/// `true` if a real app talkback is in progress right now, or that can't be determined. Reads
+/// `media`'s `speak_start` guard flag (see [`MEDIA_GUARD_FLAG_ADDR`]): `docs/23-audio-codec.md`
+/// §19.1 traced it `0 -> 1` at the instant of an app press-and-hold and `1 -> 0` at release, so a
+/// `1` here means the vendor's `audio_out_thread` is (or is about to be) feeding the speaker and
+/// `kibbled` must not. Fails closed on any error -- no `media` process, unreadable `/proc`, short
+/// read -- for the same reason [`call_active`] does.
+pub fn talkback_active() -> bool {
+    let Some(pid) = vendor_pid("media") else { return true };
+    let mut word = [0u8; 4];
+    match File::open(format!("/proc/{pid}/mem"))
+        .and_then(|f| f.read_exact_at(&mut word, MEDIA_GUARD_FLAG_ADDR))
+    {
+        Ok(()) => u32::from_le_bytes(word) != 0,
+        Err(_) => true,
+    }
+}
+
+/// PID of the vendor process whose `comm` is exactly `name`, by a plain `/proc` scan.
+fn vendor_pid(name: &str) -> Option<u32> {
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+        (comm.trim_end() == name).then_some(pid)
+    })
+}
+
+/// Exclusive in-process ownership of the speaker: `backchannel.rs`'s live session and this
+/// module's `/speak`/clip-play must never run at the same time (see module doc, "Two producers,
+/// one speaker"). One `AtomicBool`, not a `Mutex`: ownership is held across a whole playback
+/// session (seconds to minutes) typically by a different thread than the one that acquired it --
+/// [`OwnerGuard`] releases it on `Drop` regardless of which thread drops it.
 pub struct SpeakerOwner(AtomicBool);
 
 impl SpeakerOwner {
@@ -190,6 +239,9 @@ impl SpeakerOwner {
     pub fn try_acquire(self: &Arc<Self>) -> Result<OwnerGuard, &'static str> {
         if !enabled() {
             return Err("audio is disabled (POST /audio {\"enabled\":true} to enable)");
+        }
+        if talkback_active() {
+            return Err("a live app talkback is active (media's speak_start guard flag is set)");
         }
         if call_active() {
             return Err("a live app talk session appears active (/proc/ax_proc/aenc)");
@@ -253,6 +305,7 @@ pub enum SpeakError {
     Encoder(String),
     Ring(String),
     Bus(String),
+    File(String),
 }
 
 impl std::fmt::Display for SpeakError {
@@ -260,7 +313,8 @@ impl std::fmt::Display for SpeakError {
         match self {
             SpeakError::Encoder(e) => write!(f, "encoder: {e}"),
             SpeakError::Ring(e) => write!(f, "ring write: {e}"),
-            SpeakError::Bus(e) => write!(f, "audio_out_thread: {e}"),
+            SpeakError::Bus(e) => write!(f, "media bus: {e}"),
+            SpeakError::File(e) => write!(f, "clip file: {e}"),
         }
     }
 }
@@ -269,7 +323,14 @@ impl std::fmt::Display for SpeakError {
 /// acceptance test (docs/23-audio-codec.md).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlaybackStats {
+    /// Frames handed to `media`: written to the ring (ring path) or contained in the file it was
+    /// told to play (file path).
     pub frames_written: u64,
+    /// Frames the audio-output driver actually emitted during this playback, measured as the
+    /// delta of `/proc/ax_proc/ao`'s `SndFrm` counter ([`ao_frames_sent`]) -- the only ground
+    /// truth this project has for "it made sound". File path only; the ring path has never
+    /// moved this counter (`docs/23-audio-codec.md` §17.12.4) and does not attempt to read it.
+    pub frames_played: u64,
     pub aborted_call_active: bool,
 }
 
@@ -292,10 +353,10 @@ pub fn normalize_rms(pcm: &mut [i16]) {
 }
 
 /// Normalizes and encodes `pcm` for storage (`PUT /clips/<name>`) or immediate playback
-/// (`POST /speak`): concatenated ADTS access units, ready to write straight to a clip file or
-/// pace onto the ring via [`play_encoded`]. Spawns and fully drains the `aacenc` helper; blocks
-/// the calling thread for the encode's duration only (well under a second for any realistic
-/// clip length -- `tools/aacenc/`'s own validation), not for real-time playback.
+/// (`POST /speak`): concatenated ADTS access units, ready to write straight to a clip file for
+/// [`play_path`] / [`play_bytes`]. Spawns and fully drains the `aacenc` helper; blocks the
+/// calling thread for the encode's duration only (well under a second for any realistic clip
+/// length -- `tools/aacenc/`'s own validation), not for real-time playback.
 pub fn normalize_and_encode(pcm: &[i16]) -> Result<Vec<u8>, SpeakError> {
     let mut pcm = pcm.to_vec();
     normalize_rms(&mut pcm);
@@ -303,48 +364,129 @@ pub fn normalize_and_encode(pcm: &[i16]) -> Result<Vec<u8>, SpeakError> {
     Ok(frames.concat())
 }
 
-/// Plays back already-encoded ADTS bytes (a stored clip via `clips::load`, or the immediate
-/// result of [`normalize_and_encode`]) by splitting them back into individual access units and
-/// pacing them onto the ring at real-time cadence. Blocks the calling thread for the clip's full
-/// real-time duration -- callers that must not block their own request thread (`main.rs`'s
-/// `/speak` and `/clips/<name>/play` handlers) run this on a spawned thread and return once
-/// [`SpeakerOwner::try_acquire`] alone has succeeded.
-pub fn play_encoded(
-    adts_bytes: &[u8],
-    tail: &Arc<TailCursor>,
-    _owner: &OwnerGuard,
-) -> Result<PlaybackStats, SpeakError> {
-    // Held until this function returns; `Drop` sends `speak_stop` regardless of how we exit.
-    let _audio_thread = AudioOutThread::start()?;
-    let mut frames = Vec::new();
+/// Number of complete ADTS access units in `adts_bytes` -- what `media` will play from a file of
+/// these bytes, and therefore the `SndFrm` delta a successful [`play_path`] is expected to show.
+/// Stops at the first frame whose declared length overruns the buffer (a truncated tail is not
+/// a frame `media` will play either; its own reader checks the same sync word and length).
+pub fn count_frames(adts_bytes: &[u8]) -> u64 {
+    let mut frames = 0;
     let mut off = 0;
     while let Some(header) = adts::parse(&adts_bytes[off..]) {
         let len = header.frame_length as usize;
         if len == 0 || off + len > adts_bytes.len() {
             break;
         }
-        frames.push(&adts_bytes[off..off + len]);
+        frames += 1;
         off += len;
     }
-    let ring_file = open_ring_for_write()?;
-    let start = Instant::now();
-    let mut stats = PlaybackStats::default();
-    for (i, frame) in frames.into_iter().enumerate() {
-        match pace_one(start, i as u32, &ring_file, tail, frame, &mut stats)? {
-            ControlFlow::Continue(()) => {}
-            ControlFlow::Break(()) => break,
+    frames
+}
+
+/// Where [`play_bytes`] stages a one-shot clip for `media` to `fopen`: tmpfs, never flash
+/// (`/tmp` is RAM on this device; `/opt` is UBIFS and every write there wears it). One fixed
+/// path rather than a fresh temp name per call: [`SpeakerOwner`] already serializes callers and
+/// [`play_path`] does not return until `media` has played the file (or the bounded wait ran
+/// out), so no caller can overwrite a file still being read. Written to a `.part` sibling and
+/// `rename`d into place so `media` can never `fopen` a half-written file.
+const SPEAK_FILE: &str = "/tmp/kibble-speak.aac";
+
+/// `/proc/ax_proc/ao`: the audio-output driver's own status, including the cumulative `SndFrm`
+/// frame counter every live speaker test in `docs/23-audio-codec.md` used as its ground truth.
+const AO_PROC: &str = "/proc/ax_proc/ao";
+
+/// How often [`play_path`] re-reads `SndFrm` while waiting for `media` to finish, and how long
+/// past the clip's nominal real-time length it keeps waiting before giving up on the counter:
+/// covers bus dispatch latency (`media` started playing ~0.3 s after the send in §20's trace)
+/// plus the decoder's few-frame tail, with margin. Nominal length + grace is the worst case a
+/// caller blocks; a clip that plays normally returns the moment the counter shows every frame
+/// out.
+const PLAY_POLL: Duration = Duration::from_millis(100);
+const PLAY_GRACE: Duration = Duration::from_secs(3);
+
+/// The audio-output driver's cumulative sent-frame count (`SndFrm`), or `None` if the proc file
+/// is unreadable or its layout isn't the one this project has observed on every read (a
+/// `AoCardId ...` header row naming the column, then one data row). Monotonic across a boot; the
+/// delta over a playback is the number of AAC frames the speaker actually received.
+pub fn ao_frames_sent() -> Option<u64> {
+    parse_snd_frm(&std::fs::read_to_string(AO_PROC).ok()?)
+}
+
+/// Pulls `SndFrm` out of `/proc/ax_proc/ao`'s text by its column header rather than a fixed
+/// position: the file is a series of `-------- SECTION ---` banners each followed by a header
+/// row and a data row, and `SndFrm` is a column of the last one (`AO DEV STATUS`).
+fn parse_snd_frm(text: &str) -> Option<u64> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(col) = line.split_whitespace().position(|c| c == "SndFrm") else { continue };
+        return lines.next()?.split_whitespace().nth(col)?.parse().ok();
+    }
+    None
+}
+
+/// Plays already-encoded ADTS bytes (the immediate result of [`normalize_and_encode`]) by staging
+/// them at [`SPEAK_FILE`] and handing that path to `media` via [`play_path`]. Blocks for the
+/// clip's real-time duration -- callers that must not block their own request thread (`main.rs`'s
+/// `/speak` handler) run this on a spawned thread and return once [`SpeakerOwner::try_acquire`]
+/// alone has succeeded. The staged file is removed afterwards to give the RAM back.
+pub fn play_bytes(adts_bytes: &[u8], owner: &OwnerGuard) -> Result<PlaybackStats, SpeakError> {
+    let part = format!("{SPEAK_FILE}.part");
+    std::fs::write(&part, adts_bytes)
+        .and_then(|()| std::fs::rename(&part, SPEAK_FILE))
+        .map_err(|e| SpeakError::File(format!("{SPEAK_FILE}: {e}")))?;
+    let result = play_path(Path::new(SPEAK_FILE), count_frames(adts_bytes), owner);
+    let _ = std::fs::remove_file(SPEAK_FILE);
+    result
+}
+
+/// Plays one ADTS AAC-LC/16kHz/mono file already on disk (a stored clip under `clips::CLIPS_DIR`,
+/// or [`play_bytes`]'s staged upload) through `media`'s own canned-prompt engine:
+/// `bus::msg::PLAY_AAC_FILE` with the path as payload, exactly what `ctrl` sends for
+/// `/audio/en/*.aac` (`docs/23-audio-codec.md` §18.2, proven audible §20). `media` decodes and
+/// paces the file itself on its own worker thread, so this only has to wait: it polls
+/// [`ao_frames_sent`] until the driver has emitted `frames` more frames than before the send,
+/// or the clip's nominal length plus [`PLAY_GRACE`] has elapsed, whichever comes first, and
+/// reports the observed delta as `frames_played`. Holding `owner` for that whole wait is what
+/// keeps a second clip from being sent while `media` is still reading this one.
+///
+/// This is the only function in `kibbled` that sends `PLAY_AAC_FILE`, and it is reachable only
+/// through an [`OwnerGuard`] -- i.e. only after [`SpeakerOwner::try_acquire`]'s `enabled()` and
+/// talkback checks passed for an explicit `/speak` or `/clips/<name>/play` request
+/// (`docs/23-audio-codec.md` §19.4's standing requirement).
+pub fn play_path(path: &Path, frames: u64, _owner: &OwnerGuard) -> Result<PlaybackStats, SpeakError> {
+    let mut payload = Vec::with_capacity(path.as_os_str().len() + 1);
+    payload.extend_from_slice(path.as_os_str().as_bytes());
+    payload.push(0);
+    let before = ao_frames_sent();
+    bus::Sender::open(bus::Peer::Media, BUS_SRC)
+        .and_then(|s| s.send(bus::msg::PLAY_AAC_FILE, &payload))
+        .map_err(|e| SpeakError::Bus(format!("play_aac_file: {e}")))?;
+    let deadline = Instant::now() + FRAME_DURATION * u32::try_from(frames).unwrap_or(u32::MAX) + PLAY_GRACE;
+    let mut frames_played = 0;
+    loop {
+        thread::sleep(PLAY_POLL);
+        if let (Some(before), Some(now)) = (before, ao_frames_sent()) {
+            frames_played = now.saturating_sub(before);
+            if frames_played >= frames {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
         }
     }
-    Ok(stats)
+    Ok(PlaybackStats { frames_written: frames, frames_played, aborted_call_active: false })
 }
 
 /// A live, incrementally-fed speaker session for the RTSP backchannel (`backchannel.rs`): unlike
-/// [`play_encoded`] (a short clip, fully known upfront), a backchannel call is open-ended and
+/// [`play_path`] (a short clip, fully known upfront), a backchannel call is open-ended and
 /// arrives as a live RTP stream, so encoding and ring-writing happen concurrently with the caller
 /// still feeding new PCM in. One background thread drains the encoder's stdout, paces, and writes
 /// each frame as it becomes available; `feed` just writes PCM straight to the encoder's stdin --
 /// `tools/aacenc/wrapper.c` itself accumulates arbitrary-sized writes up to its own fixed
 /// 1024-sample frame internally, so callers don't need to align to that boundary themselves.
+///
+/// Ring path (module doc, path 2): `media` has never been observed consuming what this writes.
+/// Kept pending the live-talkback design decision, not because it works.
 pub struct LiveSession {
     stdin: Option<ChildStdin>,
     child: Child,
@@ -427,9 +569,9 @@ impl Drop for LiveSession {
 }
 
 /// Sleeps (if needed) until `frame_index`'s scheduled real-time slot relative to `start`, then
-/// checks the vendor call-active signal and writes one frame if clear. Shared by both the
-/// finite-clip pacing loop ([`play_encoded`]) and the live backchannel session's drainer
-/// ([`LiveSession`]) so the two can't silently drift out of sync on what "paced" means.
+/// checks the vendor call-active signal and writes one frame if clear. The live backchannel
+/// session's drainer ([`LiveSession`]) is its only caller now that finite clips go through
+/// [`play_path`]; kept separate so "paced" stays one definition.
 fn pace_one(
     start: Instant,
     frame_index: u32,
@@ -933,6 +1075,57 @@ mod tests {
         // /proc/ax_proc/aenc doesn't exist on this dev machine -- the read errors, and the
         // documented fail-closed behavior must treat that as "assume active".
         assert!(call_active());
+    }
+
+    #[test]
+    fn talkback_active_fails_closed_without_a_media_process() {
+        // No vendor `media` process on this dev machine: the gate must refuse, not wave through.
+        assert!(talkback_active());
+    }
+
+    /// Verbatim `/proc/ax_proc/ao` from the device (2026-09-16, docs/23-audio-codec.md §20),
+    /// trailing spaces and all -- `SndFrm` sits in the *last* section, after five earlier
+    /// `AoCardId`-headed tables that must not be mistaken for it.
+    const REAL_AO_PROC: &str = "-------- AO VERSION ------------------------\n\
+[Axera version]: ax_audio V3.0.0_20250707110135 Jul  7 2025 11:43:31 JK\n\
+\n\
+-------- AO DEV ATTR ------------------------\n\
+AoCardId        AoDevId         ChnCnt          Samplerate      PeriodSize      PeriodCount     LinkMode        InsertSilence   AoDepth         enBitwidth      \n\
+0               1               2               16000           160             8               0               0               30              16bit           \n\
+-------- AO DEV VOLCTL ATTR ------------------------\n\
+AoCardId        AoDevId         VqeVolume       CurrVqeVolume   MuteEnable      Fade            FadeInRate      FadeOutRate     \n\
+0               1               0.700000        0.700000        0               0               0               0               \n\
+-------- AO DEV STATUS ------------------------\n\
+AoCardId        AoDevId         SndFrm          GetFrm          Writei          \n\
+0               1               161             161             161             \n";
+
+    #[test]
+    fn parse_snd_frm_reads_the_status_table_by_column_name() {
+        assert_eq!(parse_snd_frm(REAL_AO_PROC), Some(161));
+    }
+
+    #[test]
+    fn parse_snd_frm_is_none_when_the_status_table_is_absent_or_truncated() {
+        assert_eq!(parse_snd_frm("-------- AO VERSION ---\n[Axera version]: x\n"), None);
+        let header_only = REAL_AO_PROC.rsplit_once('\n').unwrap().0.rsplit_once('\n').unwrap().0;
+        assert_eq!(parse_snd_frm(header_only), None);
+    }
+
+    #[test]
+    fn count_frames_stops_at_a_truncated_trailing_frame() {
+        // Two real 266-byte frames (docs/23 §3 header) then a third whose declared length
+        // overruns the buffer: only the two complete ones count, matching what `media`'s own
+        // reader will play.
+        let hdr = [0xffu8, 0xf1, 0x60, 0x40, 0x21, 0x5f, 0xfc];
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            buf.extend_from_slice(&hdr);
+            buf.extend(std::iter::repeat_n(0u8, 266 - 7));
+        }
+        buf.extend_from_slice(&hdr);
+        buf.extend(std::iter::repeat_n(0u8, 100));
+        assert_eq!(count_frames(&buf), 2);
+        assert_eq!(count_frames(&[]), 0);
     }
 
     #[test]

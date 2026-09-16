@@ -286,7 +286,6 @@ fn main() {
             &feeds,
             &ai_feed,
             &capture,
-            &tail,
             &speaker_owner,
             &gallery,
             health,
@@ -310,7 +309,6 @@ fn route(
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
     capture: &feed_capture::FeedCapture,
-    tail: &Arc<ring::TailCursor>,
     speaker_owner: &Arc<audioout::SpeakerOwner>,
     gallery: &faces::Gallery,
     health: health::Health,
@@ -367,10 +365,10 @@ fn route(
         ("POST", "/wifi/forget") => wifi_forget(req),
         ("GET", "/audio") => Response::Json(audio_status_json()),
         ("POST", "/audio") => audio_write(req),
-        ("POST", "/speak") => speak(req, tail, speaker_owner),
+        ("POST", "/speak") => speak(req, speaker_owner),
         ("GET", "/clips") => Response::Json(clips_json()),
         (method, p) if p.starts_with("/clips/") => {
-            clip_route(method, &p["/clips/".len()..], req, tail, speaker_owner)
+            clip_route(method, &p["/clips/".len()..], req, speaker_owner)
         }
         _ => Response::NotFound,
     }
@@ -885,10 +883,11 @@ fn schedule_result(
 /// `POST /speak`: raw body upload -- signed 16-bit little-endian mono 16kHz PCM, matching the
 /// pipeline's native format exactly (no container/header; see `http.rs`'s `MAX_BODY` doc
 /// comment). Normalizes and encodes synchronously (a few hundred ms at most for any realistic
-/// clip length -- `tools/aacenc/`'s own validation), then plays it back on a spawned thread so
-/// the HTTP server stays responsive for the clip's real-time duration; only acquiring the
-/// speaker and the encode step can fail synchronously.
-fn speak(req: &Request, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
+/// clip length -- `tools/aacenc/`'s own validation), then stages the result as a tmpfs file and
+/// has `media` play it (`audioout::play_bytes`) on a spawned thread so the HTTP server stays
+/// responsive for the clip's real-time duration; only acquiring the speaker and the encode step
+/// can fail synchronously.
+fn speak(req: &Request, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
     let pcm = match pcm_from_body(&req.body) {
         Ok(p) => p,
         Err(msg) => return Response::BadRequest(msg),
@@ -902,22 +901,27 @@ fn speak(req: &Request, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audioo
         Err(e) => return Response::Error(e.to_string()),
     };
     let samples = pcm.len();
-    spawn_playback(adts_bytes, Arc::clone(tail), guard, "speak".to_string());
+    spawn_playback(guard, "speak".to_string(), move |g| audioout::play_bytes(&adts_bytes, g));
     Response::Json(format!(
         r#"{{"ok":true,"samples":{samples},"estimated_ms":{}}}"#,
         samples as u64 * 1000 / 16_000
     ))
 }
 
-/// Plays already-encoded ADTS bytes on a spawned thread (never the request-handling thread --
-/// see `speak`'s doc comment), moving the already-acquired [`audioout::OwnerGuard`] in so it
-/// releases the speaker exactly when playback (or an abort) finishes.
-fn spawn_playback(adts_bytes: Vec<u8>, tail: Arc<ring::TailCursor>, guard: audioout::OwnerGuard, tag: String) {
-    std::thread::spawn(move || match audioout::play_encoded(&adts_bytes, &tail, &guard) {
+/// Runs `play` on a spawned thread (never the request-handling thread -- see `speak`'s doc
+/// comment), moving the already-acquired [`audioout::OwnerGuard`] in so it releases the speaker
+/// exactly when playback finishes. Logs what the audio driver actually emitted
+/// (`frames_played`, from `/proc/ax_proc/ao`) against what was handed to `media`, so a silent
+/// failure shows up in `/tmp/kibbled.log` as `0/N` rather than as nothing at all.
+fn spawn_playback(
+    guard: audioout::OwnerGuard,
+    tag: String,
+    play: impl FnOnce(&audioout::OwnerGuard) -> Result<audioout::PlaybackStats, audioout::SpeakError> + Send + 'static,
+) {
+    std::thread::spawn(move || match play(&guard) {
         Ok(stats) => eprintln!(
-            "kibbled: {tag} playback done: {} frame(s){}",
-            stats.frames_written,
-            if stats.aborted_call_active { " (aborted: vendor call became active)" } else { "" }
+            "kibbled: {tag} playback done: {}/{} frame(s) played",
+            stats.frames_played, stats.frames_written
         ),
         Err(e) => eprintln!("kibbled: {tag} playback error: {e}"),
     });
@@ -958,7 +962,6 @@ fn clip_route(
     method: &str,
     rest: &str,
     req: &Request,
-    tail: &Arc<ring::TailCursor>,
     speaker_owner: &Arc<audioout::SpeakerOwner>,
 ) -> Response {
     let (name, play) = match rest.strip_suffix("/play") {
@@ -972,7 +975,7 @@ fn clip_route(
         ("PUT", false) => clip_put(name, req),
         ("GET", false) => clip_get(name),
         ("DELETE", false) => clip_delete(name),
-        ("POST", true) => clip_play(name, tail, speaker_owner),
+        ("POST", true) => clip_play(name, speaker_owner),
         _ => Response::NotFound,
     }
 }
@@ -1012,9 +1015,12 @@ fn clip_delete(name: &str) -> Response {
     }
 }
 
-fn clip_play(name: &str, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
-    let bytes = match clips::load(name) {
-        Ok(b) => b,
+/// `POST /clips/<name>/play`: `media` reads the stored clip straight from `clips::CLIPS_DIR` --
+/// no copy. The clip is still read here first, to answer 404 synchronously and to know how many
+/// frames to expect the driver to emit.
+fn clip_play(name: &str, speaker_owner: &Arc<audioout::SpeakerOwner>) -> Response {
+    let frames = match clips::load(name) {
+        Ok(b) => audioout::count_frames(&b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Response::NotFound,
         Err(e) => return Response::Error(e.to_string()),
     };
@@ -1022,6 +1028,7 @@ fn clip_play(name: &str, tail: &Arc<ring::TailCursor>, speaker_owner: &Arc<audio
         Ok(g) => g,
         Err(reason) => return Response::Conflict(reason.to_string()),
     };
-    spawn_playback(bytes, Arc::clone(tail), guard, format!("clip {name}"));
-    Response::Json(r#"{"ok":true}"#.to_string())
+    let path = clips::path_for(name);
+    spawn_playback(guard, format!("clip {name}"), move |g| audioout::play_path(&path, frames, g));
+    Response::Json(format!(r#"{{"ok":true,"frames":{frames}}}"#))
 }
