@@ -18,11 +18,20 @@ use std::os::raw::{c_char, c_int, c_uint};
 pub const MAX_PAYLOAD: usize = 0x21c; // 540; queue msgsize is 544 = 4 + this
 
 /// Queue ids, i.e. the `dst` of a message.
+///
+/// `Ctrl`/`Media` were the other way round until 2026-09-16. The original assignment came from
+/// `/proc/<pid>/fd` listings (docs/04-live.md), which cannot tell a process's own inbox from the
+/// peer queues it also holds open. Settled live and read-only: each dispatcher thread blocks in
+/// `poll()` on `{eventfd, inbox}`, and reading that pollfd array out of `/proc/<pid>/mem` names
+/// the inbox directly -- `ctrl` polls `/msg_dispatch_2`, `media` polls `/msg_dispatch_1`, `ble`
+/// polls `/msg_dispatch_8`. This also matches every static sender: `media` and `ble` emit
+/// ctrl-namespace ids (`0x1002`, `0x100b`, ...) with `dst=2`, and `ctrl` emits media-namespace
+/// ids (`0xa`/`0xb` speak, `0x2` play_aac_file) with `dst=1`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum Peer {
-    Ctrl = 1,
-    Media = 2,
+    Media = 1,
+    Ctrl = 2,
     Cloud = 4,
     Watchdog = 5,
     Agora = 7,

@@ -60,7 +60,7 @@ extern "C" {
     fn _exit(status: c_int) -> !;
 }
 
-/// `src` we stamp on our own sends; matches `main`'s `SRC_AS_CTRL` (stock `ctrl` is `1`).
+/// `src` we stamp on our own sends; matches `main`'s `SRC_AS_CTRL` (ctrl's own queue id).
 const SRC: u16 = Peer::Ctrl as u16;
 
 /// Set once at [`BleAdv::spawn`], read only from [`handle_shutdown_signal`]. A plain atomic

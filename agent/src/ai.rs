@@ -71,15 +71,29 @@
 //! the picture" feed today — with `score`/`pet_id`/`box` honestly `null` (that data lives only in
 //! the struct above, unreachable without replacing `ctrl`), not fabricated.
 //!
-//! ## Update: `cat` is real, unlike `pet_id`
+//! ## Update: `cat` is real, unlike `score`/`box`
 //!
 //! Since `docs/27-cat-id.md`, a `"face"`-class detection's crop is also run through
 //! [`crate::embed`]'s second-process NPU path and [`crate::faces::Gallery`]'s classifier before
-//! being published. Unlike `score`/`pet_id`/`box` above -- honestly `null` because that data is
-//! unreachable without replacing `ctrl` -- [`Detection::cat`] is a **real, first-party**
-//! identification: Kibble's own frozen-embedding classifier's opinion, not the vendor's. It is
-//! `None` whenever the classifier didn't confidently match an enrolled cat (including "no cats
-//! enrolled yet"), never a guess dressed up as a fact.
+//! being published. [`Detection::cat`] is a **real, first-party** identification: Kibble's own
+//! frozen-embedding classifier's opinion, not the vendor's. It is `None` whenever the classifier
+//! didn't confidently match an enrolled cat (including "no cats enrolled yet"), never a guess
+//! dressed up as a fact.
+//!
+//! ## Update 2026-09-16: `pet_id` is real too, and it never needed `ctrl`'s queue
+//!
+//! The earlier sections were right that the `0x1002` *message* is private to `ctrl` and wrong
+//! about where the data lives. `pet_id`, `count`, `area` and the per-visit tracker entries are
+//! not in the 168-byte payload at all: `media` writes them into `config_shm` at
+//! `state::off::PET_TRACK` (`g_config + 0x2880`, study/EventStruct.md §2.3) and `ctrl` reads them
+//! back from there to build its cloud JSON. `kibbled` already maps that file read-only, so
+//! [`poll_loop`] samples the block on every tick and publishes a `"track"`-class [`Detection`]
+//! whenever the newest tracker entry changes -- `pet_id` is the vendor's cloud pet id
+//! (`petId` in `/opt/pet_name_color.json`, confirmed equal on the live feeder), `ts` is the
+//! vendor's own `start_time`. `score` stays `null`: the f32 the vendor stores per entry read
+//! 2058.042 on the first live sample, which is not a similarity, so it is exposed raw as
+//! `track_value` until its meaning is known. A bounding box does not exist anywhere in the vendor
+//! chain, so `box` stays `null` for good.
 //!
 //! `/tmp/pet_face_pic.jpg` (named in the assignment) is the one exception worth flagging: it
 //! exists only as a literal string inside **`ctrl`**, not `media`/`libalgo.so`. Disassembling its
@@ -99,6 +113,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::catid;
 use crate::faces;
+use crate::state::Shm;
 
 /// Bus message ids relevant to the AI pipeline. See the module doc for how each was recovered.
 /// Both are scoped to `ctrl`'s own inbox (`/msg_dispatch_1`) -- meaningless on any other queue.
@@ -239,15 +254,20 @@ pub struct Detection {
     pub seq: u64,
     pub ts: u64,
     pub class: &'static str,
-    /// Always `None` today -- see the module doc. Kept as a real field (not omitted) so the
-    /// JSON shape the assignment specifies is stable once a `ctrl`-replacement tap can fill it.
+    /// Always `None` today: the vendor never computes a similarity this pipeline can see (see
+    /// "Update 2026-09-16" in the module doc). Kept so the JSON shape stays stable.
     pub score: Option<f32>,
+    /// The vendor's cloud pet id, from `config_shm`'s PetTrack block -- `"track"` class only.
     pub pet_id: Option<u32>,
+    /// Always `None`: no bounding box exists anywhere in the vendor's chain.
     pub b0x: Option<[f32; 4]>,
     /// Filename under `EVENTS_DIR` this detection's crop was saved to, if the copy succeeded.
     pub image: Option<String>,
     /// Kibble's own classifier's opinion, when confident -- see "Update: `cat` is real" above.
     pub cat: Option<String>,
+    /// The raw f32 the vendor stores with each tracker entry (`state::TrackEntry::value`),
+    /// `"track"` class only. Deliberately not called `score` until its meaning is known.
+    pub track_value: Option<f32>,
 }
 
 impl Detection {
@@ -264,7 +284,7 @@ impl Detection {
         };
         let pet_id = self.pet_id.map_or("null".to_string(), |v| v.to_string());
         format!(
-            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{},"cat":{}}}"#,
+            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{},"cat":{},"track_value":{}}}"#,
             self.seq,
             self.ts,
             self.class,
@@ -273,6 +293,7 @@ impl Detection {
             pet_id,
             opt_str(&self.image),
             opt_str(&self.cat),
+            opt_num(self.track_value),
         )
     }
 }
@@ -341,23 +362,42 @@ impl Feed {
                 b0x: None,
                 image: Some(name),
                 cat: None,
+                track_value: None,
             });
         }
     }
 
     fn push(&self, class: &'static str, image: Option<String>, cat: Option<String>) {
+        self.push_detection(now_unix(), class, image, cat, None, None);
+    }
+
+    /// The vendor identified a pet: publish it under the vendor's own `start_time`.
+    fn push_track(&self, entry: &crate::state::TrackEntry) {
+        self.push_detection(entry.start_time, "track", None, None, Some(entry.pet_id), Some(entry.value));
+    }
+
+    fn push_detection(
+        &self,
+        ts: u64,
+        class: &'static str,
+        image: Option<String>,
+        cat: Option<String>,
+        pet_id: Option<u32>,
+        track_value: Option<f32>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let seq = inner.next_seq;
         inner.next_seq += 1;
         inner.events.push_back(Detection {
             seq,
-            ts: now_unix(),
+            ts,
             class,
             score: None,
-            pet_id: None,
+            pet_id,
             b0x: None,
             image,
             cat,
+            track_value,
         });
         while inner.events.len() > MAX_EVENTS {
             inner.events.pop_front();
@@ -435,9 +475,19 @@ fn prune_events_dir() {
     }
 }
 
-fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>) {
+/// Identity of a tracker entry for change detection: the vendor rewrites the block on every
+/// visit, and a new `(pet_id, start_time)` pair is what "a new identification" means. Pure so
+/// the tests can drive it without a live `config_shm`.
+fn track_key(t: &crate::state::PetTrack) -> Option<(u32, u64)> {
+    t.latest().map(|e| (e.pet_id, e.start_time))
+}
+
+fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
     let _ = fs::create_dir_all(EVENTS_DIR);
     let mut last_seen: Vec<Option<SystemTime>> = vec![None; WATCHED.len()];
+    // Whatever the block holds at startup is history, not a new event: publishing it would
+    // re-announce the same visit on every kibbled restart.
+    let mut last_track = shm.pet_track().as_ref().and_then(track_key);
     loop {
         for (i, w) in WATCHED.iter().enumerate() {
             let (new_last, found) = check_one(w, last_seen[i]);
@@ -468,16 +518,25 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>) {
                 feed.push(w.class, saved.then_some(name), cat);
             }
         }
+        // `None` here means a torn read (media was mid-write) -- keep the previous key and
+        // look again next tick rather than treating it as "the block emptied".
+        if let Some(track) = shm.pet_track() {
+            let key = track_key(&track);
+            if key.is_some() && key != last_track {
+                feed.push_track(track.latest().unwrap());
+            }
+            last_track = key;
+        }
         thread::sleep(POLL_INTERVAL);
     }
 }
 
 /// Start the background poller and return the shared feed handle for `main.rs` to route
 /// `GET /events`/`GET /events/stream` against.
-pub fn spawn(gallery: Arc<faces::Gallery>) -> Arc<Feed> {
+pub fn spawn(gallery: Arc<faces::Gallery>, shm: Arc<Shm>) -> Arc<Feed> {
     let feed = Feed::new();
     let handle = Arc::clone(&feed);
-    thread::spawn(move || poll_loop(handle, gallery));
+    thread::spawn(move || poll_loop(handle, gallery, shm));
     feed
 }
 
@@ -565,6 +624,7 @@ mod tests {
             b0x: None,
             image: None,
             cat: None,
+            track_value: None,
         };
         let json = d.to_json();
         assert!(json.contains(r#""score":null"#));
@@ -585,6 +645,7 @@ mod tests {
             b0x: None,
             image: None,
             cat: Some("Rashy".to_string()),
+            track_value: None,
         };
         assert!(d.to_json().contains(r#""cat":"Rashy""#));
     }
@@ -595,6 +656,33 @@ mod tests {
         feed.push("face", Some("1-Rashy.jpg".to_string()), Some("Rashy".to_string()));
         let inner = feed.inner.lock().unwrap();
         assert_eq!(inner.events.back().unwrap().cat.as_deref(), Some("Rashy"));
+    }
+
+    #[test]
+    fn push_track_publishes_the_vendor_pet_id_under_its_own_start_time() {
+        use crate::state::TrackEntry;
+        let feed = Feed::new();
+        feed.push_track(&TrackEntry { pet_id: 101320712, start_time: 1789528968, value: 2058.042 });
+        let json = feed.snapshot_json();
+        assert!(json.contains(r#""ts":1789528968,"class":"track""#), "{json}");
+        assert!(json.contains(r#""pet_id":101320712"#), "{json}");
+        assert!(json.contains(r#""score":null"#), "{json}");
+        assert!(json.contains(r#""track_value":2058.042"#), "{json}");
+    }
+
+    #[test]
+    fn track_key_changes_only_when_the_newest_entry_changes() {
+        use crate::state::{PetTrack, TrackEntry};
+        let e = |pet_id, start_time| TrackEntry { pet_id, start_time, value: 0.0 };
+        let empty = PetTrack { pet_id: 0, count: 0, area: 0, trackers: vec![] };
+        assert_eq!(track_key(&empty), None);
+        let one = PetTrack { pet_id: 7, count: 1, area: 100, trackers: vec![e(7, 100)] };
+        assert_eq!(track_key(&one), Some((7, 100)));
+        // A second, older entry appended behind the newest does not count as a new visit.
+        let two = PetTrack { trackers: vec![e(7, 100), e(7, 50)], ..one.clone() };
+        assert_eq!(track_key(&two), track_key(&one));
+        let newer = PetTrack { trackers: vec![e(7, 100), e(9, 200)], ..one };
+        assert_eq!(track_key(&newer), Some((9, 200)));
     }
 
     // --- GET /events/<file> path safety -------------------------------------------------------

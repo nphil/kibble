@@ -5,8 +5,8 @@
 //! `kibbled` itself -- this test does not touch the running kibbled binary at all.
 //!
 //! Usage: sendmsg <peer_id> <msg_id_hex_or_dec> <payload_string|-empty-> [linger_secs]
-//! `src` is stamped as `1` (`Peer::Ctrl`), matching this project's existing
-//! "we speak on ctrl's behalf" convention (main.rs's `SRC_AS_CTRL`). `payload_string` is
+//! `src` is stamped as `2` (`Peer::Ctrl`, ctrl's real inbox id since the 2026-09-16
+//! correction in bus.rs), matching main.rs's `SRC_AS_CTRL`. `payload_string` is
 //! sent verbatim plus one trailing NUL byte we append ourselves; the literal argument
 //! `-empty-` sends a true zero-length payload (exact byte-for-byte replica of
 //! `bus::Sender::send(msg_id, &[])`, the proven-working `speak_start`/`speak_stop` shape).
@@ -22,7 +22,7 @@ extern "C" {
     fn mq_close(mqdes: c_int) -> c_int;
 }
 const O_WRONLY: c_int = 1;
-const SRC_AS_CTRL: u16 = 1;
+const SRC_AS_CTRL: u16 = 2;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

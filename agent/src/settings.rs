@@ -150,8 +150,11 @@ pub const SETTINGS: &[Setting] = &[
         offset: 3072,
         width: Width::U32,
         kind: Kind::Bool,
+        // `0x10` is `ctrl`'s own `dispatch_handler_ledlight_mode_set` (its inbox is queue 2).
+        // Named `Peer::Media` before the 2026-09-16 queue-id correction in `bus.rs`, which was
+        // the same queue under the wrong name -- the wire target is unchanged.
         notify: Some(Notify {
-            peer: Peer::Media,
+            peer: Peer::Ctrl,
             msg_id: 0x10,
             payload_len: 1,
         }),

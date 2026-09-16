@@ -126,9 +126,12 @@ use schedule::Schedule;
 use ring::VideoFeed;
 use state::Shm;
 
-/// `src` we stamp on bus messages. Stock `ctrl` is 1; replies to our feed land in its queue,
-/// where it handles them exactly as it would a cloud-originated feed. That keeps the vendor's
-/// own feed accounting (event log, cloud counters while it still runs) consistent.
+/// `src` we stamp on bus messages: `ctrl`'s own queue id, exactly as `ctrl!dispatch_send_msg`
+/// stamps it (it copies a process-global "my queue id", docs/24-onboard-ai.md §3). Until
+/// 2026-09-16 this evaluated to `1` because `Peer::Ctrl` was misnumbered (see `bus.rs`); every
+/// proven feed went out with `src=1`. No `ble` handler is known to read `src` (it only appears
+/// in `dispatch_mqueue_read`'s log line), so `2` is expected to be equally accepted -- the next
+/// scheduled feed is the confirmation.
 const SRC_AS_CTRL: u16 = Peer::Ctrl as u16;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8765";
@@ -190,7 +193,7 @@ fn main() {
         speaker_owner: Arc::clone(&speaker_owner),
     });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
-    let ai_feed = ai::spawn(Arc::clone(&gallery));
+    let ai_feed = ai::spawn(Arc::clone(&gallery), Arc::clone(&shm));
 
     eprintln!(
         "kibbled: listening on {bind}, rtsp on {RTSP_BIND} (/main chan {}, /sub chan {})",

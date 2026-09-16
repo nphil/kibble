@@ -31,16 +31,90 @@ pub mod off {
     /// state section
     pub const BOWL_FILL_1: usize = 9916; // u32; 0xffffffff while a feed is in flight
     pub const BOWL_FILL_2: usize = 9920; // u32
+    /// Named "event counter" when first mapped; now known to be `ble`'s count of MCU feed-log
+    /// records still awaiting `ctrl`'s `0x600f` ack (`ble` increments it at 0x146f2/0x14b66 on
+    /// a FEED_LOG report, decrements it in `dispatch_handler_ble_res_feed_log` at 0x174b4).
+    /// It reads 4 on a device where every feed works, so a non-zero value is not a fault.
     pub const EVENT_COUNTER: usize = 10184;
     /// Transient "a feed cycle is running" flag: 0 -> 1 -> 0 around a dispense.
     pub const FEEDING: usize = 10238;
-    /// Watchdog liveness toggles, one byte per supervised process. Each owner flips its byte
-    /// about every 2 s; if one goes stale the watchdog restarts, then kills, then reboots.
-    pub const ALIVE_BLE: usize = 10284;
-    pub const ALIVE_MEDIA: usize = 10288;
-    pub const ALIVE_CTRL: usize = 10296;
-    pub const ALIVE_AGORA: usize = 10300;
-    pub const ALIVE_CLOUD: usize = 10304;
+    /// Watchdog liveness counters, one u32 per supervised process, followed at `slot + 0x20`
+    /// by that process's pid. Live series (2026-09-16, 45 samples at 2 s): each owned slot
+    /// cycles 0/1/2 -- a small counter, not the 0<->1 toggle the first study guessed -- and
+    /// the pid words name the owners: 10316=204 media, 10320=212 ctrl, 10332=271 cloud,
+    /// 10336=203 ble, 10344=272 logUpload. Four of the five slots were mislabelled before.
+    /// `ALIVE_AGORA` is by elimination (its pid word reads 0); 10292/10308 are the dead
+    /// card/p2p slots. Stale for ~60 s -> the watchdog restarts (or, for `ctrl` past 30 min
+    /// of uptime, reboots) -- study/WatchdogStudy.md.
+    pub const ALIVE_MEDIA: usize = 10284;
+    pub const ALIVE_CTRL: usize = 10288;
+    pub const ALIVE_AGORA: usize = 10296;
+    pub const ALIVE_CLOUD: usize = 10300;
+    pub const ALIVE_BLE: usize = 10304;
+    pub const ALIVE_LOGUPLOAD: usize = 10312;
+    /// `g_config + 0x2880`: the block `media`'s `petkit_event_result_callback` fills with the
+    /// vendor's own pet-identification result and `ctrl` reads to build its `pet_id`-carrying
+    /// cloud event (study/EventStruct.md §2.3) -- see [`super::PetTrack`]. Confirmed live on
+    /// 2026-09-16: `pet_id` here equalled the single enrolled `petId` in
+    /// `/opt/pet_name_color.json` with a `start_time` 169 s after a `visit` crop.
+    pub const PET_TRACK: usize = 10368;
+}
+
+/// Bytes of the PetTrack block this module decodes: header (16) + 20 tracker entries of 24.
+/// The vomit array that follows (`+0x1f0`) is not decoded -- nothing consumes it.
+pub const PET_TRACK_LEN: usize = 0x1f0;
+const TRACK_ENTRY_LEN: usize = 0x18;
+const TRACK_MAX: usize = 20;
+
+/// One entry of the PetTrack tracker array (`state.rs::off::PET_TRACK + 0x10 + 0x18*i`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackEntry {
+    /// The vendor's cloud pet id (`petId` in `/opt/pet_name_color.json`).
+    pub pet_id: u32,
+    /// Unix seconds, u64 LE at `+8`.
+    pub start_time: u64,
+    /// f32 at `+0x10`. `ctrl` formats it `"%.3f"` under the JSON key `score`, but the one
+    /// live sample read 2058.042 -- not a 0..1 similarity -- so it is exposed raw, unnamed,
+    /// until a second sample settles what it is.
+    pub value: f32,
+}
+
+/// The vendor's on-device pet-identification result, decoded from `config_shm`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PetTrack {
+    pub pet_id: u32,
+    pub count: u32,
+    pub area: u32,
+    /// `tracker_count` entries, in the order the vendor keeps them.
+    pub trackers: Vec<TrackEntry>,
+}
+
+impl PetTrack {
+    /// Decodes [`PET_TRACK_LEN`] bytes. `tracker_count` is clamped to the array's capacity so a
+    /// torn or garbage header can never index past the block.
+    pub fn decode(b: &[u8]) -> Option<PetTrack> {
+        if b.len() < PET_TRACK_LEN {
+            return None;
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let n = (u32_at(4) as usize).min(TRACK_MAX);
+        let trackers = (0..n)
+            .map(|i| {
+                let e = 0x10 + i * TRACK_ENTRY_LEN;
+                TrackEntry {
+                    pet_id: u32_at(e),
+                    start_time: u64::from_le_bytes(b[e + 8..e + 16].try_into().unwrap()),
+                    value: f32::from_le_bytes(b[e + 0x10..e + 0x14].try_into().unwrap()),
+                }
+            })
+            .collect();
+        Some(PetTrack { pet_id: u32_at(0), count: u32_at(8), area: u32_at(0xc), trackers })
+    }
+
+    /// The most recent tracker entry by `start_time`, if any.
+    pub fn latest(&self) -> Option<&TrackEntry> {
+        self.trackers.iter().max_by_key(|e| e.start_time)
+    }
 }
 
 extern "C" {
@@ -135,9 +209,22 @@ impl Shm {
         self.str(off::TIMEZONE_NAME, 24)
     }
 
+    /// The vendor's live pet-identification block (see [`PetTrack`]). `media` writes it
+    /// without any lock we share, so the bytes are copied twice and only accepted when both
+    /// copies agree -- a write landing between the copies just means "try next tick".
+    pub fn pet_track(&self) -> Option<PetTrack> {
+        let first: [u8; PET_TRACK_LEN] = self.bytes(off::PET_TRACK, PET_TRACK_LEN).try_into().unwrap();
+        let second = self.bytes(off::PET_TRACK, PET_TRACK_LEN);
+        if first[..] != second[..] {
+            return None;
+        }
+        PetTrack::decode(&first)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let timezone_name = self.timezone_name();
         let scheduler_tz_supported = crate::localtime::tz_for_iana_name(&timezone_name).is_some();
+        let track = self.pet_track().and_then(|t| t.latest().copied());
         Snapshot {
             serial: self.str(off::SERIAL, 32),
             firmware: self.str(off::FIRMWARE, 16),
@@ -150,6 +237,7 @@ impl Shm {
             event_counter: self.u8(off::EVENT_COUNTER),
             timezone_name,
             scheduler_tz_supported,
+            track,
         }
     }
 }
@@ -160,7 +248,7 @@ impl Drop for Shm {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub serial: String,
     pub firmware: String,
@@ -178,6 +266,9 @@ pub struct Snapshot {
     /// means the scheduler (`scheduler.rs`) refuses to run even if enabled, per
     /// STUDY-schedule-encoding.md §11.1 item 2's "fail closed, never guess a DST rule" rule.
     pub scheduler_tz_supported: bool,
+    /// The vendor's most recent pet identification ([`PetTrack::latest`]), or `None` when the
+    /// block is empty or was caught mid-write.
+    pub track: Option<TrackEntry>,
 }
 
 impl Snapshot {
@@ -186,11 +277,18 @@ impl Snapshot {
         fn opt(v: Option<u32>) -> String {
             v.map_or("null".into(), |n| n.to_string())
         }
+        let track = match self.track {
+            Some(t) => format!(
+                r#"{{"pet_id":{},"start_unix":{},"value":{}}}"#,
+                t.pet_id, t.start_time, t.value
+            ),
+            None => "null".into(),
+        };
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
                 r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"event_counter":{},"#,
-                r#""timezone_name":"{}","scheduler_tz_supported":{}}}"#
+                r#""timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
             ),
             self.serial.escape_debug(),
             self.firmware.escape_debug(),
@@ -203,6 +301,7 @@ impl Snapshot {
             self.event_counter,
             self.timezone_name.escape_debug(),
             self.scheduler_tz_supported,
+            track,
         )
     }
 }
@@ -224,7 +323,48 @@ mod tests {
             event_counter: 3,
             timezone_name: "America/New_York".into(),
             scheduler_tz_supported: true,
+            track: None,
         }
+    }
+
+    /// The first 88 bytes of `config_shm[10368..]` as read on the live feeder on 2026-09-16
+    /// (study/a3watch.log), padded with zeros to the block length.
+    fn live_block() -> Vec<u8> {
+        let head = [
+            0x08, 0x08, 0x0a, 0x06, 0x01, 0, 0, 0, 0x01, 0, 0, 0, 0x64, 0, 0, 0, // header
+            0x08, 0x08, 0x0a, 0x06, 0, 0, 0, 0, 0x88, 0x0b, 0xaa, 0x6a, 0, 0, 0, 0, // entry 0
+            0xae, 0xa0, 0x00, 0x45, 0, 0, 0, 0,
+        ];
+        let mut b = head.to_vec();
+        b.resize(PET_TRACK_LEN, 0);
+        b
+    }
+
+    #[test]
+    fn decodes_the_live_identification_block() {
+        let t = PetTrack::decode(&live_block()).unwrap();
+        assert_eq!(t.pet_id, 101320712); // == petId in /opt/pet_name_color.json
+        assert_eq!((t.count, t.area), (1, 100));
+        assert_eq!(t.trackers.len(), 1);
+        let e = t.latest().unwrap();
+        assert_eq!((e.pet_id, e.start_time), (101320712, 1789528968));
+        assert!((e.value - 2058.042).abs() < 0.01);
+    }
+
+    #[test]
+    fn tracker_count_is_clamped_and_short_input_rejected() {
+        let mut b = live_block();
+        b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(PetTrack::decode(&b).unwrap().trackers.len(), TRACK_MAX);
+        assert!(PetTrack::decode(&b[..PET_TRACK_LEN - 1]).is_none());
+    }
+
+    #[test]
+    fn to_json_reports_track_or_null() {
+        let mut s = sample();
+        assert!(s.to_json().ends_with(r#""track":null}"#));
+        s.track = Some(TrackEntry { pet_id: 101320712, start_time: 1789528968, value: 2058.042 });
+        assert!(s.to_json().contains(r#""track":{"pet_id":101320712,"start_unix":1789528968,"value":2058.042}"#));
     }
 
     #[test]
