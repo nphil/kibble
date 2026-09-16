@@ -9,7 +9,7 @@
 //! (`catid.rs`) on its output instead of depending on that unreachable message -- see
 //! `docs/27-cat-id.md` for the full design and honestly-labelled accuracy findings.
 //!
-//! Crops arrive from `ai.rs`'s poller, which watches the vendor's own `/tmp/saveFace.jpg` for
+//! Crops arrive from `ai.rs`'s poller, which watches the vendor's own `/tmp/pet_face_pic.jpg` for
 //! changes -- see that module's doc for why the on-device `pet_id` this crop was associated with
 //! is not attached (it lives in the same unreachable bus message).
 //!

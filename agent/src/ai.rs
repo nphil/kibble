@@ -62,14 +62,19 @@
 //!
 //! Independent of the mqueue, `libalgo.so`/`media` write plain JPEG files to `/tmp` as a normal
 //! part of the same detection pipeline (`docs/03-app.md` §10, re-confirmed present in the pulled
-//! binaries this session): [`SAVE_FACE_JPG`] on a face match/enrollment, [`FPRE_PET_JPEG`] on a
-//! generic pet/motion visit, [`FPRE_EAT_JPEG`] on an eat event. These are ordinary files under a
-//! world-writable tmpfs — reading them is not touching any vendor IPC object at all, just
-//! `stat`+`read` on a path, exactly as safe as the JPEG endpoints `03-app.md` already documents
-//! `ctrl`/`cloud` themselves polling. A background thread here watches their mtimes and republishes
-//! a [`Detection`] on change, giving Scrypted/HA a real, first-pass "something happened, here is
-//! the picture" feed today — with `score`/`pet_id`/`box` honestly `null` (that data lives only in
-//! the struct above, unreachable without replacing `ctrl`), not fabricated.
+//! binaries this session): [`PET_FACE_PIC_JPG`] on an identification (the 224x224 face crop
+//! `media` hands to `ctrl` via msg `0x101b`), [`FPRE_PET_JPEG`] on a generic pet/motion visit,
+//! [`FPRE_EAT_JPEG`] on an eat event. These are ordinary files under a world-writable tmpfs —
+//! reading them is not touching any vendor IPC object at all, just `stat`+`read` on a path,
+//! exactly as safe as the JPEG endpoints `03-app.md` already documents `ctrl`/`cloud` themselves
+//! polling. A background thread here watches their mtimes and republishes a [`Detection`] on
+//! change, giving Scrypted/HA a real, first-pass "something happened, here is the picture" feed
+//! today — with `score`/`box` honestly `null` (no box exists anywhere in the vendor chain).
+//!
+//! `/tmp/saveFace.jpg` — the file this module originally watched — is structurally dead on this
+//! firmware: its writer (`libalgo` `petkit_save_face_front_img`) has no caller, and it also
+//! requires a `/opt/upload_face` marker and script that are not provisioned. Zero writes were
+//! observed in ~60 visits. `kibble-agent-tmp/study/FaceCrop.md` has the full trace.
 //!
 //! ## Update: `cat` is real, unlike `score`/`box`
 //!
@@ -173,7 +178,7 @@ impl CtrlEventMsgHeader {
 
 /// Vendor JPEG artifacts this module polls -- see the module doc's last section. Paths are the
 /// literal strings recovered from the pulled binaries' rodata this session.
-pub const SAVE_FACE_JPG: &str = "/tmp/saveFace.jpg";
+pub const PET_FACE_PIC_JPG: &str = "/tmp/pet_face_pic.jpg";
 pub const FPRE_PET_JPEG: &str = "/tmp/fPre_pet.jpeg";
 pub const FPRE_EAT_JPEG: &str = "/tmp/fPre_eat.jpeg";
 
@@ -187,7 +192,7 @@ struct Watched {
 }
 
 const WATCHED: &[Watched] = &[
-    Watched { path: SAVE_FACE_JPG, class: "face", is_face_crop: true },
+    Watched { path: PET_FACE_PIC_JPG, class: "face", is_face_crop: true },
     Watched { path: FPRE_PET_JPEG, class: "visit", is_face_crop: false },
     Watched { path: FPRE_EAT_JPEG, class: "eat", is_face_crop: false },
 ];
@@ -487,9 +492,11 @@ fn track_key(t: &crate::state::PetTrack) -> Option<(u32, u64)> {
 
 fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
     let _ = fs::create_dir_all(EVENTS_DIR);
-    let mut last_seen: Vec<Option<SystemTime>> = vec![None; WATCHED.len()];
-    // Whatever the block holds at startup is history, not a new event: publishing it would
-    // re-announce the same visit on every kibbled restart.
+    // Whatever exists at startup is history, not a new event: publishing it would re-announce
+    // the same visit (and re-save the same pending crop) on every kibbled restart. Seed with
+    // the current mtimes and only react to changes from here on; same rule for the track block.
+    let mut last_seen: Vec<Option<SystemTime>> =
+        WATCHED.iter().map(|w| fs::metadata(w.path).and_then(|m| m.modified()).ok()).collect();
     let mut last_track = shm.pet_track().as_ref().and_then(track_key);
     // The vendor-state fields HA reads from `GET /state` (bowl fill, desiccant, feeding, the
     // identification block) have no producer of their own on our side -- media/ble write them
@@ -721,7 +728,7 @@ mod tests {
     #[test]
     fn read_event_serves_a_real_file_written_by_the_poller() {
         // Exercises the exact naming convention `poll_loop` uses, end to end, without needing
-        // the real device -- the file this module actually watches (`SAVE_FACE_JPG` etc.) is
+        // the real device -- the file this module actually watches (`PET_FACE_PIC_JPG` etc.) is
         // vendor-only, but the copy step (`fs::write` into `EVENTS_DIR`) is pure filesystem
         // logic this test can drive directly.
         let _ = fs::create_dir_all(EVENTS_DIR);
