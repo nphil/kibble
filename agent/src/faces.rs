@@ -419,12 +419,40 @@ pub struct Gallery {
     inner: Mutex<Classifier>,
 }
 
+/// Every cat directory under [`FACES_ROOT`], including ones with no crops yet, excluding the
+/// reserved buckets (`pending`, `other`, `not_a_cat`). Used by [`Gallery::load`] so an enrolled
+/// cat survives a restart before it has its first labelled sample.
+fn list_enrolled_cats() -> Vec<String> {
+    let Ok(read) = fs::read_dir(FACES_ROOT) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in read.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_safe_name(&name) && !is_reserved_bucket(&name) {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
 impl Gallery {
     /// Builds the classifier from every labelled crop on disk, computing (and caching) any
-    /// embedding that isn't already cached. Meant for startup; scans the whole tree, so it is
-    /// not meant to be called on every request.
+    /// embedding that isn't already cached, and re-registers every enrolled cat directory even
+    /// when it holds no crops yet. Meant for startup; scans the whole tree, so it is not meant to
+    /// be called on every request.
+    ///
+    /// The sample-less pass matters: a cat added via [`Gallery::add_cat`] before its first crop is
+    /// only an empty directory, so rebuilding from crops alone silently forgot it on every restart
+    /// (and `kibbled` restarts routinely). Enrolling your cats and then losing them to the next
+    /// deploy is exactly the kind of quiet data loss this avoids.
     pub fn load() -> Gallery {
         let mut classifier = Classifier::new();
+        for name in list_enrolled_cats() {
+            classifier.ensure_cat(&name);
+        }
         let crops = list_labelled().unwrap_or_default();
         let mut samples = Vec::with_capacity(crops.len());
         for crop in &crops {
