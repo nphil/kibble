@@ -48,7 +48,6 @@ use std::io;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::AsRawFd;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -168,11 +167,6 @@ impl Drop for Ring {
 /// of the same record-header format.
 pub(crate) struct Header {
     pub(crate) seq: u32,
-    /// Offset 8: a separate monotonic counter per channel (main/sub/thumb/mic/audio-out each
-    /// increment their own copy by exactly 1 per record of that type). `audioout.rs` tracks this
-    /// for `CHAN_AUDIO_OUT` so its own writes continue whatever numbering `agora`'s already did,
-    /// rather than restarting at an arbitrary value a real reader might reject.
-    pub(crate) chan_seq: u32,
     pub(crate) length: u32,
     pub(crate) pts_us: u32,
     pub(crate) frame_type: u8,
@@ -192,7 +186,6 @@ pub(crate) fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     let b = &buf[off..off + HDR];
     let seq = u32::from_le_bytes(b[0..4].try_into().unwrap());
     let length = u32::from_le_bytes(b[4..8].try_into().unwrap());
-    let chan_seq = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let pts_us = u32::from_le_bytes(b[16..20].try_into().unwrap());
     let frame_type = b[32];
     let chan = b[34];
@@ -210,7 +203,7 @@ pub(crate) fn parse_header(buf: &[u8], off: usize) -> Option<Header> {
     if off + HDR + length as usize > buf.len() {
         return None;
     }
-    Some(Header { seq, chan_seq, length, pts_us, frame_type, chan, width, height })
+    Some(Header { seq, length, pts_us, frame_type, chan, width, height })
 }
 
 /// Scan forward from `from` for the next byte offset that starts with an Annex-B start code
@@ -326,60 +319,6 @@ impl Walker {
             ring.advise_dontneed(from, to);
         }
         self.advised_upto = new_upto;
-    }
-}
-
-/// Shared, lock-free snapshot of the poller's current position in the ring: the offset
-/// immediately after the last record it validated, that record's global sequence number, and
-/// (separately) the last per-channel sequence number seen on `CHAN_AUDIO_OUT`. `audioout.rs`
-/// seeds its own append point from this rather than repeating a full ring scan on every write --
-/// the poller is already walking continuously (up to 100 Hz, `POLL_SLEEP`), so this is never more
-/// than one poll tick stale. That staleness is exactly why `audioout.rs` still does a short, fresh
-/// catch-up walk immediately before every actual write instead of trusting this snapshot as the
-/// literal write target: several records can land in even one poll tick, and writing at a
-/// position real data has already moved past would guarantee, not just risk, a collision. This
-/// cursor only narrows that catch-up walk from "scan the whole ring" to "check the last couple of
-/// records" -- see `audioout.rs`'s module doc for the full writer-side synchronization rationale
-/// (there is no known, safely-reverse-engineerable atomic claim primitive for this ring's write
-/// side; every prior research session that looked -- docs/11-media.md §4, docs/19-frame-ring.md
-/// §1 -- explicitly flagged slot 0's exact semantics as unrecovered).
-pub struct TailCursor {
-    ready: AtomicBool,
-    next_pos: AtomicU32,
-    global_seq: AtomicU32,
-    chan2_seq: AtomicU32,
-}
-
-impl TailCursor {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ready: AtomicBool::new(false),
-            next_pos: AtomicU32::new(DATA_START as u32),
-            global_seq: AtomicU32::new(0),
-            chan2_seq: AtomicU32::new(0),
-        })
-    }
-
-    fn update(&self, global_seq: u32, next_pos: usize, chan2_seq: Option<u32>) {
-        self.next_pos.store(next_pos as u32, Ordering::Release);
-        self.global_seq.store(global_seq, Ordering::Release);
-        if let Some(s) = chan2_seq {
-            self.chan2_seq.store(s, Ordering::Release);
-        }
-        self.ready.store(true, Ordering::Release);
-    }
-
-    /// `(next_pos, last_global_seq, last_chan2_seq)`, or `None` before the poller has validated
-    /// its first record (startup only -- normally seeded within milliseconds).
-    pub(crate) fn snapshot(&self) -> Option<(usize, u32, u32)> {
-        if !self.ready.load(Ordering::Acquire) {
-            return None;
-        }
-        Some((
-            self.next_pos.load(Ordering::Acquire) as usize,
-            self.global_seq.load(Ordering::Acquire),
-            self.chan2_seq.load(Ordering::Acquire),
-        ))
     }
 }
 
@@ -710,7 +649,6 @@ fn poll_loop(
     main_feed: Arc<VideoFeed>,
     sub_feed: Arc<VideoFeed>,
     audio_feed: Arc<AudioFeed>,
-    tail: Arc<TailCursor>,
 ) {
     let mut w = Walker::new();
     w.seed(ring.as_bytes());
@@ -734,9 +672,6 @@ fn poll_loop(
                 }
                 _ => {}
             }
-            let next_pos = payload_off + h.length as usize;
-            let chan2_seq = (h.chan == CHAN_AUDIO_OUT).then_some(h.chan_seq);
-            tail.update(h.seq, next_pos, chan2_seq);
         }
         w.maybe_advise(&ring);
         if !made_progress {
@@ -749,21 +684,14 @@ fn poll_loop(
 /// `CHAN_MAIN`), `sub_feed` (chan `CHAN_SUB`) and `audio_feed` (chan `CHAN_AUDIO`) from a single
 /// walk through the ring -- one poll, three writers, regardless of how many RTSP clients any of
 /// them ends up fanning out to. The only fallible step is the initial open (bad path, too-small
-/// file, mmap failure); the poll loop itself never stops on its own. Also returns a
-/// [`TailCursor`] the same walk keeps fresh, for `audioout.rs`'s writer to seed its own append
-/// point from (see `TailCursor`'s doc comment).
+/// file, mmap failure); the poll loop itself never stops on its own.
 pub fn spawn(
     main_feed: Arc<VideoFeed>,
     sub_feed: Arc<VideoFeed>,
     audio_feed: Arc<AudioFeed>,
-) -> io::Result<(thread::JoinHandle<()>, Arc<TailCursor>)> {
+) -> io::Result<thread::JoinHandle<()>> {
     let ring = Ring::open()?;
-    let tail = TailCursor::new();
-    let tail_for_poller = Arc::clone(&tail);
-    Ok((
-        thread::spawn(move || poll_loop(ring, main_feed, sub_feed, audio_feed, tail_for_poller)),
-        tail,
-    ))
+    Ok(thread::spawn(move || poll_loop(ring, main_feed, sub_feed, audio_feed)))
 }
 
 #[cfg(test)]

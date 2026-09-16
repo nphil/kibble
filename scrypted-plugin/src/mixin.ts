@@ -22,8 +22,10 @@ import { FeederConfig, IdentifyResponse, RawDetection } from './types';
  * itself remembers detections for. */
 const MAX_CACHED_CROPS = 50;
 const SECOND_PASS_MIN_SCORE = 0.2;
-/** 20ms of 8kHz mu-law: 160 samples, 1 byte each. */
-const PCMU_FRAME_BYTES = 160;
+/** 20 ms of L16/16000 (16-bit signed big-endian PCM at the feeder's native 16 kHz): 320 samples,
+ * 2 bytes each. Wideband end to end -- no G.711 companding or 8 kHz band-limit between the
+ * caller's Opus and the feeder's AAC encoder. `agent/src/backchannel.rs`'s `PT_L16_16K`. */
+const L16_FRAME_BYTES = 640;
 
 /** `ObjectDetectionResult.score` is a required field in the SDK's own type, but the vendor's
  * confidence is genuinely unreachable (see `types.ts`). Building the honest, incomplete object
@@ -101,15 +103,15 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
             throw new Error(`kibble: PLAY failed: ${play.code} ${play.reason}`);
         }
         this.intercomClient = client;
-        this.console.log(
-            'kibble: intercom backchannel negotiated and playing (RTP/AVP/TCP, interleaved 4-5). ' +
-            'Audible playback on the feeder is separately gated on a vendor start-signal AudioStart ' +
-            'is resolving -- the negotiation and transport below are real; see README.',
-        );
+        this.console.log('kibble: intercom backchannel negotiated and playing (RTP/AVP/TCP, interleaved 4-5, L16/16000)');
 
         const ffmpegPath = await sdk.mediaManager.getFFmpegPath();
         const inputArgs = ffmpegInput.inputArguments?.length ? ffmpegInput.inputArguments : ['-i', ffmpegInput.url!];
-        const args = [...inputArgs, '-vn', '-acodec', 'pcm_mulaw', '-ar', '8000', '-ac', '1', '-f', 'mulaw', 'pipe:1'];
+        // Low-latency flags: no input probing/analysis delay, flush every packet.
+        const args = [
+            '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32', '-analyzeduration', '0',
+            ...inputArgs, '-vn', '-acodec', 'pcm_s16be', '-ar', '16000', '-ac', '1', '-f', 's16be', '-flush_packets', '1', 'pipe:1',
+        ];
         this.console.log(`kibble: intercom ffmpeg: ${ffmpegPath} ${args.join(' ')}`);
         const proc = child_process.spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         this.intercomFfmpeg = proc;
@@ -119,9 +121,9 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         let pending: Buffer = Buffer.alloc(0);
         proc.stdout?.on('data', (chunk: Buffer) => {
             pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-            while (pending.length >= PCMU_FRAME_BYTES) {
-                client.sendPcmuFrame(pending.subarray(0, PCMU_FRAME_BYTES));
-                pending = pending.subarray(PCMU_FRAME_BYTES);
+            while (pending.length >= L16_FRAME_BYTES) {
+                client.sendL16Frame(pending.subarray(0, L16_FRAME_BYTES));
+                pending = pending.subarray(L16_FRAME_BYTES);
             }
         });
     }

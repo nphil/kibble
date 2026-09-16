@@ -1,7 +1,7 @@
 // A small, from-scratch RTSP/1.0 + RTP-over-TCP-interleaved client for exactly the ONVIF-style
 // backchannel `agent/src/rtsp.rs` implements (see that module's doc comment and
 // `docs/23-audio-codec.md` §7.2/§14): DESCRIBE with `Require: www.onvif.org/ver20/backchannel`
-// offers a fourth SDP section (`m=audio 0 RTP/AVP 0`, `a=sendonly`, `trackID=2`); SETUP for
+// offers a fourth SDP section (`m=audio 0 RTP/AVP 98 0 8`, L16/16000 + G.711, `a=sendonly`, `trackID=2`); SETUP for
 // trackID=2 accepts only `RTP/AVP/TCP;unicast;interleaved=4-5` (a UDP transport request gets a
 // clean `461 Unsupported Transport`, by design, so a generic ONVIF/Scrypted client's documented
 // UDP-then-TCP fallback fires); PLAY starts the whole session (video + mic-audio + backchannel
@@ -25,6 +25,8 @@ const VIDEO_RTP_CHANNEL = 0;
 const AUDIO_RTP_CHANNEL = 2;
 /** RTP static payload type for PCMU (G.711 mu-law) -- `backchannel.rs`'s `PT_PCMU`. */
 const PCMU_PAYLOAD_TYPE = 0;
+/** Dynamic payload type the feeder's SDP maps to `L16/16000` -- `backchannel.rs`'s `PT_L16_16K`. */
+const L16_PAYLOAD_TYPE = 98;
 const MAX_HEADER_BYTES = 16 * 1024;
 
 export interface RtspResponse {
@@ -132,14 +134,23 @@ export class RtspBackchannelClient {
      * `backchannel.rs`'s CSRC-aware `rtp_payload` parser sees a bare 12-byte header) and writes
      * it as an interleaved TCP frame on the backchannel's channel. */
     sendPcmuFrame(payload: Buffer): void {
+        this.sendRtp(PCMU_PAYLOAD_TYPE, payload, payload.length); // 1 byte == 1 sample @ 8 kHz
+    }
+
+    /** Same, for one frame of L16/16000 (16-bit big-endian samples; the feeder's native rate). */
+    sendL16Frame(payload: Buffer): void {
+        this.sendRtp(L16_PAYLOAD_TYPE, payload, payload.length / 2);
+    }
+
+    private sendRtp(payloadType: number, payload: Buffer, samples: number): void {
         if (!this.socket) throw new Error('rtsp: not connected');
         const header = Buffer.alloc(12);
         header[0] = 0x80; // V=2, P=0, X=0, CC=0
-        header[1] = PCMU_PAYLOAD_TYPE; // M=0
+        header[1] = payloadType; // M=0
         header.writeUInt16BE(this.seq, 2);
         this.seq = (this.seq + 1) & 0xffff;
         header.writeUInt32BE(this.rtpTimestamp, 4);
-        this.rtpTimestamp = (this.rtpTimestamp + payload.length) >>> 0; // 1 byte == 1 sample @ 8kHz
+        this.rtpTimestamp = (this.rtpTimestamp + samples) >>> 0;
         header.writeUInt32BE(this.ssrc, 8);
         this.writeInterleaved(BACKCHANNEL_RTP_CHANNEL, Buffer.concat([header, payload]));
         this.audioFramesSent++;

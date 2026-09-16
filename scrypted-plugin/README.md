@@ -164,34 +164,30 @@ other. Auto-discovery skips the NVR's own per-camera detection mixins (designed 
 pipeline, not standalone crops) and matches on `/onnx|openvino/i`, so this also works on an
 OpenVINO-based instance without code changes. Toggle: Settings → "Second-pass detection".
 
-## Intercom: what's real, what's blocked
+## Intercom: working, wideband
 
-The feeder serves video to exactly one consumer (Scrypted's Rebroadcast). Scrypted's rebroadcast
-path is receive-only, so talkback has to open its **own** short-lived RTSP session straight to
+The feeder serves video to exactly one persistent consumer (Scrypted's Rebroadcast). Scrypted's
+rebroadcast path is receive-only, so talkback opens its **own** short-lived RTSP session straight to
 `kibbled` (`rtspBackchannel.ts`) — real DESCRIBE/SETUP/PLAY against the device, per
 `docs/23-audio-codec.md §14`. Because the device's RTSP server always starts full video+audio
-playback on `PLAY` (there is no way to play only the backchannel track), this transient session
-necessarily also becomes a real, second video session on `/sub` for the duration of one call —
-exactly the role `agent/src/rtsp.rs`'s own `MAX_SESSIONS_PER_STREAM` "spare slot" (2 total; normally
-1 used by Scrypted's own prebuffer) already exists for, not a violation of the one-persistent-
-consumer rule. `startIntercom` tears the session down on `stopIntercom`/error.
+playback on `PLAY`, this transient session is also a second video session on `/sub` for the
+duration of one call — the role `agent/src/rtsp.rs`'s `MAX_SESSIONS_PER_STREAM` spare slot exists
+for. `startIntercom` tears it down on `stopIntercom`/error.
 
-`startIntercom` spawns `ffmpeg` (via `mediaManager.getFFmpegPath()`) on whatever `FFmpegInput` the
-caller hands in, transcodes to raw `pcm_mulaw`/8kHz/mono, and packetizes+sends it as real RTP over
-the negotiated interleaved channel — the same wire format `docs/23-audio-codec.md §7.2` documents.
+`startIntercom` spawns `ffmpeg` (via `mediaManager.getFFmpegPath()`, low-delay flags) on whatever
+`FFmpegInput` the caller hands in (HomeKit's Opus, the Scrypted app's WebRTC audio), transcodes to
+**L16/16000** (raw 16-bit big-endian PCM at the feeder's native 16 kHz — no G.711 companding, no
+8 kHz band-limit), and sends it as RTP on the negotiated interleaved channel (payload type 98,
+`a=rtpmap:98 L16/16000` in the feeder's SDP; G.711 stays available for generic clients).
 
-**Audible output is currently blocked on a vendor start-signal `AudioStart` is resolving** — per
-this session's live coordination, the measured result was **no `SndFrm` movement** (predicted +125,
-got 0): the write path is byte-correct and reaches the ring, but the vendor's own `audio_out_thread`
-never consumes it yet. **The negotiation and transport above are real and independently verified
-live; the sound is not there yet.** Do not read the passing self-test as "talkback works."
+On the feeder, `kibbled` encodes to AAC and streams it through a named pipe that `media` plays as
+one long "prompt file" (`docs/23-audio-codec.md §20`), so there are no file/chunk boundaries and
+the speaker is paced by the audio driver itself. Measured latency budget ≈ pre-roll 0.5 s + encoder
+~0.1 s + driver buffer; session diagnostics (frames played, silence inserted, max lag) are on the
+agent's `GET /audio` after every call.
 
-**Do NOT flip `noAudio` on device 238 while this is blocked.** Once `AudioStart` reports the
-backchannel is actually audible: set `noAudio=false` on the RTSP Camera Plugin device's own
-settings, and confirm `prebuffer:detectedCodec` becomes `h264/aac` (the mic AAC track already
-exists per `docs/23-audio-codec.md §14`'s live verification — this flag is what tells Scrypted's
-prebuffer to actually negotiate and expose it, including to HomeKit). Until then it must stay
-`true`, or HomeKit/WebRTC clients will try to open an audio track the device won't usefully fill.
+`noAudio` on device 238 should be `false` so Scrypted negotiates the mic AAC track
+(`prebuffer:detectedCodec` = `h264/aac`) for viewers and HomeKit.
 
 ## A real @scrypted/sdk@0.5.59 workaround (`sdkFix.ts`)
 

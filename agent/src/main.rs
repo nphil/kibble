@@ -188,7 +188,7 @@ fn main() {
     let main_feed = VideoFeed::new();
     let sub_feed = VideoFeed::new();
     let audio_feed = ring::AudioFeed::new();
-    let (_poller, tail) = ring::spawn(main_feed.clone(), sub_feed.clone(), audio_feed.clone())
+    let _poller = ring::spawn(main_feed.clone(), sub_feed.clone(), audio_feed.clone())
         .unwrap_or_else(|e| die(&format!("open {}: {e}", ring::RING_PATH)));
     let speaker_owner = audioout::SpeakerOwner::new();
     let rtsp_listener =
@@ -198,7 +198,6 @@ fn main() {
         main: main_feed,
         sub: sub_feed,
         audio: audio_feed,
-        tail: Arc::clone(&tail),
         speaker_owner: Arc::clone(&speaker_owner),
     });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
@@ -394,7 +393,12 @@ fn state_json(shm: &Shm, health: health::Health) -> String {
 /// `GET /audio`: whether the off-by-default audio gate (`audioout::enabled`,
 /// docs/23-audio-codec.md §19) is currently on.
 fn audio_status_json() -> String {
-    format!(r#"{{"enabled":{}}}"#, audioout::enabled())
+    let last = audioout::LAST_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    format!(
+        r#"{{"enabled":{},"last_session":{}}}"#,
+        audioout::enabled(),
+        last.map_or_else(|| "null".to_string(), |s| s.to_json())
+    )
 }
 
 fn audio_write(req: &Request) -> Response {
@@ -919,10 +923,10 @@ fn spawn_playback(
     play: impl FnOnce(&audioout::OwnerGuard) -> Result<audioout::PlaybackStats, audioout::SpeakError> + Send + 'static,
 ) {
     std::thread::spawn(move || match play(&guard) {
-        Ok(stats) => eprintln!(
-            "kibbled: {tag} playback done: {}/{} frame(s) played",
-            stats.frames_played, stats.frames_written
-        ),
+        Ok(stats) => {
+            audioout::record_last(stats);
+            eprintln!("kibbled: {tag} playback done: {}/{} frame(s) played", stats.frames_played, stats.frames_written)
+        }
         Err(e) => eprintln!("kibbled: {tag} playback error: {e}"),
     });
 }

@@ -107,9 +107,7 @@ pub struct Feeds {
     pub sub: Arc<VideoFeed>,
     /// The one microphone, shared by both mounts (see `ring::AudioFeed`'s own doc comment).
     pub audio: Arc<AudioFeed>,
-    /// Ring writer-side dependencies the backchannel needs to reach the speaker -- see
-    /// `audioout.rs`.
-    pub tail: Arc<ring::TailCursor>,
+    /// The one speaker lock every talkback/announce path shares -- see `audioout.rs`.
     pub speaker_owner: Arc<audioout::SpeakerOwner>,
 }
 
@@ -290,7 +288,7 @@ fn start_backchannel_if_setup(setup: &SessionSetup, feeds: &Feeds, peer: &str) -
         return None;
     }
     match feeds.speaker_owner.try_acquire() {
-        Ok(guard) => match Backchannel::start(Arc::clone(&feeds.tail), guard) {
+        Ok(guard) => match Backchannel::start(guard) {
             Ok(bc) => Some(bc),
             Err(e) => {
                 eprintln!("kibbled: rtsp backchannel start failed for {peer}: {e}");
@@ -367,8 +365,10 @@ fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8], backchannel: bool) -> Strin
     );
     if backchannel {
         sdp.push_str(&format!(
-            "m=audio 0 RTP/AVP 0\r\n\
+            "m=audio 0 RTP/AVP 98 0 8\r\n\
+             a=rtpmap:98 L16/16000\r\n\
              a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
              a=sendonly\r\n\
              a=control:{base}/trackID=2\r\n"
         ));
@@ -426,11 +426,17 @@ fn stream_media(
     })();
     if let Some(bc) = backchannel {
         match bc.finish() {
-            Ok(stats) => eprintln!(
-                "kibbled: rtsp backchannel session {session_id} done: {} frame(s) written{}",
-                stats.frames_written,
-                if stats.aborted_call_active { " (aborted: vendor call became active)" } else { "" }
-            ),
+            Ok(stats) => {
+                audioout::record_last(stats);
+                eprintln!(
+                    "kibbled: rtsp backchannel session {session_id} done: {}/{} frame(s) played, {} silence, lag max {}{}",
+                    stats.frames_played,
+                    stats.frames_written,
+                    stats.silence_frames,
+                    stats.max_lag_frames,
+                    if stats.aborted_call_active { " (aborted: vendor call became active)" } else { "" }
+                )
+            }
             Err(e) => eprintln!("kibbled: rtsp backchannel session {session_id} error: {e}"),
         }
     }
@@ -858,6 +864,8 @@ mod tests {
     fn build_sdp_offers_backchannel_only_when_requested() {
         let sdp = build_sdp("rtsp://host:8554/sub", &[0x67, 0, 0, 0], &[0x68], true);
         assert!(sdp.contains("a=control:rtsp://host:8554/sub/trackID=2"));
+        assert!(sdp.contains("m=audio 0 RTP/AVP 98 0 8"), "L16/16000 offered first, G.711 as baseline");
+        assert!(sdp.contains("a=rtpmap:98 L16/16000"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000"));
         assert!(sdp.contains("a=sendonly"));
     }
@@ -884,7 +892,6 @@ mod tests {
             main: VideoFeed::new(),
             sub: VideoFeed::new(),
             audio: AudioFeed::new(),
-            tail: ring::TailCursor::new(),
             speaker_owner: audioout::SpeakerOwner::new(),
         }
     }

@@ -75,17 +75,6 @@ pub mod msg {
     /// `/proc/ax_proc/ao`'s `SndFrm` by exactly +23, without touching `audio_out_thread`'s
     /// guard flag or the ring. The only speaker path `kibbled` has ever made audible.
     pub const PLAY_AAC_FILE: u16 = 0x2;
-    /// -> media: spawns `audio_out_thread` if not already running (idempotent -- a second
-    /// `speak_start` while one is already running is a disassembly-confirmed no-op, just
-    /// returns `-1`; reads no payload). `docs/23-audio-codec.md` §17.1/§17.7.
-    pub const SPEAK_START: u16 = 0xa;
-    /// -> media: clears `audio_out_thread`'s guard flag (`0x767f0`). Does **not** stop the
-    /// thread itself -- it exits on its own ~5s idle timeout regardless -- but must be sent
-    /// after every `speak_start` (RAII-guaranteed, [`super::audioout::AudioOutThread`]) or the
-    /// flag sticks at `1` forever and silently rejects every future `speak_start`, kibbled's own
-    /// or (architecture-consistent, not independently proven) a real app pet-call's. Reads no
-    /// payload. `docs/23-audio-codec.md` §17.4.
-    pub const SPEAK_STOP: u16 = 0xb;
 }
 
 type MqdT = c_int;
