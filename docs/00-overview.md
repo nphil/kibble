@@ -64,7 +64,7 @@ STUDY-msgids.md, STUDY-config.md (+config_layout.json), STUDY-mcu.md, STUDY-ble.
 RESEARCH-npu-scout.md, PETKIT_BLE_RESEARCH_ONLINE.md (+3 quick refs), live/ (config_shm.bin SECRET, ble.img, 60 s shm series).
 
 - SoC: Axera **AX620Q** (AX620E family; Cortex-A53 x2 in AArch32; 256 MiB SiP, 96 MB to Linux + 160 MB CMM). Pulsar2 target AX620E. AX Engine V3.0.0.
-- Bus: POSIX mqueues `/msg_dispatch_N` (1 ctrl, 2 media, 4 cloud, 5 watchdog, 7 agora, 8 ble, 10 logUpload); envelope 16 B {u32 msg_id, i32 src, i32 dst, u32 len}; mq 128 x 544.
+- Bus: POSIX mqueues `/msg_dispatch_N` (1 media, 2 ctrl — swapped relative to the original fd-listing guess, corrected live 2026-09-16 — 4 cloud, 5 watchdog, 7 agora, 8 ble, 10 logUpload); envelope 16 B {u32 msg_id, i32 src, i32 dst, u32 len}; mq 128 x 544.
 - **Feed = msg_id 0x6004 to dst 8**, 67-byte payload (ctrl 0x44f98 -> ble dispatch_handler_ble_feed_ctrl -> UART CMD 0x0A). Other ids: 0x100f feed-in, 0x100a recv_ble_data, 0x101a ble_get_schedule, 0x1009 ble_key_change_wifi, 0x1007 save_wifi_conf, 0x1010 dev_state_report.
 - Watchdog: per-process u32 alive counters in config_shm — 10284 media / 10288 ctrl / 10296 agora / 10300 cloud / 10304 ble / 10312 logUpload, each followed by the owner's pid at +0x20 (corrected 2026-09-16; the earlier "1-byte toggles, 10296=ctrl" reading was wrong — see 06-msgids.md errata). Stale ~60 s -> restart, or for ctrl past 30 min uptime -> `reboot -f`.
 - config_t: 11952 B, usr(4664) | dev(228) | state(7060); 54 offsets mapped, 228 field names; telemetry offsets still need a feed-cycle diff.
