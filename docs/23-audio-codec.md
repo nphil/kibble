@@ -1402,3 +1402,301 @@ confirm or refute that `publish()` writes valid records, independent of any cons
 (2) if writes are confirmed good, retest consumption against a freshly-rebooted (not just
 freshly-restarted) device to remove the elevated-reset-frequency confound entirely; (3) only then,
 if `SndFrm` still fails to move, revisit the gate model itself.
+
+## 18. `play_aac_file` payload decoded; the whole dispatch chain re-verified live; `speak_start` still produces zero effect even from a byte-identical sender post-reboot
+
+Author: AudioSolve. Method: disassembly (capstone + pyelftools, same pipeline every prior
+session used) against the same `f9e74f321a2bb7693f495598d816386a` `media` copy, **plus**, new
+this session, live read-only verification against the actual running device: a mounted
+`mqueue` pseudo-filesystem, `/proc/<pid>/fd`, and a handful of targeted `/proc/204/mem` reads
+(never `ptrace`, never a write, never touching a vendor process's execution). One real,
+Main-approved device reboot was performed and is reported in full. Every claim below is tagged
+per this doc's standing convention.
+
+### 18.1 A methodological bug in this session's own tooling, found and fixed [HIGH]
+
+Early in this session's disassembly, `register()`'s table-population arguments (the `r1`/`r2`
+GOT-indirected values every prior session's own re-derivation relied on) resolved to
+garbled-looking 32-bit values instead of clean pointers. Root cause, found by hand-verifying
+one known-good case: this session's PC-relative-address simulator applied `Align(PC,4)` to
+**every** PC-relative instruction, but that alignment rule is only correct for `LDR`
+(literal)/`ADR`-class instructions -- a plain data-processing `ADD Rd, PC` (used throughout
+this binary to materialize a GOT/data base pointer, e.g. `ldr r4,[pc,#N]; add r4,pc`) uses the
+**unaligned** `PC = instruction_address + 4`. Whenever the `add`'s own address happened to
+already be a multiple of 4 the bug was invisible (several early spot-checks this session
+coincidentally landed there); whenever it wasn't, every downstream GOT dereference read two
+bytes into the wrong slot, producing exactly the "half of one field + half of the next"
+garbage this session chased for a while. Fixed by using unaligned `PC` for `ADD`/`MOV`-class
+PC reads and keeping `Align(PC,4)` only for `LDR`/literal reads. **Flagging this explicitly
+for any future session redoing this kind of analysis on this binary -- it is a real trap, not
+specific to this session's code, and would silently corrupt any GOT-relative table read.**
+
+### 18.2 `dispatch_handler_play_aac_file`'s payload: a plain, unconstrained path string [HIGH]
+
+Traced from `register()`'s live table entry for `msg_id=2` (handler `0x31a05`, confirmed live,
+§18.4) through to the actual file I/O, every call PLT-resolved by symbol name against
+`.rel.plt`/`.dynsym` (not guessed):
+
+1. **Trampoline** (`0x31a04`): receives `(msg_id, src, payload_ptr, payload_len)` -- the same
+   4-argument convention `dispatch_mqueue_read` uses for every handler (§18.3). Gates only on
+   `payload_len-1 <= 0xff` (i.e. length in `1..=256`, purely for whether a debug log is safe to
+   print) and `payload_ptr != NULL`; on the real path, calls `0x314d4` with `r0 = payload_ptr`.
+2. **`0x314d4`**: `strlen(payload_ptr)`, `malloc(len+1)`, `memcpy` -- a plain heap string
+   duplicate of the payload, **no prefix, no suffix, no directory concatenation, no table/index
+   lookup anywhere in this path**. The duplicate exists so the payload -- which only lives for
+   the duration of the dispatch call, backed by `dispatch_mqueue_read`'s own stack buffer -- has
+   a stable copy for the async worker thread below.
+3. `pthread_create(thread, NULL, start_routine=0x301fa, arg=<the heap copy>)`.
+4. **Worker thread** (`0x301fa`): `pthread_self`+`pthread_detach` (self-detaching, same idiom as
+   `audio_out_thread`), `pthread_mutex_lock` on an unrelated internal state mutex (not the ring
+   mutex), then **`fopen(arg, "rb")` with the heap-copied string passed verbatim as the path** --
+   confirmed by symbol name, not inferred. `fread`s exactly 7 bytes and checks for a genuine
+   ADTS sync word (`0xFF` then top nibble `0xF`) before proceeding to
+   `AX_ADEC_SendStream`/`AX_ADEC_GetFrame`/`AX_AO_SendFrame` (§6's already-confirmed
+   canned-prompt engine); on a bad/missing file it logs via `fputs` and falls through to
+   `fclose`/`free` cleanup instead of crashing.
+
+**This is an arbitrary-path file player, not a fixed-prompt index.** Any path this device's
+root user can `fopen()` -- including a file `kibbled` itself wrote under `/tmp` or
+`/opt/kibble` -- is a legal payload as far as this code is concerned. `/audio/en/*.aac` (the
+vendor's own 7 KB-ish prompts, confirmed AAC-LC/16kHz/mono ADTS via local `ffprobe` on a
+fetched copy) needs no special-casing; it is simply the vendor's own choice of `arg`.
+
+### 18.3 `dispatch_mqueue_read` and the message table, fully re-derived and cross-checked live [HIGH]
+
+Corrected the prior citation of this function's address (`0x33171`, one byte off a real
+instruction boundary and, worse, disassembled without `capstone`'s `skipdata=True`, which
+silently produces garbage across any embedded literal pool -- the true function starts at
+`0x33172`, one instruction into what looked like noise under the old method). Full trace, byte
+by byte:
+
+1. `mq_receive(mqd, buf=&local[544 bytes], len=0x220, prio=NULL)` -- `0x220` = 544 matches
+   `bus.rs`'s own documented `msgsize` exactly. The 544-byte buffer is `memset` to 0 immediately
+   before every call, so an under-length message's tail is zero, not garbage.
+2. `payload_len = bytes_received - 4`. `msg_id = buf[0:2]`, `src = buf[2:4]` (both `u16`) --
+   matches `bus.rs`'s documented envelope exactly.
+3. Two sentinels checked before general dispatch: `msg_id==0xFFFF` returns immediately without
+   dispatching anything (a shutdown/no-op value); `msg_id==0x103` skips a verbose debug-log call
+   only, still dispatches normally. Neither is `0xa`/`0xb`/`0x2`.
+4. **Table lookup**: `pthread_mutex_lock` a dedicated table-protection mutex (confirmed, by
+   disassembly, to be a *different* mutex object from the ring's `media_buffer_frame_buf` one --
+   this table search cannot be affected by anything this project has done to the ring mutex),
+   linear-scans a **12-byte-stride array** (`{u16 msg_id, u16 pad, u32 handler, u32
+   name_str_ptr}`) comparing only the leading `u16`, `pthread_mutex_unlock`, then, if found and
+   `handler != NULL`, calls `handler(msg_id, src, payload_ptr, payload_len)` with `payload_ptr`
+   pointing at `buf+4` (the same 544-byte receive buffer, not a second copy). `register()`
+   (`0x337c8`) is confirmed to write this exact same table (cross-derived from *both* sides --
+   the reader's table-base computation and the writer's -- landing on the identical address once
+   §18.1's bug was fixed).
+
+### 18.4 Live confirmation: the table is correctly populated, right now, on the actual running device [HIGH]
+
+Read the table directly out of `media`'s own live memory (`/proc/204/mem`, root, plain
+byte-range read -- no `ptrace`, no signal, no pause of the target; the same read-only technique
+this project already uses for `/dev/shm/media_buffer_frame_buf`). Base address `0x76844`
+(the *other* of two independently-computed candidates was wrong -- a stale/miscomputed literal
+offset, discarded once the live read distinguished them). First 8 entries, exactly as predicted
+by static analysis with zero discrepancies:
+
+| index | msg\_id | handler | name (from §18.1-corrected `register()` trace) |
+|---|---|---|---|
+| 0 | 3 | `0x1a029` | `dispatch_handler_set_day_night_mode` |
+| 1 | 4 | `0x28091` | `dispatch_handler_get_jpeg` |
+| 2 | 6 | `0x28091` | (same handler, second registration) |
+| 3 | 1 | `0x283d9` | `dispatch_handler_request_IDR` |
+| 4 | **2** | **`0x31a05`** | `dispatch_handler_play_aac_file` |
+| 5 | **0xa** | **`0x31b21`** | `dispatch_handler_speak_start` |
+| 6 | **0xb** | **`0x31b2d`** | `dispatch_handler_speak_stop` |
+| 7 | 0x1013 | `0x241f1` | `dispatch_handler_algo_ctrl` |
+
+Entries 4-6 (the three this project cares about) are **byte-identical in shape** to every
+neighboring entry -- same 12-byte layout, non-null handler, plausible name pointer. No
+corruption, no null, nothing structurally different singles them out. This directly answers
+the "is 0xa/0xb's table entry different from a working one" question: **no**, at the table
+level they are indistinguishable from entries this device uses for its own core video
+functions (`request_IDR`, `get_jpeg`).
+
+Also read the `speak_start`/`speak_stop` guard flag (`0x767f0`, the address prior sessions
+cited) directly: **0**, not stuck at `1`. Not independently re-derived this session with the
+§18.1-corrected method, so this specific address is [MED] rather than [HIGH] -- but it is at
+least consistent with "not the reason nothing happens."
+
+### 18.5 The queue is draining, not backing up [HIGH]
+
+Mounted the kernel's `mqueue` pseudo-filesystem read-only (`mount -t mqueue none /tmp/mq`,
+trivially reversible, touches no persistent storage) and read `QSIZE` directly:
+`msg_dispatch_1` and `msg_dispatch_2` both read **`QSIZE:0`** after multiple `speak_start`/
+`play_aac_file` sends from this session. Also confirmed via `/proc/204/fd` that `media`
+(PID 204) holds `/msg_dispatch_2` open (`fd 41`, `O_RDWR|O_NONBLOCK` per `/proc/204/fdinfo/41`,
+matching the disassembled `mq_open` flags at `0x336ec`/`0x336e6` exactly) -- the exact same name
+`bus::Peer::Media` opens. **Messages are not being sent to the wrong queue, and they are not
+piling up unread; something is receiving and discarding them with zero observable effect.**
+
+### 18.6 The reboot experiment: a wedged-thread hypothesis, tested and refuted [HIGH]
+
+Before this section's live-memory work, the leading theory (this session, informed by
+`speak_start` producing zero thread-count change from *this session's own* sender) was that
+hours of prior sessions' ring-mutex stress testing (§17.12.2's 700 ms-2 s holds) had wedged
+*only* `media`'s message-dispatch thread while leaving its video/audio subsystems healthy.
+Tested directly, Main-approved, full before/after capture:
+
+| | before | after |
+|---|---|---|
+| uptime | 9h01m | 91s (fresh boot) |
+| `SndFrm` | 1867 | 0 |
+| `media` thread count | 32 | 26 |
+| ring `0x18` | 227285 | 6452 |
+| `kibbled` md5 | `c87501...` | `c87501...` (identical, relaunched by `app_init.sh`) |
+| all 7 vendor PIDs | present | present, fresh PIDs |
+
+Reboot executed cleanly (`reboot`, busybox; ~35s to answer telnet again, +10s settle). Full
+stack verified back: `GET /state` answering, RTSP `/main` serving `h264`+`aac` via live
+`ffprobe`. Thread count dropping 32→26 on a clean boot is itself informative (something
+*was* accumulated over the 9h session -- most plausibly ordinary per-RTSP-session worker
+threads from repeated `ffprobe`/testing, not evidence of a leak specific to the audio path) but
+**`speak_start`, sent identically post-reboot, still produced 26→26, not 26→27.** A completely
+fresh `media` process, dispatch table freshly built by its own startup code, still does not
+respond. **This refutes the wedged-thread hypothesis as this session understood it** -- whatever
+is wrong is not accumulated session damage, and reappears from a cold start.
+
+### 18.7 Where this leaves the investigation [HIGH for the facts, genuinely open for the conclusion]
+
+Every mechanical layer this session could independently verify is now confirmed correct and
+live-checked, not just statically inferred:
+- Wire format, queue name, `src` value: byte-identical to `bus::Sender::send`, including a
+  true zero-length-payload replica of the exact bytes `speak_start`/`speak_stop` send today.
+- Transport: right queue (`/proc/204/fd` confirms), not backing up (`QSIZE:0`).
+- Table: right handler address for `0xa`/`0xb`/`0x2`, live-read from the process's own memory,
+  structurally identical to entries this device demonstrably uses for its own video pipeline.
+- Guard flag: not stuck.
+- Sender-side variables ruled out one at a time: payload length/NUL-termination (tried true
+  zero-length), timing (waited up to 6 s), sender-process lifetime (5 s linger before
+  `mq_close`), IPC namespacing (checked directly -- `/proc/<pid>/ns/ipc` does not exist on this
+  kernel; effectively one global IPC namespace, so a separate-namespace queue is not possible
+  here), and now session-accumulated vendor-side damage (reboot).
+
+**What remains genuinely unexplained**: a message that is queued successfully, drained from the
+queue, and whose table entry resolves to a real, correctly-shaped, non-null handler produces no
+observable effect (no thread, no `SndFrm` movement, no error, no crash, no log this session
+could see). The next test in progress as of this write-up is the one Main proposed: instrument
+`media`'s thread count (plus `SndFrm` and the guard flag) at high rate and watch it through one
+real, externally-triggered app press-and-hold talkback. That test directly brackets the last
+remaining open question -- whether `speak_start`/`audio_out_thread` is really how the vendor's
+own talkback reaches the speaker at all, independent of anything this project has ever sent.
+**Not run yet as of this section**; see the live hub log / a follow-up doc section for the
+result.
+
+## 19. REGRESSION: a real vendor talkback session was cut short during this session's testing, and the mechanism is now identified
+
+Author: AudioSolve. **This is the most important finding in this document.** Everything in §18
+answered "why does our own audio not play." This section answers a different, higher-priority
+question Main raised mid-session: **did this project's own testing break a feature the
+household already relies on?** Short answer: **very likely yes, on this occasion, and the exact
+autonomous code path that could do it is identified below, code-verified, not inferred.**
+
+### 19.1 What happened, in wall-clock/device-uptime order
+
+Per Main's live report: Nitin pressed and held the Petkit app's talkback button, expecting the
+normal experience (his voice plays through the feeder). It played for several seconds and then
+**abruptly stopped while he was still holding the button** -- his own words: this is the first
+time the app's talkback has ever cut out; it has always worked before. That makes this session's
+testing the prime suspect for a genuine, user-visible regression, not merely "our own feature
+still doesn't work."
+
+A read-only sampler (armed and mirrored off-device per this project's standing discipline
+*before* asking for the test, per §18.7) captured the whole window at ~0.3 s resolution. Device
+`/proc/uptime` seconds, this boot (the one from §18.6's reboot):
+
+| t (s) | `media` threads | `SndFrm` | guard flag (`0x767f0`) | event |
+|---|---|---|---|---|
+| 605-699 | 26 (steady) | 0 (steady) | 0 (steady) | baseline, nothing happening |
+| **699.71** | **26→27** | 0 | **0→1** | a `speak_start`-shaped event fires -- Nitin's press |
+| 700.08-705.79 | 27 | 0→77, climbing ~5 frames/sample (real-time paced) | 1 | audio genuinely flowing to the speaker |
+| ~706.1-706.4 (est.) | 27 | **plateaus at 77 -- stops climbing** | 1 | **consumption stalls; Nitin is still holding, per his own report** |
+| **706.72** | 27 | 77 | **1→0** | **something sends `speak_stop`** (the only thing that clears this flag) |
+| **707.04** | **27→26** | 77 | 0 | `audio_out_thread` exits, one sample tick later |
+
+**The sequence is: audio consumption stalls first (a ~1-2 s gap where nothing moves while the
+guard flag is still `1`), then a `speak_stop`-equivalent event clears the flag, then the thread
+exits.** This is a real, non-`kibbled`-initiated talkback session (nobody on this project sent
+`speak_start` at `t=699.71`; every send this session used msg IDs and timing that don't line up)
+being cut short by something -- and the flag-clear at `706.72` is the one event in this whole
+trace that only an explicit `speak_stop` message can cause.
+
+### 19.2 The autonomous mechanism, found in the currently-deployed binary's own source
+
+`agent/src/audioout.rs`, `SpeakerOwner::new()` (unchanged on the branch that produced the
+binary running on-device throughout this incident, md5 `c87501c8f4ad8ac671c6dd8437f45980`):
+
+```rust
+pub fn new() -> Arc<Self> {
+    // Best-effort, non-fatal: clears a guard flag a previous kibbled crash may have left
+    // stuck at `1` ... Runs exactly once, here, so `main.rs` doesn't need its own startup hook.
+    AudioOutThread::clear_stale_guard_flag();
+    Arc::new(Self(AtomicBool::new(false)))
+}
+```
+
+`clear_stale_guard_flag()` sends `speak_stop` (msg `0xb`) **unconditionally, with no HTTP
+request, no user action, and no check for whether a real session might currently be active** --
+by design, so that a `kibbled` crash mid-`/speak` doesn't leave the vendor's guard flag stuck at
+`1` forever (§17.4's documented failure mode). This runs **every single time the `kibbled`
+process starts**: a deliberate binary swap, an `app_init.sh`-driven supervisor restart after a
+crash, or -- because this build's `Cargo.toml` sets `panic = "abort"` -- **any panic anywhere in
+`kibbled`, including in code with nothing to do with audio** (an HTTP handler, the RTSP server,
+the schedule/config-sync logic, anything), aborts the whole process and relaunches it,
+re-arming this same unconditional `speak_stop` send.
+
+**This is the mechanism Main asked about, confirmed present and unconditional in the exact
+binary that was live on-device for this entire incident.** It fully explains how this project's
+testing could end a real talkback session the household was actively using, with *zero*
+intentional audio action on this project's part: `kibbled` restarting for any reason at all,
+at any moment, sends `speak_stop` regardless of what else is happening on the speaker.
+
+### 19.3 What is proven versus what is not [tagged per this doc's convention]
+
+- **[HIGH]** The guard-flag-clear at `t=706.72` did not come from any message this project's
+  agents sent this session with `sendmsg`/`bus::Sender` -- none of this session's own sends
+  landed anywhere near that device-uptime timestamp, and every one of this session's own
+  `speak_start`/`speak_stop`/`play_aac_file` sends is independently accounted for elsewhere in
+  this doc with its own timestamp.
+- **[HIGH]** `SpeakerOwner::new()`'s unconditional startup `speak_stop` exists in the
+  currently-deployed source, is reachable with zero HTTP/RTSP trigger, and fires on every
+  `kibbled` process start for any reason.
+- **[MED, not directly observed]** That `kibbled` actually restarted at `t≈706` s this specific
+  boot. This session did not itself restart `kibbled` in that window and has no visibility into
+  whether it crashed on its own (`kibbled`'s stdout/stderr goes to `/dev/null` under
+  `app_init.sh` -- the same logging gap `docs/23-audio-codec.md §17.12.6` already flagged as
+  needing a real fix before more live testing). A `ps`/PID-change check immediately after this
+  incident could have confirmed or refuted a restart directly; by the time this section was
+  written `kibbled` had already been taken down for Main's planned rollback, so that specific
+  confirmation is not available for this incident and is flagged as the concrete gap for whoever
+  investigates next: **add a real, `kibbled`-owned log sink** (not a shell redirect) that records
+  process start time and every `speak_start`/`speak_stop` send with a timestamp, so a future
+  incident can be diagnosed from evidence instead of timing correlation.
+- **[MED, architectural, stated by multiple prior sessions, not independently re-proven this
+  session]** That the vendor's own real talkback (via `agora`) uses this *same* guard flag as a
+  liveness signal for its own session, such that an external `speak_stop` arriving mid-session
+  could plausibly disrupt it beyond just "the flag value changed." This project has never traced
+  `agora`'s own binary to confirm it, but it is the simplest hypothesis consistent with every
+  observation in §19.1, and is exactly the risk this project's own standing instructions have
+  been warning about since `docs/23-audio-codec.md §17.6`: *"Kibbled calling speak_start first,
+  then a real app talkback starting... could plausibly manifest as a real user's pet-call
+  talkback silently not working for up to ~5s after any kibbled-initiated speak_start/speak_stop
+  cycle."* That prior warning undersold the risk: it assumed the disruption window was bounded
+  by the ~5s idle timeout and required *kibbled* to have initiated a session first. This incident
+  suggests a **kibbled restart alone, with no prior kibbled-initiated speak session at all**, can
+  send the disruptive message, and the household saw an active real session — not a merely-
+  delayed one — actually terminate.
+
+### 19.4 Response taken
+
+Per Main's direction: **the device is being rolled back to `kibbled.pre-audiostart`/
+`kibbled.pre-announce` (md5 `f862cc2e52cb14aacb461027c82e3788`)** -- the last build with no
+`speak_start`/`speak_stop`/ring-publish code at all, keeping every feature the household
+actually uses (feeding, camera, settings, Wi-Fi, cat ID, schedule read) while removing every
+autonomous or explicit touch of `media`'s audio path. Audio work resumes, if at all, only behind
+an explicit off-by-default flag, so a `kibbled` restart can never again send an unrequested
+message to the vendor's speaker subsystem. **This is a harder requirement than "works
+correctly": any future `speak_start`/`speak_stop` sender must be gated so that process startup,
+crash-recovery, and any other non-`/speak`-triggered code path cannot reach it, full stop.**
