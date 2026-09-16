@@ -1,6 +1,6 @@
 //! Local push: a WebSocket feed of the same JSON the GET endpoints serve, sent when it changes.
 //!
-//! Design: docs/33-local-push-design.md. The load-bearing decisions, restated:
+//! Design: docs/33-local-push.md. The load-bearing decisions, restated:
 //!
 //! - **Its own listener and thread** ([`PUSH_BIND`], :8766). The HTTP server in `http.rs` is one
 //!   thread, one connection at a time; a held connection there blocks every other client (the

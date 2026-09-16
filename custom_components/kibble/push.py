@@ -1,6 +1,6 @@
 """The agent's local-push channel: a WebSocket on port 8766 carrying the same JSON bodies the
 HTTP `GET` endpoints serve, sent when they change (`agent/src/push.rs`,
-`docs/33-local-push-design.md`).
+`docs/33-local-push.md`).
 
 Two layers, kept apart so the interesting one is testable without a socket:
 

@@ -80,7 +80,7 @@ def test_latest_dish_snapshot_empty_feeds_is_none_for_both_sides() -> None:
 
 def _detection(seq: int, ts: int, cls: str, image: str | None) -> DetectionEvent:
     return DetectionEvent(
-        seq=seq, ts=ts, cls=cls, image=image, cat=None, score=None, pet_id=None, track_value=None
+        seq=seq, ts=ts, cls=cls, image=image, cat=None, score=None, pet_id=None, total_score=None
     )
 
 

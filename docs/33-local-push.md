@@ -1,7 +1,8 @@
 # Local push: design for moving the HA integration off polling
 
-**Status:** design, not implemented. Written 2026-09-16 against agent `main` `c01d0b9` and HA
-2026.9.2. Every reference citation below was read in the installed HA source
+**Status:** implemented and live 2026-09-16 (agent `65129f1`, HA `9f1cd37`+`d39e223`).
+Written as a design first, then annotated with what the implementation and the live tests
+showed (§8). Against HA 2026.9.2. Every reference citation below was read in the installed HA source
 (`homeassistant/components/{wled,unifiprotect,shelly,reolink,esphome}` and
 `homeassistant/helpers/update_coordinator.py`); every Kibble citation was read in this repo.
 
@@ -273,3 +274,41 @@ See `appendix-ha-inventory.md` (2026-09-16): 33 sensors, 19 binary sensors
 (incl. dynamic `cat_present_*`), 4 switches, 4 numbers, 4 buttons, 2 selects, 4 images,
 camera, media_player; 17 services. Every row's `reads` column is a `coordinator.data.<field>`
 path that §3 guarantees unchanged.
+
+---
+
+## 8. As built, and what the live tests showed
+
+| design item | as built |
+|---|---|
+| agent listener | `agent/src/push.rs`, :8766, own thread (64 KiB stack), one client; `sha1.rs` for the handshake |
+| frame bodies == GET bodies | enforced by construction: `main.rs` builds `push::Serialize` from the same functions the routes call (four fallible handlers were refactored into `*_json() -> Result<String,String>` shared by both) |
+| marks | `ai::Feed::push_detection` (events); `ai::poll_loop` 1 s `Snapshot` diff (state); `feed_capture` FEEDING edges + `save_pair` (state, feeds); `schedule::save`; `cloud::save` + a status-JSON diff on its 15 s reconciler tick; `wifi::save` + status/scan diffs on its 60 s tick; `clips::{save,delete}`; `persist::apply_value` (config); `faces::{save_pending,label,unlabel,add_cat}` (cats/identify/review_face/pending_faces together) |
+| HA transport | `custom_components/kibble/push.py`: `session.ws_connect(heartbeat=30, receive_timeout=90)`, frames parsed with the existing `from_json`s, `merge_frame` = `dataclasses.replace` |
+| coordinator | `async_start_push` (entry background task, single-task guard), `_push_loop` (jittered backoff 1..60 s), `_consume` (10-min resync), `_apply_frame` (resets the failure counter, `async_set_updated_data`); `update_interval=None` while connected; cancelled on unload, closed cleanly on `EVENT_HOMEASSISTANT_STOP` |
+| quality scale | `iot_class: local_push`; `appropriate-polling: exempt`; diagnostics `push:{connected, unsupported_by_agent, reconnects, seconds_since_last_frame, update_interval_seconds}` |
+
+**Live, measured (2026-09-16):**
+
+- Agent alone: hello → 13-field snapshot; `config/schedule/cloud/cats/clips/feeds/review_face`
+  byte-equal to their GETs; `GET /state` answered in 10 ms while the socket was held; an HTTP
+  write produced an `update` with the four face fields inside the same second; RSS 1.4 MB.
+- HA: connected 30 s after restart, `update_interval_seconds: null`; a write reached HA as a
+  frame in ~0.2 s (vs ≤45 s before). All 41 registered entities kept their ids and states.
+- Drop test (`kill kibbled`, the supervisor respawns it in ~5 s): HA fell back to 45 s polling
+  within 5 s, **no entity went unavailable**, reconnected and re-entered push mode at 15 s.
+- One defect found and fixed by that test: the first build classified *connection refused*
+  as "agent has no push" and stopped retrying. Only a rejected handshake or a foreign `proto`
+  is permanent now; refused/unreachable always retries. Regression test in `tests/test_push.py`.
+
+**Deliberately unchanged:** every entity and service (`appendix-ha-inventory.md`); Scrypted's
+5 s `GET /events` poll; the HTTP API. `PRESENCE_WINDOW` stays at 2 min for now -- with push it
+could shrink, but that is a semantics change to decide separately (§2.8).
+
+**`total_score`:** the vendor's per-visit float published on `track` events was traced in
+`libalgo` (`kibble-agent-tmp/study/TrackValue.md`): the sum over the visit's qualifying frames
+of the best-candidate confidence, accumulated with `vadd.f32` and copied out unmodified; the
+vendor's own name for the threshold it is compared against is `discern_total_score`. It is
+exposed under that name (attribute of `sensor.vendor_last_seen_pet`, field on `track`
+events), never as the entity state, because it is a length-weighted total, not a probability.
+

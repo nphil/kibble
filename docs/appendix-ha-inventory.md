@@ -2,7 +2,7 @@
 
 Point-in-time inventory of every entity and service the Kibble integration exposes, and what each reads
 from `KibbleData`. Produced from the platform sources on the date above; it is the compatibility list
-`33-local-push-design.md` is held to. §5's mapping proposal is historical -- the `vendor_pet_ids`
+`33-local-push.md` is held to. §5's mapping proposal is historical -- the `vendor_pet_ids`
 option (options flow) was implemented the same day. Entities added the same day and not in the tables
 below: `sensor.vendor_last_seen_pet`.
 

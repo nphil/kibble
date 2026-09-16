@@ -9,7 +9,7 @@ rules:
       Push-based: the agent's WebSocket (port 8766, agent/src/push.rs) delivers every field
       the moment it changes and the coordinator sets update_interval=None while it is
       connected. The 45 s HTTP poll remains only as the fallback when the socket is down and
-      as the first-contact check (test-before-setup). docs/33-local-push-design.md.
+      as the first-contact check (test-before-setup). docs/33-local-push.md.
   brands:
     status: exempt
     comment: |

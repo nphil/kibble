@@ -1,7 +1,7 @@
 """Coordinator for a Kibble feeder: local push over the agent's WebSocket, with the HTTP poll
 below as the fallback and the first-contact check.
 
-## Push (docs/33-local-push-design.md)
+## Push (docs/33-local-push.md)
 
 After the first successful poll proves the HTTP API (`async_config_entry_first_refresh`,
 rule `test-before-setup`), `async_start_push` opens the agent's push socket (`push.py`) in a
@@ -175,7 +175,7 @@ class VendorSighting:
     ts: int
     pet_id: str
     cat: str | None
-    track_value: float | None
+    total_score: float | None
 
 
 def vendor_sightings(
@@ -184,7 +184,7 @@ def vendor_sightings(
     """Every `track` event, newest last, with its `pet_id` mapped to a cat name where the
     option names it. Pure so it's testable without a coordinator."""
     return tuple(
-        VendorSighting(ts=e.ts, pet_id=e.pet_id, cat=pet_ids.get(e.pet_id), track_value=e.track_value)
+        VendorSighting(ts=e.ts, pet_id=e.pet_id, cat=pet_ids.get(e.pet_id), total_score=e.total_score)
         for e in sorted(events, key=lambda e: (e.ts, e.seq))
         if e.cls == "track" and e.pet_id is not None
     )

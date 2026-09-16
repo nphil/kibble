@@ -327,7 +327,8 @@ class DetectionEvent:
     with an `image` filename for `GET /events/<name>` -- or `track`: the vendor's own on-device
     identification, read from the feeder's shared config block. A `track` carries `pet_id`
     (the vendor's cloud pet id, as a string), `ts` = the vendor's own visit start time, and
-    `track_value` (an unexplained per-visit float the vendor stores alongside; exposed raw).
+    `total_score` (the vendor's own per-visit number: the sum of per-frame identification
+    confidence over the tracked visit -- bigger means longer/steadier, not more probable).
 
     `score` is honestly `None` on every class: the vendor never computes a similarity this
     pipeline can observe, and no bounding box exists anywhere in its chain."""
@@ -339,12 +340,12 @@ class DetectionEvent:
     cat: str | None
     score: float | None
     pet_id: str | None
-    track_value: float | None
+    total_score: float | None
 
     @classmethod
     def from_json(cls_, data: dict[str, Any]) -> DetectionEvent:
         score = data.get("score")
-        track_value = data.get("track_value")
+        total_score = data.get("total_score")
         return cls_(
             seq=int(data.get("seq") or 0),
             ts=int(data.get("ts") or 0),
@@ -353,7 +354,7 @@ class DetectionEvent:
             cat=data.get("cat") or None,
             score=float(score) if score is not None else None,
             pet_id=str(data["pet_id"]) if data.get("pet_id") is not None else None,
-            track_value=float(track_value) if track_value is not None else None,
+            total_score=float(total_score) if total_score is not None else None,
         )
 
 

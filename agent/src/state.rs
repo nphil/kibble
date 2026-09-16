@@ -73,9 +73,12 @@ pub struct TrackEntry {
     pub pet_id: u32,
     /// Unix seconds, u64 LE at `+8`.
     pub start_time: u64,
-    /// f32 at `+0x10`. `ctrl` formats it `"%.3f"` under the JSON key `score`, but the one
-    /// live sample read 2058.042 -- not a 0..1 similarity -- so it is exposed raw, unnamed,
-    /// until a second sample settles what it is.
+    /// f32 at `+0x10`: the vendor's `total_score` (their own name -- the confirmation
+    /// threshold setter is `petkit_modify_discern_total_score`). Study/TrackValue.md traced
+    /// it in `libalgo`: the running SUM over every qualifying frame of the visit of that
+    /// frame's best-candidate confidence (`vadd.f32` into `TrackData+0x18`, copied out
+    /// unmodified). Not normalised, so larger = a longer visit and/or steadier matches; live
+    /// values ran 276..2759.
     pub value: f32,
 }
 

@@ -69,7 +69,7 @@ def test_parse_fields_uses_the_get_parsers_and_skips_null_and_unknown() -> None:
             "state": STATE_JSON,
             "config": {"volume": "7"},
             "pending_faces": ["a.jpg", "b.jpg"],
-            "events": [{"seq": 1, "ts": 10, "class": "track", "pet_id": 5, "track_value": 2.5}],
+            "events": [{"seq": 1, "ts": 10, "class": "track", "pet_id": 5, "total_score": 2.5}],
             "cats": None,  # agent could not serialise it right now -> keep the previous value
             "future_field": {"x": 1},  # a newer agent -> ignored
         }

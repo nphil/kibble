@@ -164,7 +164,7 @@ def test_is_present_true_just_inside_the_presence_window_boundary() -> None:
 
 
 def _sighting(cat: str | None, ts: int, pet_id: str = "101320712") -> VendorSighting:
-    return VendorSighting(ts=ts, pet_id=pet_id, cat=cat, track_value=None)
+    return VendorSighting(ts=ts, pet_id=pet_id, cat=cat, total_score=None)
 
 
 def test_is_present_true_from_a_recent_vendor_sighting_alone() -> None:
@@ -190,9 +190,9 @@ def test_is_present_false_once_a_vendor_sighting_ages_out() -> None:
 # --- coordinator.vendor_sightings / const.parse_vendor_pet_ids --------------------------------
 
 
-def _event(seq: int, ts: int, cls: str, pet_id: str | None, track_value: float | None = None) -> DetectionEvent:
+def _event(seq: int, ts: int, cls: str, pet_id: str | None, total_score: float | None = None) -> DetectionEvent:
     return DetectionEvent(
-        seq=seq, ts=ts, cls=cls, image=None, cat=None, score=None, pet_id=pet_id, track_value=track_value
+        seq=seq, ts=ts, cls=cls, image=None, cat=None, score=None, pet_id=pet_id, total_score=total_score
     )
 
 
@@ -205,7 +205,7 @@ def test_vendor_sightings_keeps_only_track_events_in_time_order_and_maps_names()
     got = vendor_sightings(events, {"101320712": "Kitty"})
     assert [s.ts for s in got] == [200, 300]
     assert got[0].cat is None and got[0].pet_id == "5"
-    assert got[1].cat == "Kitty" and got[1].track_value == 1531.2
+    assert got[1].cat == "Kitty" and got[1].total_score == 1531.2
 
 
 def test_parse_vendor_pet_ids_accepts_spaces_and_a_trailing_comma() -> None:

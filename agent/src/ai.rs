@@ -90,10 +90,11 @@
 //! [`poll_loop`] samples the block on every tick and publishes a `"track"`-class [`Detection`]
 //! whenever the newest tracker entry changes -- `pet_id` is the vendor's cloud pet id
 //! (`petId` in `/opt/pet_name_color.json`, confirmed equal on the live feeder), `ts` is the
-//! vendor's own `start_time`. `score` stays `null`: the f32 the vendor stores per entry read
-//! 2058.042 on the first live sample, which is not a similarity, so it is exposed raw as
-//! `track_value` until its meaning is known. A bounding box does not exist anywhere in the vendor
-//! chain, so `box` stays `null` for good.
+//! vendor's own `start_time`. `score` stays `null` -- the vendor computes no similarity --
+//! and `total_score` carries the vendor's own per-visit number under the vendor's own name:
+//! the sum over the visit's qualifying frames of the best-candidate confidence
+//! (`state::TrackEntry::value`), so bigger means longer and/or steadier, not "more likely".
+//! A bounding box does not exist anywhere in the vendor chain, so `box` stays `null` for good.
 //!
 //! `/tmp/pet_face_pic.jpg` (named in the assignment) is the one exception worth flagging: it
 //! exists only as a literal string inside **`ctrl`**, not `media`/`libalgo.so`. Disassembling its
@@ -265,9 +266,10 @@ pub struct Detection {
     pub image: Option<String>,
     /// Kibble's own classifier's opinion, when confident -- see "Update: `cat` is real" above.
     pub cat: Option<String>,
-    /// The raw f32 the vendor stores with each tracker entry (`state::TrackEntry::value`),
-    /// `"track"` class only. Deliberately not called `score` until its meaning is known.
-    pub track_value: Option<f32>,
+    /// The vendor's `total_score` for the visit (`state::TrackEntry::value`), `"track"` class
+    /// only: the sum of per-frame identification confidence over the tracked visit -- not a
+    /// probability, so kept apart from `score`.
+    pub total_score: Option<f32>,
 }
 
 impl Detection {
@@ -284,7 +286,7 @@ impl Detection {
         };
         let pet_id = self.pet_id.map_or("null".to_string(), |v| v.to_string());
         format!(
-            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{},"cat":{},"track_value":{}}}"#,
+            r#"{{"seq":{},"ts":{},"class":"{}","score":{},"box":{},"pet_id":{},"image":{},"cat":{},"total_score":{}}}"#,
             self.seq,
             self.ts,
             self.class,
@@ -293,7 +295,7 @@ impl Detection {
             pet_id,
             opt_str(&self.image),
             opt_str(&self.cat),
-            opt_num(self.track_value),
+            opt_num(self.total_score),
         )
     }
 }
@@ -362,7 +364,7 @@ impl Feed {
                 b0x: None,
                 image: Some(name),
                 cat: None,
-                track_value: None,
+                total_score: None,
             });
         }
     }
@@ -383,7 +385,7 @@ impl Feed {
         image: Option<String>,
         cat: Option<String>,
         pet_id: Option<u32>,
-        track_value: Option<f32>,
+        total_score: Option<f32>,
     ) {
         let mut inner = self.inner.lock().unwrap();
         let seq = inner.next_seq;
@@ -397,7 +399,7 @@ impl Feed {
             b0x: None,
             image,
             cat,
-            track_value,
+            total_score,
         });
         while inner.events.len() > MAX_EVENTS {
             inner.events.pop_front();
@@ -635,7 +637,7 @@ mod tests {
             b0x: None,
             image: None,
             cat: None,
-            track_value: None,
+            total_score: None,
         };
         let json = d.to_json();
         assert!(json.contains(r#""score":null"#));
@@ -656,7 +658,7 @@ mod tests {
             b0x: None,
             image: None,
             cat: Some("Rashy".to_string()),
-            track_value: None,
+            total_score: None,
         };
         assert!(d.to_json().contains(r#""cat":"Rashy""#));
     }
@@ -678,7 +680,7 @@ mod tests {
         assert!(json.contains(r#""ts":1789528968,"class":"track""#), "{json}");
         assert!(json.contains(r#""pet_id":101320712"#), "{json}");
         assert!(json.contains(r#""score":null"#), "{json}");
-        assert!(json.contains(r#""track_value":2058.042"#), "{json}");
+        assert!(json.contains(r#""total_score":2058.042"#), "{json}");
     }
 
     #[test]

@@ -238,7 +238,7 @@ fn main() {
         ),
     }
 
-    // Local push (docs/33-local-push-design.md): every frame body comes from the exact function
+    // Local push (docs/33-local-push.md): every frame body comes from the exact function
     // the matching GET route uses, so HA's parsers see one shape whichever path delivered it.
     {
         let shm = Arc::clone(&shm);

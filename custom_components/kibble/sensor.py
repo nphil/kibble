@@ -564,10 +564,11 @@ class KibbleVendorLastSeenPetSensor(KibbleEntity, SensorEntity):
             "pet_id": s.pet_id,
             "last_identified": dt_util.utc_from_timestamp(s.ts).isoformat(),
         }
-        if s.track_value is not None:
-            # Unexplained per-visit float the vendor stores with the identification (agent
-            # `state::TrackEntry::value`); exposed raw, deliberately not called a score.
-            attrs["track_value"] = s.track_value
+        if s.total_score is not None:
+            # The vendor's own `total_score`: the sum of per-frame identification confidence
+            # over the tracked visit (docs/33 §track). Bigger = longer/steadier visit, not a
+            # probability -- which is why it is not the entity's state.
+            attrs["total_score"] = s.total_score
         return attrs
 
 
