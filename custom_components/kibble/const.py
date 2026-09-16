@@ -16,6 +16,32 @@ CONF_BLE_ADDRESS = "ble_address"
 # _require_schedule_writes_enabled`. Default off; a wrong table could dispense at the wrong
 # time or amount.
 CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
+# The vendor's on-device identifier resolves a face to the *cloud* pet id it was enrolled under
+# (`petId` in the feeder's `/opt/pet_name_color.json`); the name only ever lived in Petkit's
+# cloud. This option is the operator's own `id=name` list, e.g. `101320712=Kitty`, so a vendor
+# `track` event can drive that cat's presence. Ids not listed are still surfaced raw, never
+# guessed into a name.
+CONF_VENDOR_PET_IDS = "vendor_pet_ids"
+
+
+def parse_vendor_pet_ids(raw: str) -> dict[str, str]:
+    """`"101320712=Kitty, 5=Pancake"` -> `{"101320712": "Kitty", "5": "Pancake"}`.
+
+    Ids are kept as strings because that is how `DetectionEvent.pet_id` carries them. Raises
+    `ValueError` on any entry that is not `<digits>=<non-empty name>`; blank entries (a
+    trailing comma) are ignored."""
+    mapping: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        pet_id, sep, name = entry.partition("=")
+        pet_id, name = pet_id.strip(), name.strip()
+        if not sep or not pet_id.isdigit() or not name:
+            raise ValueError(entry)
+        mapping[pet_id] = name
+    return mapping
+
 
 DEFAULT_PORT = 8765
 DEFAULT_RTSP_PORT = 8554

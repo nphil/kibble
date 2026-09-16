@@ -217,6 +217,9 @@
       "last_seen_pet": {
         "name": "Last seen pet"
       },
+      "vendor_last_seen_pet": {
+        "name": "Vendor last seen pet"
+      },
       "identification_score": {
         "name": "Identification score"
       },
@@ -558,18 +561,20 @@
   "options": {
     "step": {
       "init": {
-        "title": "Video source, Bluetooth fallback & schedule writes",
-        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.\n\nSchedule-card writes (add/edit/remove/toggle) are refused until you turn this on — the MCU's per-entry time encoding is still unconfirmed, so a wrong table could dispense at the wrong time or amount.",
+        "title": "Video source, Bluetooth fallback, schedule writes & vendor pet ids",
+        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.\n\nSchedule-card writes (add/edit/remove/toggle) are refused until you turn this on — the MCU's per-entry time encoding is still unconfirmed, so a wrong table could dispense at the wrong time or amount.\n\nThe feeder's own identifier reports the Petkit cloud pet id it was enrolled under, never a name. List `id=name` pairs (the id shows as `pet_id` on the last detection sensor) so that cat's presence sensor also follows the vendor's identification.",
         "data": {
           "stream_url": "Rebroadcast RTSP URL",
           "ble_address": "Feeder BLE MAC address",
-          "enable_schedule_writes": "Allow schedule card writes (unconfirmed encoding)"
+          "enable_schedule_writes": "Allow schedule card writes (unconfirmed encoding)",
+          "vendor_pet_ids": "Vendor pet ids (id=name, comma separated)"
         }
       }
     },
     "error": {
       "not_rtsp": "Must be an rtsp:// URL.",
-      "not_mac": "Must be a MAC address, e.g. AA:BB:CC:DD:EE:FF."
+      "not_mac": "Must be a MAC address, e.g. AA:BB:CC:DD:EE:FF.",
+      "bad_pet_ids": "Each entry must be <numeric id>=<name>, e.g. 101320712=Kitty"
     }
   },
   "exceptions": {

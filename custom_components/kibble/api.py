@@ -323,13 +323,14 @@ class ClipInfo:
 class DetectionEvent:
     """One onboard-AI detection, as reported by `GET /events` (`agent/src/ai.rs`).
 
-    `cls` is the vendor's own class -- `visit` (a pet in frame), `eat` (feeding) or `face` (a
-    usable face crop). `image` is a filename for `GET /events/<name>`.
+    `cls` is `visit` (a pet in frame), `eat` (feeding), `face` (a usable face crop) -- each
+    with an `image` filename for `GET /events/<name>` -- or `track`: the vendor's own on-device
+    identification, read from the feeder's shared config block. A `track` carries `pet_id`
+    (the vendor's cloud pet id, as a string), `ts` = the vendor's own visit start time, and
+    `track_value` (an unexplained per-visit float the vendor stores alongside; exposed raw).
 
-    `score`, `pet_id` and `box` are honestly `None`: that metadata exists only inside a private
-    POSIX message queue delivered to the vendor's `ctrl` process (`docs/24-onboard-ai.md`), which
-    we cannot read without stealing its messages. They are modelled here so the shape does not
-    change when a future `ctrl` replacement can fill them in."""
+    `score` is honestly `None` on every class: the vendor never computes a similarity this
+    pipeline can observe, and no bounding box exists anywhere in its chain."""
 
     seq: int
     ts: int
@@ -338,10 +339,12 @@ class DetectionEvent:
     cat: str | None
     score: float | None
     pet_id: str | None
+    track_value: float | None
 
     @classmethod
     def from_json(cls_, data: dict[str, Any]) -> DetectionEvent:
         score = data.get("score")
+        track_value = data.get("track_value")
         return cls_(
             seq=int(data.get("seq") or 0),
             ts=int(data.get("ts") or 0),
@@ -350,6 +353,7 @@ class DetectionEvent:
             cat=data.get("cat") or None,
             score=float(score) if score is not None else None,
             pet_id=str(data["pet_id"]) if data.get("pet_id") is not None else None,
+            track_value=float(track_value) if track_value is not None else None,
         )
 
 

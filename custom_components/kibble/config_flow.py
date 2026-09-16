@@ -22,8 +22,10 @@ from .const import (
     CONF_HOST,
     CONF_PORT,
     CONF_STREAM_URL,
+    CONF_VENDOR_PET_IDS,
     DEFAULT_PORT,
     DOMAIN,
+    parse_vendor_pet_ids,
 )
 
 SCHEMA = vol.Schema(
@@ -83,6 +85,9 @@ class KibbleOptionsFlow(OptionsFlow):
     `enable_schedule_writes`: off by default. The MCU's per-entry schedule time encoding is
     still unconfirmed (docs/schedule.md) -- until an operator flips this on deliberately, the
     `schedule_card_add`/`_edit`/`_remove`/`_toggle` services refuse to write anything.
+
+    `vendor_pet_ids`: `id=name` pairs mapping the vendor's cloud pet ids (seen as `pet_id` on
+    `track` detections) to the operator's own cat names -- see `const.parse_vendor_pet_ids`.
     """
 
     async def async_step_init(
@@ -92,15 +97,20 @@ class KibbleOptionsFlow(OptionsFlow):
             url = (user_input.get(CONF_STREAM_URL) or "").strip()
             address = (user_input.get(CONF_BLE_ADDRESS) or "").strip().upper()
             enable_schedule_writes = bool(user_input.get(CONF_ENABLE_SCHEDULE_WRITES, False))
+            vendor_pet_ids = (user_input.get(CONF_VENDOR_PET_IDS) or "").strip()
             errors: dict[str, str] = {}
             if url and not url.startswith(("rtsp://", "rtsps://")):
                 errors[CONF_STREAM_URL] = "not_rtsp"
             if address and not _MAC_RE.match(address):
                 errors[CONF_BLE_ADDRESS] = "not_mac"
+            try:
+                parse_vendor_pet_ids(vendor_pet_ids)
+            except ValueError:
+                errors[CONF_VENDOR_PET_IDS] = "bad_pet_ids"
             if errors:
                 return self.async_show_form(
                     step_id="init",
-                    data_schema=self._schema(url, address, enable_schedule_writes),
+                    data_schema=self._schema(url, address, enable_schedule_writes, vendor_pet_ids),
                     errors=errors,
                 )
             return self.async_create_entry(
@@ -108,6 +118,7 @@ class KibbleOptionsFlow(OptionsFlow):
                     CONF_STREAM_URL: url,
                     CONF_BLE_ADDRESS: address,
                     CONF_ENABLE_SCHEDULE_WRITES: enable_schedule_writes,
+                    CONF_VENDOR_PET_IDS: vendor_pet_ids,
                 }
             )
 
@@ -118,11 +129,14 @@ class KibbleOptionsFlow(OptionsFlow):
                 options.get(CONF_STREAM_URL, ""),
                 options.get(CONF_BLE_ADDRESS, ""),
                 options.get(CONF_ENABLE_SCHEDULE_WRITES, False),
+                options.get(CONF_VENDOR_PET_IDS, ""),
             ),
         )
 
     @staticmethod
-    def _schema(stream_url: str, ble_address: str, enable_schedule_writes: bool) -> vol.Schema:
+    def _schema(
+        stream_url: str, ble_address: str, enable_schedule_writes: bool, vendor_pet_ids: str
+    ) -> vol.Schema:
         return vol.Schema(
             {
                 vol.Optional(CONF_STREAM_URL, default=stream_url): str,
@@ -130,5 +144,6 @@ class KibbleOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_ENABLE_SCHEDULE_WRITES, default=enable_schedule_writes
                 ): bool,
+                vol.Optional(CONF_VENDOR_PET_IDS, default=vendor_pet_ids): str,
             }
         )

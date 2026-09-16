@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -16,18 +17,19 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util, slugify
 
 from .api import IdentifyResult
-from .coordinator import KibbleConfigEntry, KibbleCoordinator
+from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
 from .entity import KibbleEntity
 
 # Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
 PARALLEL_UPDATES = 0
 
-# How long a cat stays "present" after its last confident identification. An implementation
-# choice, not a device-measured value -- see docs/27-cat-id.md's honesty section. There is no
-# live, continuous detection feed to derive presence from (agent/src/ai.rs's own doc: score/
-# pet_id/box are unreachable without replacing ctrl), so this latches on the classifier's own
-# discrete, event-driven identifications instead of a real dwell time.
+# How long a cat stays "present" after its last identification. An implementation choice, not
+# a device-measured value -- see docs/27-cat-id.md's honesty section. Two independent sources
+# feed it: Kibble's own classifier (`GET /identify`, every enrolled cat) and the vendor's
+# on-device identifier (`track` detections, only for cats mapped through the `vendor_pet_ids`
+# option -- on this feeder that is the one cat enrolled in the Petkit app). Both are discrete,
+# event-driven identifications, not a dwell time, so each latches for this window.
 PRESENCE_WINDOW = timedelta(minutes=15)
 
 
@@ -135,14 +137,23 @@ SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
 )
 
 
-def is_present(cat_name: str, identify: IdentifyResult, now: datetime) -> bool:
-    """Whether `cat_name` was the most recently identified visitor, recently enough to still
-    call it present. A free function (not a method) so it's directly unit-testable with no
-    entity or coordinator involved."""
-    if identify.cat != cat_name or identify.ts is None:
-        return False
-    seen_at = dt_util.utc_from_timestamp(identify.ts)
-    return now - seen_at < PRESENCE_WINDOW
+def is_present(
+    cat_name: str,
+    identify: IdentifyResult,
+    sightings: Sequence[VendorSighting],
+    now: datetime,
+) -> bool:
+    """Whether `cat_name` was identified -- by Kibble's classifier as the most recent visitor,
+    or by the vendor's on-device identifier under its mapped pet id -- recently enough to
+    still call it present. A free function (not a method) so it's directly unit-testable with
+    no entity or coordinator involved."""
+    if identify.cat == cat_name and identify.ts is not None:
+        if now - dt_util.utc_from_timestamp(identify.ts) < PRESENCE_WINDOW:
+            return True
+    return any(
+        s.cat == cat_name and now - dt_util.utc_from_timestamp(s.ts) < PRESENCE_WINDOW
+        for s in sightings
+    )
 
 
 async def async_setup_entry(
@@ -268,4 +279,5 @@ class KibbleCatPresentBinarySensor(KibbleEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        return is_present(self._cat_name, self.coordinator.data.identify, dt_util.utcnow())
+        data = self.coordinator.data
+        return is_present(self._cat_name, data.identify, data.vendor_sightings, dt_util.utcnow())

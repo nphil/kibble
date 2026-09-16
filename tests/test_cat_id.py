@@ -13,8 +13,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from kibble.api import IdentifyResult, KibbleError, ReviewFace
+from kibble.api import DetectionEvent, IdentifyResult, KibbleError, ReviewFace
 from kibble.binary_sensor import PRESENCE_WINDOW, is_present
+from kibble.const import parse_vendor_pet_ids
+from kibble.coordinator import VendorSighting, vendor_sightings
 from kibble.image import _image_url
 from kibble.select import KibbleLabelFaceSelect, cat_for_option
 
@@ -138,24 +140,80 @@ def _ts_seconds_ago(seconds: int) -> int:
 
 def test_is_present_true_for_a_recent_matching_identification() -> None:
     identify = _identify("Rashy", _ts_seconds_ago(60))
-    assert is_present("Rashy", identify, _NOW) is True
+    assert is_present("Rashy", identify, (), _NOW) is True
 
 
 def test_is_present_false_for_a_different_cat() -> None:
     identify = _identify("Ghost", _ts_seconds_ago(60))
-    assert is_present("Rashy", identify, _NOW) is False
+    assert is_present("Rashy", identify, (), _NOW) is False
 
 
 def test_is_present_false_with_no_timestamp() -> None:
     identify = _identify("Rashy", None)
-    assert is_present("Rashy", identify, _NOW) is False
+    assert is_present("Rashy", identify, (), _NOW) is False
 
 
 def test_is_present_false_once_outside_the_presence_window() -> None:
     identify = _identify("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 60))
-    assert is_present("Rashy", identify, _NOW) is False
+    assert is_present("Rashy", identify, (), _NOW) is False
 
 
 def test_is_present_true_just_inside_the_presence_window_boundary() -> None:
     identify = _identify("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) - 1))
-    assert is_present("Rashy", identify, _NOW) is True
+    assert is_present("Rashy", identify, (), _NOW) is True
+
+
+def _sighting(cat: str | None, ts: int, pet_id: str = "101320712") -> VendorSighting:
+    return VendorSighting(ts=ts, pet_id=pet_id, cat=cat, track_value=None)
+
+
+def test_is_present_true_from_a_recent_vendor_sighting_alone() -> None:
+    """The classifier has never seen this cat, but the vendor's own identifier has."""
+    identify = _identify("Ghost", _ts_seconds_ago(60))
+    sightings = (_sighting("Kitty", _ts_seconds_ago(90)),)
+    assert is_present("Kitty", identify, sightings, _NOW) is True
+
+
+def test_is_present_ignores_an_unmapped_vendor_sighting() -> None:
+    """An id with no `vendor_pet_ids` entry names nobody, so it makes nobody present."""
+    identify = _identify(None, None)
+    sightings = (_sighting(None, _ts_seconds_ago(60)),)
+    assert is_present("Kitty", identify, sightings, _NOW) is False
+
+
+def test_is_present_false_once_a_vendor_sighting_ages_out() -> None:
+    identify = _identify(None, None)
+    old = _sighting("Kitty", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 1))
+    assert is_present("Kitty", identify, (old,), _NOW) is False
+
+
+# --- coordinator.vendor_sightings / const.parse_vendor_pet_ids --------------------------------
+
+
+def _event(seq: int, ts: int, cls: str, pet_id: str | None, track_value: float | None = None) -> DetectionEvent:
+    return DetectionEvent(
+        seq=seq, ts=ts, cls=cls, image=None, cat=None, score=None, pet_id=pet_id, track_value=track_value
+    )
+
+
+def test_vendor_sightings_keeps_only_track_events_in_time_order_and_maps_names() -> None:
+    events = (
+        _event(3, 300, "track", "101320712", 1531.2),
+        _event(1, 100, "visit", None),
+        _event(2, 200, "track", "5"),
+    )
+    got = vendor_sightings(events, {"101320712": "Kitty"})
+    assert [s.ts for s in got] == [200, 300]
+    assert got[0].cat is None and got[0].pet_id == "5"
+    assert got[1].cat == "Kitty" and got[1].track_value == 1531.2
+
+
+def test_parse_vendor_pet_ids_accepts_spaces_and_a_trailing_comma() -> None:
+    assert parse_vendor_pet_ids(" 101320712 = Kitty ,5=Pancake, ") == {"101320712": "Kitty", "5": "Pancake"}
+    assert parse_vendor_pet_ids("") == {}
+
+
+@pytest.mark.parametrize("raw", ["Kitty", "abc=Kitty", "101320712=", "=Kitty"])
+def test_parse_vendor_pet_ids_rejects_malformed_entries(raw: str) -> None:
+    with pytest.raises(ValueError):
+        parse_vendor_pet_ids(raw)

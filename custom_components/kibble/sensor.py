@@ -26,7 +26,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntry
 from .ble_fallback import CONTROL_PATHS
-from .coordinator import KibbleConfigEntry, KibbleCoordinator
+from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
 from .entity import KibbleEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -206,6 +206,7 @@ async def async_setup_entry(
     entities.append(KibbleWifiSignalSensor(coordinator))
     entities.append(KibbleLastSeenPetSensor(coordinator))
     entities.append(KibbleIdentificationScoreSensor(coordinator))
+    entities.append(KibbleVendorLastSeenPetSensor(coordinator))
     entities.append(KibblePendingFacesSensor(coordinator))
     entities.append(KibbleClipsSensor(coordinator))
     entities.append(KibbleLastDetectionSensor(coordinator))
@@ -524,6 +525,49 @@ class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
             attrs["second_best_score"] = result.second_best.score
         if result.ts is not None:
             attrs["last_identified"] = dt_util.utc_from_timestamp(result.ts).isoformat()
+        return attrs
+
+
+class KibbleVendorLastSeenPetSensor(KibbleEntity, SensorEntity):
+    """The vendor's own on-device identifier's most recent result -- independent of Kibble's
+    classifier above. State is the operator's name for the pet id (`vendor_pet_ids` option),
+    the raw id as a string if it is unmapped, or unavailable until the vendor has identified
+    anything since the agent started. The vendor gallery only knows cats enrolled with face
+    photos in the Petkit app (one, on this feeder), so this can only ever name those."""
+
+    _attr_translation_key = "vendor_last_seen_pet"
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "vendor_last_seen_pet")
+
+    def _latest(self) -> VendorSighting | None:
+        sightings = self.coordinator.data.vendor_sightings
+        return sightings[-1] if sightings else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._latest() is not None
+
+    @property
+    def native_value(self) -> str | None:
+        s = self._latest()
+        if s is None:
+            return None
+        return s.cat if s.cat is not None else s.pet_id
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        s = self._latest()
+        if s is None:
+            return {}
+        attrs: dict[str, Any] = {
+            "pet_id": s.pet_id,
+            "last_identified": dt_util.utc_from_timestamp(s.ts).isoformat(),
+        }
+        if s.track_value is not None:
+            # Unexplained per-visit float the vendor stores with the identification (agent
+            # `state::TrackEntry::value`); exposed raw, deliberately not called a score.
+            attrs["track_value"] = s.track_value
         return attrs
 
 

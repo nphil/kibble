@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -98,11 +98,13 @@ from .const import (
     CONF_ENABLE_SCHEDULE_WRITES,
     CONF_HOST,
     CONF_STREAM_URL,
+    CONF_VENDOR_PET_IDS,
     DEFAULT_RTSP_PATH,
     DEFAULT_RTSP_PORT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     ISSUE_FEEDER_UNRESPONSIVE,
+    parse_vendor_pet_ids,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -129,6 +131,31 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 
 @dataclass(frozen=True, slots=True)
+class VendorSighting:
+    """One `track` detection resolved through the `vendor_pet_ids` option: the vendor's own
+    on-device identification of `pet_id`, at the vendor's own visit start time `ts`. `cat` is
+    the operator-assigned name, or `None` when the id is not in the option (surfaced raw,
+    never guessed into a name)."""
+
+    ts: int
+    pet_id: str
+    cat: str | None
+    track_value: float | None
+
+
+def vendor_sightings(
+    events: Sequence[DetectionEvent], pet_ids: Mapping[str, str]
+) -> tuple[VendorSighting, ...]:
+    """Every `track` event, newest last, with its `pet_id` mapped to a cat name where the
+    option names it. Pure so it's testable without a coordinator."""
+    return tuple(
+        VendorSighting(ts=e.ts, pet_id=e.pet_id, cat=pet_ids.get(e.pet_id), track_value=e.track_value)
+        for e in sorted(events, key=lambda e: (e.ts, e.seq))
+        if e.cls == "track" and e.pet_id is not None
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
     device-settings snapshot, the Petkit-cloud kill switch's status, the current Wi-Fi
@@ -150,6 +177,7 @@ class KibbleData:
     clips: tuple[ClipInfo, ...]
     feeds: tuple[FeedRecord, ...]
     events: tuple[DetectionEvent, ...]
+    vendor_sightings: tuple[VendorSighting, ...]
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -279,6 +307,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         clips = tuple(await self.client.clips())
         feeds = tuple(await self.client.feeds())
         events = tuple(await self.client.events())
+        # A malformed option can't reach here: the options flow validates it before saving.
+        pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
         return KibbleData(
             state=state,
             schedule=schedule,
@@ -293,6 +323,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             clips=clips,
             feeds=feeds,
             events=events,
+            vendor_sightings=vendor_sightings(events, pet_ids),
         )
 
     def _handle_poll_success(self) -> None:
