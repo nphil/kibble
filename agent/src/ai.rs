@@ -292,10 +292,57 @@ pub struct Feed {
 
 impl Feed {
     pub fn new() -> Arc<Feed> {
-        Arc::new(Feed {
+        let feed = Arc::new(Feed {
             inner: Mutex::new(FeedInner { events: VecDeque::with_capacity(MAX_EVENTS), next_seq: 1 }),
             changed: Condvar::new(),
-        })
+        });
+        feed.rehydrate_from_disk();
+        feed
+    }
+
+    /// Rebuild the in-memory feed from the crops already on disk in [`EVENTS_DIR`].
+    ///
+    /// Without this, `GET /events` reported an empty list after every `kibbled` restart even
+    /// though the images were sitting right there -- and `kibbled` restarts for ordinary reasons
+    /// (a new binary, the supervisor's respawn loop). Filenames are the ones `poll_loop` writes,
+    /// `<unix_ts>-<class>.jpg`, so the timestamp and class are recoverable exactly; `score`,
+    /// `pet_id` and `box` stay `None` for the same honest reason they always are (that data only
+    /// ever existed in `ctrl`'s private queue, never in the file).
+    fn rehydrate_from_disk(&self) {
+        let Ok(entries) = fs::read_dir(EVENTS_DIR) else { return };
+        let mut found: Vec<(u64, &'static str, String)> = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some((ts_str, rest)) = name.split_once('-') else { continue };
+            let Ok(ts) = ts_str.parse::<u64>() else { continue };
+            let class = match rest.strip_suffix(".jpg").or_else(|| rest.strip_suffix(".jpeg")) {
+                Some("visit") => "visit",
+                Some("eat") => "eat",
+                Some("face") => "face",
+                _ => continue,
+            };
+            found.push((ts, class, name));
+        }
+        if found.is_empty() {
+            return;
+        }
+        found.sort_by_key(|(ts, _, _)| *ts);
+        let skip = found.len().saturating_sub(MAX_EVENTS);
+        let mut inner = self.inner.lock().unwrap();
+        for (ts, class, name) in found.into_iter().skip(skip) {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            inner.events.push_back(Detection {
+                seq,
+                ts,
+                class,
+                score: None,
+                pet_id: None,
+                b0x: None,
+                image: Some(name),
+                cat: None,
+            });
+        }
     }
 
     fn push(&self, class: &'static str, image: Option<String>, cat: Option<String>) {
@@ -363,6 +410,31 @@ fn check_one(w: &Watched, last_seen: Option<SystemTime>) -> (Option<SystemTime>,
     }
 }
 
+/// Cap on crops kept in [`EVENTS_DIR`]. `/opt` is UBIFS on raw NAND with finite erase cycles and
+/// ~56 MB free, and a detection crop lands here on every vendor detection -- unbounded, that is
+/// a slow flash-filling leak. 200 is comfortably more than [`MAX_EVENTS`] (so `GET /events` can
+/// always be rehydrated in full after a restart) while bounding the directory to a few MB.
+const MAX_EVENT_FILES: usize = 200;
+
+/// Delete the oldest crops once the directory exceeds [`MAX_EVENT_FILES`].
+///
+/// Called only right after a successful write, i.e. once per real detection -- never on a timer,
+/// so an idle feeder performs no flash writes at all.
+fn prune_events_dir() {
+    let Ok(entries) = fs::read_dir(EVENTS_DIR) else { return };
+    let mut names: Vec<String> =
+        entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    if names.len() <= MAX_EVENT_FILES {
+        return;
+    }
+    // Filenames start with a fixed-width-ish unix timestamp, but sort numerically rather than
+    // lexically so a digit-count rollover can't pick the wrong victim.
+    names.sort_by_key(|n| n.split_once('-').and_then(|(ts, _)| ts.parse::<u64>().ok()).unwrap_or(0));
+    for name in names.iter().take(names.len() - MAX_EVENT_FILES) {
+        let _ = fs::remove_file(Path::new(EVENTS_DIR).join(name));
+    }
+}
+
 fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>) {
     let _ = fs::create_dir_all(EVENTS_DIR);
     let mut last_seen: Vec<Option<SystemTime>> = vec![None; WATCHED.len()];
@@ -374,6 +446,9 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>) {
                 let ts = now_unix();
                 let name = format!("{ts}-{}.jpg", w.class);
                 let saved = fs::write(Path::new(EVENTS_DIR).join(&name), &bytes).is_ok();
+                if saved {
+                    prune_events_dir();
+                }
                 let mut cat = None;
                 if w.is_face_crop {
                     if let Ok(pending_name) = faces::save_pending(&bytes, None) {
