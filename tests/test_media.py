@@ -21,13 +21,14 @@ as `test_cat_id.py` already does for `select.py`/`binary_sensor.py`/`image.py`.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from homeassistant.util import dt as dt_util
-from kibble.api import FeedRecord, KibbleClient, KibbleSpeakerBusyError
+from kibble.api import DetectionEvent, FeedRecord, KibbleClient, KibbleSpeakerBusyError
 from kibble.coordinator import _pcm_convert_args
-from kibble.image import _h264_to_jpeg_args, _latest_dish_snapshot
+from kibble.image import KibbleLastDetectionImage, _h264_to_jpeg_args, _latest_dish_snapshot
 
 
 # --- coordinator._pcm_convert_args -------------------------------------------------------------
@@ -72,6 +73,33 @@ def _record(ts: int, id_: str, before: str | None, after: str | None) -> FeedRec
 def test_latest_dish_snapshot_empty_feeds_is_none_for_both_sides() -> None:
     assert _latest_dish_snapshot((), "before") == (None, None)
     assert _latest_dish_snapshot((), "after") == (None, None)
+
+
+# --- image.KibbleLastDetectionImage._apply ---------------------------------------------------
+
+
+def _detection(seq: int, ts: int, cls: str, image: str | None) -> DetectionEvent:
+    return DetectionEvent(
+        seq=seq, ts=ts, cls=cls, image=image, cat=None, score=None, pet_id=None, track_value=None
+    )
+
+
+def test_last_detection_image_keeps_the_newest_crop_when_a_track_event_is_newer() -> None:
+    """A `track` event (the vendor's identification) has no crop. It must not blank the image
+    entity -- the regression that made `image.*_last_detection` read unknown the moment the
+    first identification landed after the newest visit crop."""
+    fake = SimpleNamespace(_entry=SimpleNamespace(data={"host": "h", "port": 1}))
+    events = (
+        _detection(1, 100, "visit", "100-visit.jpg"),
+        _detection(2, 200, "track", None),
+    )
+    KibbleLastDetectionImage._apply(fake, events)
+    assert fake._event.seq == 1
+    assert fake._attr_image_url.endswith("/events/100-visit.jpg")
+    assert fake._attr_image_last_updated == dt_util.utc_from_timestamp(100)
+
+    KibbleLastDetectionImage._apply(fake, (_detection(2, 200, "track", None),))
+    assert fake._event is None and fake._attr_image_url is None
 
 
 def test_latest_dish_snapshot_uses_the_newest_records_own_side_not_an_older_records() -> None:

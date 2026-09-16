@@ -666,8 +666,8 @@ class KibbleLastDetectionSensor(KibbleEntity, SensorEntity):
         event = _latest_detection(self.coordinator.data.events)
         if event is None:
             return {}
-        # score/pet_id are honestly absent until the vendor's ctrl process is replaced
-        # (docs/24-onboard-ai.md) -- reported as-is rather than filled in with a fake number.
+        # `pet_id` is real on `track` events (the vendor's own identification, read from the
+        # feeder's shared config); `score` is honestly absent on every class -- see api.py.
         return {
             "class": event.cls,
             "image": event.image,

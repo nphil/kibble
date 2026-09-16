@@ -108,7 +108,10 @@ def _detection_url(entry: KibbleConfigEntry, name: str) -> str:
 
 
 class KibbleLastDetectionImage(KibbleEntity, ImageEntity):
-    """The crop from the feeder's most recent onboard-AI detection (`GET /events`).
+    """The crop from the feeder's most recent onboard-AI detection that produced one
+    (`GET /events`, classes `visit`/`eat`/`face`). A `track` event -- the vendor's own
+    identification -- carries no crop and must not blank this out, so the newest event *with an
+    image* wins, not the newest event.
 
     Already a JPEG on the device, so unlike the dish snapshots this needs no H.264 transcode --
     the URL is handed straight to Home Assistant. `image_last_updated` uses the detection's own
@@ -125,8 +128,9 @@ class KibbleLastDetectionImage(KibbleEntity, ImageEntity):
         self._apply(entry.runtime_data.data.events)
 
     def _apply(self, events: tuple[DetectionEvent, ...]) -> None:
-        event = max(events, key=lambda e: (e.ts, e.seq)) if events else None
-        if event is None or not event.image:
+        with_image = [e for e in events if e.image]
+        event = max(with_image, key=lambda e: (e.ts, e.seq)) if with_image else None
+        if event is None:
             self._attr_image_url = None
             self._attr_image_last_updated = None
             self._event = None
