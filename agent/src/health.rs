@@ -11,12 +11,17 @@
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PATH: &str = "/opt/kibble/health.json";
-/// The boot script's own durable record (`scripts/app_init.sh`) -- kibbled never writes this
-/// file itself, only reads it, so a read failure here (missing on a system not yet running the
-/// new boot script, or a race with the script's own trim-and-replace) is just "unknown", not an
-/// error worth surfacing.
-const RESTARTS_LOG: &str = "/opt/kibble/restarts.log";
+// Both paths are tmpfs, deliberately: nothing about restart bookkeeping is written to the
+// feeder's flash (Nitin, 2026-09-15). `/opt` is UBIFS on raw NAND with finite erase cycles, and a
+// counter rewritten on every process start is exactly the kind of small, frequent write that
+// wears it. The cost is that the count resets on reboot -- which is fine, because the question it
+// answers is "is kibbled crash-looping *right now*", and the durable history lives in remote
+// syslog on the Unraid box (see `scripts/app_init.sh`), not on the device.
+const PATH: &str = "/tmp/kibble-health.json";
+/// The boot script's own record (`scripts/app_init.sh`). kibbled never writes this file itself,
+/// only reads it, so a read failure (missing on a system not yet running the new boot script) is
+/// just "unknown", not an error worth surfacing.
+const RESTARTS_LOG: &str = "/tmp/kibbled-restarts.log";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Health {
