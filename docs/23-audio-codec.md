@@ -1586,7 +1586,21 @@ own talkback reaches the speaker at all, independent of anything this project ha
 **Not run yet as of this section**; see the live hub log / a follow-up doc section for the
 result.
 
-## 19. REGRESSION: a real vendor talkback session was cut short during this session's testing, and the mechanism is now identified
+## 19. REGRESSION, CONFIRMED BY CONTROL TEST: a real vendor talkback session was cut short by our own autonomous `speak_stop`
+
+**Update after §19.1-19.3 were first written (which called this "likely, circumstantial"):
+Main rolled the device back to `f862cc2e` (no `media`-touching code at all) and had Nitin retry.
+His talkback ran clean for 15+ seconds. It had cut at 5-8s every time on the binary containing
+`SpeakerOwner::new()`'s unconditional startup `speak_stop`, and ran long and clean the moment
+that code was gone from the running binary. That is a real control test, not a timing
+correlation: root cause CONFIRMED, at [HIGH]. The GPIO error (`pa_gpio->pa_linout`, §19.1) is
+exonerated as a one-off -- it appears exactly once in the whole kernel ring buffer, against (at
+least) four talkback attempts, so it is not routine noise at every session start and not the
+explanation either.** The restart-timing arithmetic (kibbled exit ~701.7s + the supervisor's
+fixed 5s sleep = relaunch at ~706.7s, against an observed guard-flag-clear at 706.72s) remains
+circumstantial -- no direct crash log exists for this specific incident, which is exactly the
+gap §19.4's fixes close for next time.
+
 
 Author: AudioSolve. **This is the most important finding in this document.** Everything in §18
 answered "why does our own audio not play." This section answers a different, higher-priority
@@ -1700,3 +1714,38 @@ an explicit off-by-default flag, so a `kibbled` restart can never again send an 
 message to the vendor's speaker subsystem. **This is a harder requirement than "works
 correctly": any future `speak_start`/`speak_stop` sender must be gated so that process startup,
 crash-recovery, and any other non-`/speak`-triggered code path cannot reach it, full stop.**
+
+### 19.5 Handoff state (end of this session)
+
+Implemented on branch `audio-solve` (pushed to origin, NOT merged, NOT deployed to the device):
+- `agent/src/audioout.rs`: `SpeakerOwner::new()` no longer sends anything (the unconditional
+  `clear_stale_guard_flag`/`speak_stop` is deleted, not just disabled); `try_acquire()` now
+  refuses unless `enabled()` is true; new `enabled()`/`set_enabled()` gated on
+  `/opt/kibble/audio_enabled` existing.
+- `agent/src/main.rs` / `agent/src/health.rs`: `GET`/`POST /audio` to read/toggle the flag;
+  `health::record_start()` (called once, at the top of `main()`, not periodically) persists
+  `start_count`/`last_start_unix` to `/opt/kibble/health.json`; `health::last_exit_code()` reads
+  the boot script's own restart ledger; all three merged into `GET /state` as
+  `kibbled_start_count`/`kibbled_last_start_unix`/`kibbled_last_exit_code`.
+- `scripts/app_init.sh`: reviewed line-by-line by Main and approved, staged in-repo, **not yet
+  copied to `/opt/app_init.sh` on the device**. Splits kibbled's own stdout/stderr (potentially
+  high-volume, → `/tmp/kibbled.log`, tmpfs, unbounded -- never touches flash) from a small
+  durable start/exit forensic record (→ `/opt/kibble/restarts.log`, flash, bounded on both line
+  count and byte size) per the household's standing flash-wear rule. Tested standalone with a
+  fake exiting binary under `dash`; not yet run on-device.
+- Full `cargo test --release` on this branch: 268/268 (one `embed::` test is flaky under
+  parallel execution -- confirmed passing standalone, environmental, not a regression).
+
+**Not done, and this is the concrete next step**: build for `armv7-unknown-linux-musleabihf`,
+report md5 before/after, deploy `scripts/app_init.sh` to `/opt/app_init.sh` and the new
+`kibbled` to `/opt/kibble/kibbled`, verify the full health gate, `POST /audio {"enabled":true}`,
+confirm the guard flag (`0x767f0`) reads `0` (no vendor session active), send `speak_start`,
+`publish()` an 8s test clip predicting the exact frame-count delta first, report the `SndFrm`
+delta, and -- regardless of outcome -- confirm a real vendor app talkback still runs 15+ seconds
+clean afterward (this is now an acceptance criterion, not an afterthought, per §19). If the
+publish test fails, per Main's explicit instruction: report the numbers and stop, do not start a
+new investigation in the same session.
+
+**Why kibbled exited at ~701.7s remains unanswered.** The new logging (once deployed) makes this
+answerable after the *next* occurrence, not this one -- there is no way to recover a cause for
+an incident that predates the log existing.
