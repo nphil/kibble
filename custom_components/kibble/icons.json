@@ -225,6 +225,9 @@
       },
       "detections_today": {
         "default": "mdi:counter"
+      },
+      "agent_starts": {
+        "default": "mdi:restart"
       }
     },
     "select": {

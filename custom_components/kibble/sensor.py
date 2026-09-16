@@ -210,6 +210,7 @@ async def async_setup_entry(
     entities.append(KibbleClipsSensor(coordinator))
     entities.append(KibbleLastDetectionSensor(coordinator))
     entities.append(KibbleDetectionsTodaySensor(coordinator))
+    entities.append(KibbleAgentStartsSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -667,4 +668,37 @@ class KibbleDetectionsTodaySensor(KibbleEntity, SensorEntity):
             "by_class": by_class,
             # True when the agent's own 50-event cap may be hiding older detections from today.
             "capped": len(self.coordinator.data.events) >= 50,
+        }
+
+
+class KibbleAgentStartsSensor(KibbleEntity, SensorEntity):
+    """How many times kibbled has started since the feeder last booted.
+
+    A steady 1 is the healthy reading. Anything higher means the agent exited and was restarted
+    by the vendor's app supervisor, which is worth knowing because nothing else surfaces it: the
+    counters live in tmpfs (`/tmp/kibble-health.json`) precisely so we never write restart logs
+    to the feeder's NAND, and they reset on reboot. `last_exit_code` is the previous run's exit
+    status -- null on a clean first start, and the field to look at when the count climbs.
+    """
+
+    _attr_translation_key = "agent_starts"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "agent_starts")
+
+    @property
+    def native_value(self) -> int:
+        return self.coordinator.data.state.agent_starts
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data.state
+        return {
+            "last_start": dt_util.utc_from_timestamp(state.agent_last_start).isoformat()
+            if state.agent_last_start
+            else None,
+            "last_exit_code": state.agent_last_exit_code,
         }

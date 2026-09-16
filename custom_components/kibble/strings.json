@@ -231,6 +231,9 @@
       },
       "detections_today": {
         "name": "Detections today"
+      },
+      "agent_starts": {
+        "name": "Agent starts"
       }
     },
     "switch": {

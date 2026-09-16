@@ -7,9 +7,15 @@ trip. `KibbleVolumeNumber` is the opposite: a single device-backed setting (the 
 integer in `agent/src/settings.rs`'s table), read from and written to the feeder's shared
 config through the agent's `/config` endpoint, same as `switch.py`'s writable booleans.
 
-There is one amount per auger plus a combined one. The two augers are independent motors with
-their own byte in the feed payload, so they stay separately controllable whether or not the
-physical hopper divider is fitted; without it both simply draw from one bin.
+There is one amount per auger plus a combined one, because the feed payload carries a separate
+byte per auger (`b[65]`, `b[66]` -- see `agent/src/feed.rs`).
+
+On *this* unit, however, per-auger targeting is not honoured: a command sent with
+`amount_l=1, amount_r=0` was observed to spin BOTH augers, so a "hopper 1" dispense delivers
+roughly twice the requested portions into the single (divider-less) bowl. The encoding is
+correct -- verified byte-for-byte against the vendor's own commands -- so this is firmware
+behaviour, not a bug here. Treat the combined `feed_amount` as the control that means what it
+says and the two per-hopper amounts as advisory until someone refits the divider and re-tests.
 """
 
 from __future__ import annotations

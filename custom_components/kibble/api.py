@@ -72,11 +72,22 @@ class FeederState:
     feeding: bool
     bowl_fill: tuple[int | None, int | None]
     event_counter: int
+    # Agent-process forensics, not device data: kibbled keeps these in tmpfs (`health.rs`), so
+    # they reset to a single start on a feeder reboot. A count that climbs without a reboot is
+    # the signal worth an alert -- it means the agent itself is dying and being restarted.
+    agent_starts: int
+    agent_last_start: int | None
+    agent_last_exit_code: int | None
     raw: dict[str, Any]
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> FeederState:
         fill = data.get("bowl_fill") or [None, None]
+        # `kibbled_last_exit_code` is null on a first, clean start -- a real 0 means "the
+        # previous run exited successfully", which is a different fact, so neither collapses
+        # into the other via `or`.
+        last_start = data.get("kibbled_last_start_unix")
+        exit_code = data.get("kibbled_last_exit_code")
         return cls(
             serial=str(data.get("serial", "")),
             firmware=str(data.get("firmware", "")),
@@ -86,6 +97,9 @@ class FeederState:
             feeding=bool(data.get("feeding")),
             bowl_fill=(fill[0], fill[1] if len(fill) > 1 else None),
             event_counter=int(data.get("event_counter") or 0),
+            agent_starts=int(data.get("kibbled_start_count") or 0),
+            agent_last_start=int(last_start) if isinstance(last_start, (int, float)) else None,
+            agent_last_exit_code=int(exit_code) if isinstance(exit_code, (int, float)) else None,
             raw=data,
         )
 
