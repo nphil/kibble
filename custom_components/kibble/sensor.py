@@ -684,7 +684,9 @@ class KibbleAgentStartsSensor(KibbleEntity, SensorEntity):
     _attr_translation_key = "agent_starts"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = False
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    # Deliberately no `state_class`: the counter resets to 1 whenever the feeder reboots, so a
+    # long-term sum would be meaningless, and a statistic id here would be stranded the moment
+    # this (disabled-by-default) entity is turned back off.
 
     def __init__(self, coordinator) -> None:
         super().__init__(coordinator, "agent_starts")

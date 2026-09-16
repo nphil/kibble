@@ -35,11 +35,15 @@ The agent uses **280 KB of RSS**, one thread, and no external dependencies.
 
 | | |
 |---|---|
-| Dispense (per auger, amount, cancel) | working, verified by dispensing |
+| Dispense (amount, cancel) | working, verified by dispensing |
+| Per-auger targeting | encoded correctly, **not honoured by firmware** -- both augers spin regardless, so a one-hopper request delivers about double into the divider-less bowl |
 | Live state (feeding, bowl fill, desiccant, firmware) | working |
-| Camera / two-way audio via Scrypted | designed, not implemented ([docs](docs/scrypted-onboarding.md)) |
-| Schedule, settings, events | see [docs/design-entities.md](docs/design-entities.md) |
-| Cat identification (NPU embeddings + self-trained classifier) | working, see [docs/27-cat-id.md](docs/27-cat-id.md) |
+| Schedule | working -- Kibble owns it, not the MCU ([docs/16-schedule.md](docs/16-schedule.md)); a live fire was observed dispensing |
+| Camera via Scrypted | working -- RTSP `h264/aac`, plus a mixin that turns the agent's `/events` into Scrypted detections ([docs](docs/scrypted-onboarding.md)) |
+| Two-way audio (speaker out) | blocked: the vendor's `audio_out_thread` never consumes our ring writes ([docs/20-two-way-audio.md](docs/20-two-way-audio.md)) |
+| Detections in HA | working -- `sensor.*_last_detection`, `sensor.*_detections_today`, `image.*_last_detection`, and a row in the Lovelace card |
+| Cat identification | enrolment and the classifier work ([docs/27-cat-id.md](docs/27-cat-id.md)), but the device has produced no face crops yet, so nothing has been identified in anger |
+| Agent health | `sensor.*_agent_starts` (diagnostic) counts kibbled starts since the feeder booted; counters live in tmpfs so nothing is logged to the feeder's NAND |
 
 See [docs/](docs/) for the reverse-engineering notes this is built on, including the exact wire
 formats and the addresses they were recovered from.
