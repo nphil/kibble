@@ -57,7 +57,17 @@ fn is_safe_name(name: &str) -> bool {
 /// at [`MAX_PENDING`]. `pet_id` is `None` today (see the module doc); kept as a parameter so a
 /// future real tap can pass one through without changing this function's shape.
 pub fn save_pending(bytes: &[u8], pet_id: Option<u32>) -> io::Result<String> {
-    save_pending_in(Path::new(PENDING_DIR), bytes, pet_id)
+    let name = save_pending_in(Path::new(PENDING_DIR), bytes, pet_id)?;
+    mark_faces_changed();
+    Ok(name)
+}
+
+/// The face store's four HA-visible views (`/cats`, `/identify`, `/faces/current/info`,
+/// `/faces/pending`) all derive from the same directories, so any mutation of those
+/// directories dirties all four at once.
+fn mark_faces_changed() {
+    use crate::push::Field;
+    crate::push::mark_all(&[Field::Cats, Field::Identify, Field::ReviewFace, Field::PendingFaces]);
 }
 
 fn save_pending_in(dir: &Path, bytes: &[u8], pet_id: Option<u32>) -> io::Result<String> {
@@ -153,7 +163,9 @@ pub fn read_pending(name: &str) -> Result<Vec<u8>, FaceError> {
 /// "cat names are not recoverable from the device", a one-time HA-side naming step), sanitised
 /// only enough to stay inside `FACES_ROOT`.
 pub fn label(name: &str, cat: &str) -> Result<(), FaceError> {
-    label_in(Path::new(PENDING_DIR), Path::new(FACES_ROOT), name, cat)
+    label_in(Path::new(PENDING_DIR), Path::new(FACES_ROOT), name, cat)?;
+    mark_faces_changed();
+    Ok(())
 }
 
 fn label_in(pending_dir: &Path, faces_root: &Path, name: &str, cat: &str) -> Result<(), FaceError> {
@@ -242,7 +254,9 @@ pub fn ensure_embedding(jpg_path: &Path) -> Result<[f32; embed::EMBED_DIM], Embe
 /// previously-labelled crop (and its `.emb` sidecar, if any) back into the pending review queue.
 /// A full re-label is this followed by [`label`] into the correct cat.
 pub fn unlabel(cat: &str, name: &str) -> Result<(), FaceError> {
-    unlabel_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR), cat, name)
+    unlabel_in(Path::new(FACES_ROOT), Path::new(PENDING_DIR), cat, name)?;
+    mark_faces_changed();
+    Ok(())
 }
 
 fn unlabel_in(faces_root: &Path, pending_dir: &Path, cat: &str, name: &str) -> Result<(), FaceError> {
@@ -516,6 +530,7 @@ impl Gallery {
         }
         fs::create_dir_all(Path::new(FACES_ROOT).join(name)).map_err(FaceError::Io)?;
         self.inner.lock().unwrap().ensure_cat(name);
+        mark_faces_changed();
         Ok(())
     }
 

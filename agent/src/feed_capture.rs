@@ -317,17 +317,24 @@ fn run_one_cycle(shm: &Shm, capture: &FeedCapture) -> bool {
     if !wait_for_flag(shm, true, None) {
         return false;
     }
+    // This watcher sees the flag at 200 ms; the 1 s state diff in ai.rs would also catch it,
+    // but a dispense is the one thing worth telling HA about as fast as we know.
+    crate::push::mark(crate::push::Field::State);
     let (id, amount1, amount2, manual, before) = capture.start_cycle();
     if !wait_for_flag(shm, false, Some(MAX_CYCLE_WAIT)) {
         eprintln!("kibbled: feed capture: flag for {id} never cleared, dropping this cycle");
         return true;
     }
+    crate::push::mark(crate::push::Field::State);
     thread::sleep(SETTLE_AFTER_FEED);
     match capture.finish_cycle(&id, amount1, amount2, manual, before) {
-        Ok(r) => eprintln!(
-            "kibbled: feed capture: saved {id} (manual={manual}, before={:?}, after={:?})",
-            r.before, r.after
-        ),
+        Ok(r) => {
+            eprintln!(
+                "kibbled: feed capture: saved {id} (manual={manual}, before={:?}, after={:?})",
+                r.before, r.after
+            );
+            crate::push::mark(crate::push::Field::Feeds);
+        }
         Err(e) => eprintln!("kibbled: feed capture: failed to save {id}: {e}"),
     }
     true

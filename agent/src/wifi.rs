@@ -695,7 +695,9 @@ fn parse_desired(text: &str) -> Desired {
 }
 
 fn save(desired: &Desired) -> io::Result<()> {
-    save_to(STATE_PATH, desired)
+    let r = save_to(STATE_PATH, desired);
+    crate::push::mark(crate::push::Field::Wifi);
+    r
 }
 
 fn save_to(path: &str, desired: &Desired) -> io::Result<()> {
@@ -730,6 +732,9 @@ pub fn spawn_reconciler() {
         boot_reapply(CONNECT_TIMEOUT, POLL_INTERVAL);
         let mut consecutive_failures = 0u32;
         let mut last_target: Option<(String, Option<String>)> = None;
+        // Association/signal/scan results are live radio state; diff the exact bytes HA would
+        // receive on this thread's existing tick and mark only on change (same as cloud.rs).
+        let (mut last_status, mut last_scan) = (status_json(), scan_json());
         loop {
             std::thread::sleep(RECONCILE_INTERVAL);
             let mut runner = RealRunner;
@@ -740,6 +745,15 @@ pub fn spawn_reconciler() {
                 CONNECT_TIMEOUT,
                 POLL_INTERVAL,
             );
+            let (status, scan) = (status_json(), scan_json());
+            if status != last_status {
+                crate::push::mark(crate::push::Field::Wifi);
+                last_status = status;
+            }
+            if scan != last_scan {
+                crate::push::mark(crate::push::Field::WifiScan);
+                last_scan = scan;
+            }
         }
     });
 }

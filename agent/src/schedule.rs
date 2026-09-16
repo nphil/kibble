@@ -408,6 +408,8 @@ impl Cache {
         if let Ok(dir_handle) = fs::File::open(&dir) {
             let _ = dir_handle.sync_all();
         }
+        // Every schedule mutation (HTTP writes, the scheduler's fire records) lands here.
+        crate::push::mark(crate::push::Field::Schedule);
         Ok(())
     }
 

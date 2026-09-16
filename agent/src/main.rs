@@ -104,12 +104,14 @@ mod http;
 mod md5;
 mod persist;
 mod localtime;
+mod push;
 mod rfc3640;
 mod ring;
 mod rtsp;
 mod schedule;
 mod scheduler;
 mod settings;
+mod sha1;
 mod state;
 mod wifi;
 
@@ -236,6 +238,35 @@ fn main() {
         ),
     }
 
+    // Local push (docs/33-local-push-design.md): every frame body comes from the exact function
+    // the matching GET route uses, so HA's parsers see one shape whichever path delivered it.
+    {
+        let shm = Arc::clone(&shm);
+        let schedule = Arc::clone(&schedule);
+        let ai_feed = Arc::clone(&ai_feed);
+        let capture = Arc::clone(&capture);
+        let gallery = Arc::clone(&gallery);
+        let serialize: push::Serialize = Arc::new(move |f| match f {
+            push::Field::State => state_json(&shm, health),
+            push::Field::Schedule => schedule_status_json(&schedule, scheduler_enabled, tz),
+            push::Field::Config => settings::to_json(&shm),
+            push::Field::Cloud => cloud::status_json(),
+            push::Field::Wifi => wifi::status_json(),
+            push::Field::WifiScan => wifi::scan_json(),
+            push::Field::Cats => gallery.cats_json(),
+            push::Field::Identify => identify_json(&gallery).unwrap_or_else(|_| "null".into()),
+            push::Field::ReviewFace => faces_current_info_json().unwrap_or_else(|_| "null".into()),
+            push::Field::PendingFaces => faces_pending_json().unwrap_or_else(|_| "null".into()),
+            push::Field::Clips => clips_json(),
+            push::Field::Feeds => feeds_json(&capture).unwrap_or_else(|_| "null".into()),
+            push::Field::Events => ai_feed.snapshot_json(),
+        });
+        match push::spawn(serialize) {
+            Ok(()) => eprintln!("kibbled: push listening on {}", push::PUSH_BIND),
+            Err(e) => eprintln!("kibbled: push disabled: bind {}: {e}", push::PUSH_BIND),
+        }
+    }
+
     let _ = http::serve(listener, |req| {
         route(
             req,
@@ -305,18 +336,18 @@ fn route(
         ("GET", "/events") => Response::Json(ai_feed.snapshot_json()),
         ("GET", "/events/stream") => events_stream(query, ai_feed),
         ("GET", p) if p.starts_with("/events/") => events_file_get(&p["/events/".len()..]),
-        ("GET", "/faces/pending") => faces_pending_list(),
+        ("GET", "/faces/pending") => json_response(faces_pending_json()),
         ("GET", p) if p.starts_with("/faces/pending/") => {
             faces_pending_get(&p["/faces/pending/".len()..])
         }
         ("POST", "/faces/label") => faces_label_post(req, gallery),
         ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery),
         ("GET", "/faces/current") => faces_current_get(),
-        ("GET", "/faces/current/info") => faces_current_info_get(),
+        ("GET", "/faces/current/info") => json_response(faces_current_info_json()),
         ("GET", "/cats") => cats_get(gallery),
         ("POST", "/cats") => cats_post(req, gallery),
-        ("GET", "/identify") => identify_get(gallery),
-        ("GET", "/feeds") => feeds_list(capture),
+        ("GET", "/identify") => json_response(identify_json(gallery)),
+        ("GET", "/feeds") => json_response(feeds_json(capture)),
         ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
         ("GET", "/ble") => Response::Json(ble_adv.status_json()),
         ("POST", "/ble/advertise") => ble_advertise_write(req, ble_adv),
@@ -389,14 +420,19 @@ fn events_file_get(name: &str) -> Response {
     }
 }
 
-fn faces_pending_list() -> Response {
-    match faces::list_pending() {
-        Ok(names) => {
-            let items: Vec<String> = names.iter().map(|n| format!("\"{}\"", n.escape_debug())).collect();
-            Response::Json(format!("[{}]", items.join(",")))
-        }
-        Err(e) => Response::Error(e.to_string()),
+/// `Result<json, error>` -> HTTP. The JSON producers below are shared with the push channel
+/// (`push::Serialize` in `main`), which is why they don't build a `Response` themselves.
+fn json_response(r: Result<String, String>) -> Response {
+    match r {
+        Ok(json) => Response::Json(json),
+        Err(e) => Response::Error(e),
     }
+}
+
+fn faces_pending_json() -> Result<String, String> {
+    let names = faces::list_pending().map_err(|e| e.to_string())?;
+    let items: Vec<String> = names.iter().map(|n| format!("\"{}\"", n.escape_debug())).collect();
+    Ok(format!("[{}]", items.join(",")))
 }
 
 fn faces_pending_get(name: &str) -> Response {
@@ -483,19 +519,18 @@ fn faces_current_get() -> Response {
     }
 }
 
-fn faces_current_info_get() -> Response {
-    match faces::review_target() {
-        Ok(Some(faces::FaceTarget::Pending { name })) => Response::Json(format!(
+fn faces_current_info_json() -> Result<String, String> {
+    match faces::review_target().map_err(|e| e.to_string())? {
+        Some(faces::FaceTarget::Pending { name }) => Ok(format!(
             r#"{{"status":"pending","name":"{}","cat":null}}"#,
             name.escape_debug()
         )),
-        Ok(Some(faces::FaceTarget::Labelled { cat, name })) => Response::Json(format!(
+        Some(faces::FaceTarget::Labelled { cat, name }) => Ok(format!(
             r#"{{"status":"labelled","name":"{}","cat":"{}"}}"#,
             name.escape_debug(),
             cat.escape_debug()
         )),
-        Ok(None) => Response::Json(r#"{"status":"none","name":null,"cat":null}"#.into()),
-        Err(e) => Response::Error(e.to_string()),
+        None => Ok(r#"{"status":"none","name":null,"cat":null}"#.into()),
     }
 }
 
@@ -519,13 +554,10 @@ fn cats_post(req: &Request, gallery: &faces::Gallery) -> Response {
 /// `GET /identify`: Kibble's own classifier's opinion of the newest pending crop, or ground
 /// truth from the most recently labelled one once the queue is empty (`source` distinguishes
 /// the two -- see the module doc and `docs/27-cat-id.md`).
-fn identify_get(gallery: &faces::Gallery) -> Response {
-    let target = match faces::identify_target() {
-        Ok(t) => t,
-        Err(e) => return Response::Error(e.to_string()),
-    };
+fn identify_json(gallery: &faces::Gallery) -> Result<String, String> {
+    let target = faces::identify_target().map_err(|e| e.to_string())?;
     let Some(target) = target else {
-        return Response::Json(
+        return Ok(
             r#"{"cat":null,"score":null,"second_best":null,"crop":null,"source":null,"ts":null}"#
                 .into(),
         );
@@ -539,38 +571,33 @@ fn identify_get(gallery: &faces::Gallery) -> Response {
     let ts_json = ts.map_or("null".to_string(), |t| t.to_string());
     let crop_json = format!("\"{}\"", target.name().escape_debug());
     match target {
-        faces::FaceTarget::Labelled { cat, .. } => Response::Json(format!(
+        faces::FaceTarget::Labelled { cat, .. } => Ok(format!(
             r#"{{"cat":"{}","score":null,"second_best":null,"crop":{crop_json},"source":"labelled","ts":{ts_json}}}"#,
             cat.escape_debug(),
         )),
-        faces::FaceTarget::Pending { .. } => match faces::ensure_embedding(&path) {
-            Ok(feat) => {
-                let (cat_json, score_json, second_json) = match gallery.identify(&feat) {
-                    catid::Verdict::Known { cat, score, second_best } => (
-                        format!("\"{}\"", cat.escape_debug()),
-                        score.to_string(),
-                        second_best.map_or("null".to_string(), |s| {
-                            format!(r#"{{"cat":"{}","score":{}}}"#, s.cat.escape_debug(), s.score)
-                        }),
-                    ),
-                    catid::Verdict::Unknown { .. } => {
-                        ("\"unknown\"".to_string(), "null".to_string(), "null".to_string())
-                    }
-                };
-                Response::Json(format!(
-                    r#"{{"cat":{cat_json},"score":{score_json},"second_best":{second_json},"crop":{crop_json},"source":"classifier","ts":{ts_json}}}"#
-                ))
-            }
-            Err(e) => Response::Error(e.to_string()),
-        },
+        faces::FaceTarget::Pending { .. } => {
+            let feat = faces::ensure_embedding(&path).map_err(|e| e.to_string())?;
+            let (cat_json, score_json, second_json) = match gallery.identify(&feat) {
+                catid::Verdict::Known { cat, score, second_best } => (
+                    format!("\"{}\"", cat.escape_debug()),
+                    score.to_string(),
+                    second_best.map_or("null".to_string(), |s| {
+                        format!(r#"{{"cat":"{}","score":{}}}"#, s.cat.escape_debug(), s.score)
+                    }),
+                ),
+                catid::Verdict::Unknown { .. } => {
+                    ("\"unknown\"".to_string(), "null".to_string(), "null".to_string())
+                }
+            };
+            Ok(format!(
+                r#"{{"cat":{cat_json},"score":{score_json},"second_best":{second_json},"crop":{crop_json},"source":"classifier","ts":{ts_json}}}"#
+            ))
+        }
     }
 }
 
-fn feeds_list(capture: &feed_capture::FeedCapture) -> Response {
-    match capture.list_json() {
-        Ok(json) => Response::Json(json),
-        Err(e) => Response::Error(e.to_string()),
-    }
+fn feeds_json(capture: &feed_capture::FeedCapture) -> Result<String, String> {
+    capture.list_json().map_err(|e| e.to_string())
 }
 
 fn feeds_get(capture: &feed_capture::FeedCapture, name: &str) -> Response {

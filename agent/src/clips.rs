@@ -62,11 +62,15 @@ pub fn load(name: &str) -> io::Result<Vec<u8>> {
 
 pub fn save(name: &str, adts_bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(CLIPS_DIR)?;
-    fs::write(path_for(name), adts_bytes)
+    fs::write(path_for(name), adts_bytes)?;
+    crate::push::mark(crate::push::Field::Clips);
+    Ok(())
 }
 
 pub fn delete(name: &str) -> io::Result<()> {
-    fs::remove_file(path_for(name))
+    fs::remove_file(path_for(name))?;
+    crate::push::mark(crate::push::Field::Clips);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -404,6 +404,7 @@ impl Feed {
         }
         drop(inner);
         self.changed.notify_all();
+        crate::push::mark(crate::push::Field::Events);
     }
 
     /// `GET /events`: the last [`MAX_EVENTS`], oldest first.
@@ -488,6 +489,11 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
     // Whatever the block holds at startup is history, not a new event: publishing it would
     // re-announce the same visit on every kibbled restart.
     let mut last_track = shm.pet_track().as_ref().and_then(track_key);
+    // The vendor-state fields HA reads from `GET /state` (bowl fill, desiccant, feeding, the
+    // identification block) have no producer of their own on our side -- media/ble write them
+    // straight into config_shm -- so this loop's existing 1 s tick doubles as their change
+    // detector: one `Snapshot` compare on memory it already reads, no extra timer.
+    let mut last_state = shm.snapshot();
     loop {
         for (i, w) in WATCHED.iter().enumerate() {
             let (new_last, found) = check_one(w, last_seen[i]);
@@ -526,6 +532,11 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
                 feed.push_track(track.latest().unwrap());
             }
             last_track = key;
+        }
+        let state = shm.snapshot();
+        if state != last_state {
+            crate::push::mark(crate::push::Field::State);
+            last_state = state;
         }
         thread::sleep(POLL_INTERVAL);
     }

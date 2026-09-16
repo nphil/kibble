@@ -336,8 +336,17 @@ fn assert_enabled(runner: &mut impl Runner, gw: &str, dev: &str) -> Result<(), S
 pub fn spawn_reconciler() {
     std::thread::spawn(|| {
         wait_for_live_route();
+        // `routes`/`connections` in the status JSON are live kernel state that changes without
+        // any write of ours; diff the exact bytes HA would receive, on the tick this thread
+        // already takes, and mark only when they differ.
+        let mut last_status = status_json();
         loop {
             reconcile_once();
+            let status = status_json();
+            if status != last_status {
+                crate::push::mark(crate::push::Field::Cloud);
+                last_status = status;
+            }
             std::thread::sleep(RECONCILE_INTERVAL);
         }
     });
@@ -631,7 +640,9 @@ fn parse_state(text: &str) -> State {
 }
 
 fn save(state: &State) -> io::Result<()> {
-    save_to(STATE_PATH, state)
+    let r = save_to(STATE_PATH, state);
+    crate::push::mark(crate::push::Field::Cloud);
+    r
 }
 
 fn save_to(path: &str, state: &State) -> io::Result<()> {

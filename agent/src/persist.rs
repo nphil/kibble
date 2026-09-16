@@ -149,6 +149,9 @@ fn apply_value(setting: &'static Setting, value: u32) -> io::Result<Option<bool>
             .is_ok()
     });
 
+    // Both callers (`POST /config` and the boot/periodic reconciler) land here; the value is
+    // in config_shm at this point, which is what `GET /config` reads.
+    crate::push::mark(crate::push::Field::Config);
     Ok(notified)
 }
 
