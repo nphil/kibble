@@ -11,6 +11,12 @@ RTSP Camera Plugin). Adds two capabilities on top of that camera:
   (`agent/src/rtsp.rs`/`backchannel.rs`), independent of Scrypted's Rebroadcast plugin (which only
   ever *reads* from the feeder).
 
+> **Note on the feeder's address:** the feeder has moved networks at least once during this
+> project (`192.168.4.85` → `192.168.1.85`). The host is a plugin Setting, not a hardcoded
+> constant, for exactly this reason — update it there, not in code, if it moves again. Evidence
+> captured earlier in this README against `192.168.4.85` predates the move; the default now
+> points at the current address.
+
 ## The starvation incident (read this before touching the poll design)
 
 During this branch's live testing, attaching the mixin ran `KibbleDetectionFeed` against the
@@ -134,29 +140,17 @@ This plugin mirrors that honesty instead of inventing numbers:
 - `label`/`labelScore` on that same entry come from `GET /identify` — Kibble's **own** real,
   first-party nearest-centroid cat-name classifier (`docs/27-cat-id.md`), not the vendor's.
 
-**A real, separate gap found and worked around, not papered over:** `agent/src/main.rs`'s full
-route table has no endpoint that serves `EVENTS_DIR`'s files — `Detection.image` is a bare
-filename (`/opt/kibble/events/<ts>-<class>.jpg`) with **no HTTP route to fetch it**, for *any*
-class. The one real fetch path: `class: "face"` crops are *also* written to the face-review queue
-(`faces::PENDING_DIR`) in the same tick, which **is** served (`GET /faces/current`). This plugin
-fetches that immediately upon seeing a new `face` event, only while `/faces/current/info` still
-reports `"pending"` (i.e., nothing has raced ahead of it) — a documented best-effort, not a
-guarantee. `visit`/`eat` events have no such queue and get **no** crop; `getDetectionInput` for
-those honestly throws rather than fabricating one. (Flagged to `Main`/`HaMedia` as a real
-agent-side gap — `image.py`/`camera.py` will hit the identical limitation for any full-frame crop.)
-
-## Agent-side TODO (not fixed here — `agent/src/main.rs` belongs to other tasks)
-
-**Add `GET /events/<file>`, serving raw bytes from `EVENTS_DIR` (`/opt/kibble/events/`), matching
-the existing `GET /faces/pending/<name>` pattern** (`main.rs`'s route table, `faces_pending_get`).
-`ai.rs`'s `Detection.image` already names the exact file (`{ts}-{class}.jpg`) that
-`poll_loop` writes there for *every* class (`face`/`visit`/`eat`), but nothing serves that
-directory over HTTP today — only `face`-class crops are separately reachable, indirectly, via
-`GET /faces/current` (a different directory, `faces::PENDING_DIR`, with different filenames, no
-guaranteed 1:1 mapping). Once this route exists, this plugin's `mixin.ts`
-(`tryFetchMatchingCrop`) should be simplified to `GET /events/<image>` directly for every class —
-a straightforward, exact, non-best-effort fetch — instead of the current same-tick
-`/faces/current` heuristic that only covers `face`-class detections.
+**A real gap this plugin found, worked around, and flagged instead of papering over — now
+resolved upstream.** `agent/src/main.rs`'s route table originally had no endpoint serving
+`EVENTS_DIR`'s files, so `Detection.image` was a bare filename with no way to fetch it for any
+class; the first version of this plugin worked around that with a same-tick, face-class-only
+heuristic (`GET /faces/current`, a different directory, no guaranteed 1:1 mapping) and flagged the
+gap in an "Agent-side TODO" section. **`GET /events/<file>` now exists** (verified live by `Main`
+against the real device: a real 99,831-byte JPEG fetched by name, path traversal rejected —
+`../settings.json` → 400, `..%2Fsettings.json` → 404, `/etc/passwd` → 400 — unknown names → 404).
+This plugin now fetches every class's crop directly by name (`mixin.ts`'s `tryFetchCrop`) instead
+of the old face-only workaround; `visit`/`eat` detections get a real crop (and therefore a real
+second-pass re-check) for the first time. Events with `image: null` still honestly get no crop.
 
 ## Second pass: did both, for different reasons
 

@@ -30,7 +30,7 @@ const SELF_TEST_SILENCE_FRAME_COUNT = 25; // ~500ms of 20ms PCMU frames
 const SELF_TEST_SILENCE_BYTE = 0xff; // G.711 mu-law's "silence" code
 
 const DEFAULTS: Record<string, string> = {
-    feederHost: '192.168.4.85',
+    feederHost: '192.168.1.85', // moved networks once already -- this is why it's a setting, not a constant
     feederHttpPort: '8765',
     feederRtspPort: '8554',
     feederRtspPath: 'sub',
