@@ -21,6 +21,16 @@ Working hypothesis (queue N = inbox of process id N; a process opens its own inb
     1=ctrl (everyone reports to it), 2=media, 8=ble, 7=agora, 4=cloud, 5=watchdog, 10=logUpload; 3/6/9 likely card/p2p/tserver-or-pktool.
 To confirm: match against src/dst ids in the dispatch_send_msg debug strings, or read the dispatch table (see msg_id task).
 
+**Correction (2026-09-16, live, read-only):** the hypothesis above is wrong for `ctrl`/`media`.
+An fd listing cannot tell a process's own inbox from the peer queues it also opens. Reading each
+dispatcher's `poll()` fd array out of `/proc/<pid>/mem` (the main thread blocks in
+`poll({eventfd, inbox}, 2, …)`; `/proc/<pid>/task/<tid>/syscall` gives the array address) and
+resolving that fd names the inbox directly: **`ctrl` polls `/msg_dispatch_2`, `media` polls
+`/msg_dispatch_1`**, `ble` polls `/msg_dispatch_8`. Every static sender agrees (`media`/`ble`
+emit ctrl-namespace ids with `dst=2`; `ctrl` emits `0xa`/`0xb`/`0x2` with `dst=1`).
+`agent/src/bus.rs::Peer` was corrected the same day; any doc line below that says `1=ctrl,
+2=media` should be read with the two swapped.
+
 ## Shared memory
     /dev/shm/config_shm              11952 bytes  = the config_t struct (saved: live/config_shm.bin — CONTAINS DEVICE CREDENTIALS, treat as secret)
     /dev/shm/media_buffer_frame_buf  8389608 bytes = video frame ring written by media

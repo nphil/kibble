@@ -7,6 +7,20 @@
 
 ---
 
+**Errata (2026-09-16, live, read-only) — two facts below are wrong; `agent/src/state.rs` and
+`bus.rs` carry the corrected values:**
+
+1. Queue ids: `ctrl`'s inbox is `/msg_dispatch_2` and `media`'s is `/msg_dispatch_1` (see
+   04-live.md's correction for the method). Swap `1=ctrl, 2=media` wherever it appears here.
+2. Watchdog slots are small u32 counters (observed cycling 0/1/2 every 2 s, never a 0↔1
+   toggle) and the owner mapping is: 10284 media, 10288 **ctrl**, 10292 card (dead), 10296
+   agora, 10300 cloud, 10304 ble, 10308 p2p (dead), 10312 logUpload. Evidence: the pid word at
+   `slot + 0x20` holds the owner's live pid (10316=204 media, 10320=212 ctrl, 10332=271 cloud,
+   10336=203 ble, 10344=272 logUpload). The watchdog disassembly
+   (`kibble-agent-tmp/study/WatchdogStudy.md`) has the watchdog incrementing and the owner
+   zeroing, stale at 30 (~60 s) — direction not independently confirmed live.
+
+
 ## Executive Summary
 
 The device implements a POSIX message-queue dispatch bus where:
