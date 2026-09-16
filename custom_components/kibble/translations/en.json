@@ -101,6 +101,9 @@
       },
       "dish_after": {
         "name": "Dish after feed"
+      },
+      "last_detection": {
+        "name": "Last detection"
       }
     },
     "media_player": {
@@ -222,6 +225,12 @@
       },
       "clips": {
         "name": "Stored clips"
+      },
+      "last_detection": {
+        "name": "Last detection"
+      },
+      "detections_today": {
+        "name": "Detections today"
       }
     },
     "switch": {
@@ -571,7 +580,7 @@
       "message": "{device_id} is not a Kibble feeder."
     },
     "schedule_writes_disabled": {
-      "message": "Schedule writing is disabled until the time encoding is confirmed \u2014 see docs/schedule."
+      "message": "Schedule writing is disabled until the time encoding is confirmed — see docs/schedule."
     },
     "unknown_schedule_entry": {
       "message": "No schedule entry with ID {entry_id}."
@@ -583,7 +592,7 @@
   "issues": {
     "feeder_unresponsive": {
       "title": "{name} is not responding",
-      "description": "The feeder has not answered {failures} polls in a row (most recent error: {error}). Entities keep showing their last known values, not live ones, until it recovers.\n\nCheck that the feeder is powered on and connected to Wi-Fi, and that its `kibbled` agent is running. This resolves itself \u2014 and this issue clears \u2014 as soon as a poll succeeds again."
+      "description": "The feeder has not answered {failures} polls in a row (most recent error: {error}). Entities keep showing their last known values, not live ones, until it recovers.\n\nCheck that the feeder is powered on and connected to Wi-Fi, and that its `kibbled` agent is running. This resolves itself — and this issue clears — as soon as a poll succeeds again."
     }
   }
 }

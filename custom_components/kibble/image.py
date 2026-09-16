@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import FeedRecord, ReviewFace
+from .api import DetectionEvent, FeedRecord, ReviewFace
 from .const import CONF_HOST, CONF_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
@@ -48,6 +48,7 @@ async def async_setup_entry(
     async_add_entities(
         [
             KibblePendingFaceImage(hass, entry),
+            KibbleLastDetectionImage(hass, entry),
             *(KibbleDishImage(hass, entry, description) for description in DISH_IMAGES),
         ]
     )
@@ -98,6 +99,55 @@ class KibblePendingFaceImage(KibbleEntity, ImageEntity):
         if review.cat is not None:
             attrs["cat"] = review.cat
         return attrs
+
+
+def _detection_url(entry: KibbleConfigEntry, name: str) -> str:
+    host = entry.data[CONF_HOST]
+    port = entry.data[CONF_PORT]
+    return f"http://{host}:{port}/events/{quote(name, safe='')}"
+
+
+class KibbleLastDetectionImage(KibbleEntity, ImageEntity):
+    """The crop from the feeder's most recent onboard-AI detection (`GET /events`).
+
+    Already a JPEG on the device, so unlike the dish snapshots this needs no H.264 transcode --
+    the URL is handed straight to Home Assistant. `image_last_updated` uses the detection's own
+    capture timestamp, so the frontend refetches exactly when a new detection lands rather than
+    on every poll."""
+
+    _attr_translation_key = "last_detection"
+
+    def __init__(self, hass: HomeAssistant, entry: KibbleConfigEntry) -> None:
+        KibbleEntity.__init__(self, entry.runtime_data, "last_detection_image")
+        ImageEntity.__init__(self, hass)
+        self._entry = entry
+        self._event: DetectionEvent | None = None
+        self._apply(entry.runtime_data.data.events)
+
+    def _apply(self, events: tuple[DetectionEvent, ...]) -> None:
+        event = max(events, key=lambda e: (e.ts, e.seq)) if events else None
+        if event is None or not event.image:
+            self._attr_image_url = None
+            self._attr_image_last_updated = None
+            self._event = None
+            return
+        self._event = event
+        self._attr_image_url = _detection_url(self._entry, event.image)
+        self._attr_image_last_updated = dt_util.utc_from_timestamp(event.ts)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        previous = self._attr_image_url
+        self._apply(self.coordinator.data.events)
+        if self._attr_image_url != previous:
+            self._cached_image = None
+        super()._handle_coordinator_update()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        if self._event is None:
+            return {}
+        return {"class": self._event.cls, "cat": self._event.cat}
 
 
 def _latest_dish_snapshot(

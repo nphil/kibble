@@ -80,6 +80,7 @@ from .api import (
     CatInfo,
     ClipInfo,
     CloudState,
+    DetectionEvent,
     FeederState,
     FeedRecord,
     IdentifyResult,
@@ -148,6 +149,7 @@ class KibbleData:
     pending_face_count: int
     clips: tuple[ClipInfo, ...]
     feeds: tuple[FeedRecord, ...]
+    events: tuple[DetectionEvent, ...]
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -276,6 +278,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         pending_face_count = len(await self.client.pending_faces())
         clips = tuple(await self.client.clips())
         feeds = tuple(await self.client.feeds())
+        events = tuple(await self.client.events())
         return KibbleData(
             state=state,
             schedule=schedule,
@@ -289,6 +292,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             pending_face_count=pending_face_count,
             clips=clips,
             feeds=feeds,
+            events=events,
         )
 
     def _handle_poll_success(self) -> None:

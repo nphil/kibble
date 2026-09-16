@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +24,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import ClipInfo, CloudState, FeederState, ScheduleEntry
+from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntry
 from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
@@ -207,6 +208,8 @@ async def async_setup_entry(
     entities.append(KibbleIdentificationScoreSensor(coordinator))
     entities.append(KibblePendingFacesSensor(coordinator))
     entities.append(KibbleClipsSensor(coordinator))
+    entities.append(KibbleLastDetectionSensor(coordinator))
+    entities.append(KibbleDetectionsTodaySensor(coordinator))
     async_add_entities(entities)
 
 
@@ -579,3 +582,89 @@ class KibbleClipsSensor(KibbleEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, list[dict[str, Any]]]:
         clips: tuple[ClipInfo, ...] = self.coordinator.data.clips
         return {"clips": [{"name": c.name, "bytes": c.bytes} for c in clips]}
+
+
+def _latest_detection(events: Sequence[DetectionEvent]) -> DetectionEvent | None:
+    """The newest detection, or `None` if the agent has seen none.
+
+    `GET /events` is oldest-first, but sort defensively rather than trusting order: the agent
+    rehydrates this list from disk at startup and a future change to that ordering should not
+    silently make this entity report a stale event."""
+    if not events:
+        return None
+    return max(events, key=lambda e: (e.ts, e.seq))
+
+
+class KibbleLastDetectionSensor(KibbleEntity, SensorEntity):
+    """When the feeder's onboard AI last saw something, with the vendor's own class.
+
+    Exists because a detection could previously be captured perfectly and remain completely
+    invisible in Home Assistant -- the agent held the events and the crops, but nothing surfaced
+    them. The state is the timestamp (so it renders as "2 minutes ago"); the class, the crop
+    filename and Kibble's own cat guess ride along as attributes."""
+
+    _attr_translation_key = "last_detection"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "last_detection")
+
+    @property
+    def native_value(self) -> datetime | None:
+        event = _latest_detection(self.coordinator.data.events)
+        if event is None or not event.ts:
+            return None
+        return dt_util.utc_from_timestamp(event.ts)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        event = _latest_detection(self.coordinator.data.events)
+        if event is None:
+            return {}
+        # score/pet_id are honestly absent until the vendor's ctrl process is replaced
+        # (docs/24-onboard-ai.md) -- reported as-is rather than filled in with a fake number.
+        return {
+            "class": event.cls,
+            "image": event.image,
+            "cat": event.cat,
+            "score": event.score,
+            "pet_id": event.pet_id,
+        }
+
+
+class KibbleDetectionsTodaySensor(KibbleEntity, SensorEntity):
+    """How many detections the agent has recorded since local midnight, by class.
+
+    Counts from the agent's own event list (capped at its newest 50), so a very busy day reports
+    "at least this many" rather than a true total -- stated in the attributes instead of being
+    quietly wrong."""
+
+    _attr_translation_key = "detections_today"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "detections_today")
+
+    def _today(self) -> list[DetectionEvent]:
+        start = dt_util.start_of_local_day()
+        return [
+            e
+            for e in self.coordinator.data.events
+            if e.ts and dt_util.utc_from_timestamp(e.ts) >= start
+        ]
+
+    @property
+    def native_value(self) -> int:
+        return len(self._today())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        today = self._today()
+        by_class: dict[str, int] = {}
+        for e in today:
+            by_class[e.cls] = by_class.get(e.cls, 0) + 1
+        return {
+            "by_class": by_class,
+            # True when the agent's own 50-event cap may be hiding older detections from today.
+            "capped": len(self.coordinator.data.events) >= 50,
+        }

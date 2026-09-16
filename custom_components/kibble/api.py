@@ -306,6 +306,40 @@ class ClipInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class DetectionEvent:
+    """One onboard-AI detection, as reported by `GET /events` (`agent/src/ai.rs`).
+
+    `cls` is the vendor's own class -- `visit` (a pet in frame), `eat` (feeding) or `face` (a
+    usable face crop). `image` is a filename for `GET /events/<name>`.
+
+    `score`, `pet_id` and `box` are honestly `None`: that metadata exists only inside a private
+    POSIX message queue delivered to the vendor's `ctrl` process (`docs/24-onboard-ai.md`), which
+    we cannot read without stealing its messages. They are modelled here so the shape does not
+    change when a future `ctrl` replacement can fill them in."""
+
+    seq: int
+    ts: int
+    cls: str
+    image: str | None
+    cat: str | None
+    score: float | None
+    pet_id: str | None
+
+    @classmethod
+    def from_json(cls_, data: dict[str, Any]) -> DetectionEvent:
+        score = data.get("score")
+        return cls_(
+            seq=int(data.get("seq") or 0),
+            ts=int(data.get("ts") or 0),
+            cls=str(data.get("class", "")),
+            image=data.get("image") or None,
+            cat=data.get("cat") or None,
+            score=float(score) if score is not None else None,
+            pet_id=str(data["pet_id"]) if data.get("pet_id") is not None else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FeedRecord:
     """One feed cycle's before/after dish-snapshot pair, as reported by `GET /feeds`
     (`agent/src/feed_capture.rs`'s own `FeedRecord`). `before`/`after` are filenames for
@@ -522,6 +556,11 @@ class KibbleClient:
 
     async def feeds(self) -> list[FeedRecord]:
         return [FeedRecord.from_json(f) for f in await self._request("GET", "/feeds")]
+
+    async def events(self) -> list[DetectionEvent]:
+        """`GET /events`: the agent's last 50 detections, oldest first. Rehydrated from disk on
+        agent startup, so this survives a `kibbled` restart."""
+        return [DetectionEvent.from_json(e) for e in await self._request("GET", "/events")]
 
     async def speak(self, pcm: bytes) -> dict:
         """`POST /speak`: plays `pcm` (raw signed-16-bit-LE/mono/16kHz, no container -- exactly
