@@ -58,6 +58,21 @@ async def async_get_config_entry_diagnostics(
                 "control_path": coordinator.control_path,
                 "loaded_platforms": [platform.value for platform in coordinator.loaded_platforms],
             },
+            "push": {
+                "connected": coordinator.push_connected,
+                "unsupported_by_agent": coordinator.push_unsupported,
+                "reconnects": coordinator.push_reconnects,
+                "seconds_since_last_frame": (
+                    None
+                    if coordinator.push_last_frame is None
+                    else round(hass.loop.time() - coordinator.push_last_frame, 1)
+                ),
+                "update_interval_seconds": (
+                    None
+                    if coordinator.update_interval is None
+                    else coordinator.update_interval.total_seconds()
+                ),
+            },
             "data": asdict(data) if data is not None else None,
         },
         TO_REDACT,

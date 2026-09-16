@@ -6,7 +6,7 @@ import logging
 import re
 
 import voluptuous as vol
-from homeassistant.const import Platform
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
@@ -297,6 +297,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _async_register_services(hass)
+
+    # Local push: started only after the poll above proved the HTTP API and every platform
+    # exists to receive frames. Torn down on unload and on HA stop (wled's pattern).
+    coordinator.async_start_push()
+    entry.async_on_unload(coordinator.async_cancel_push)
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, coordinator.async_stop_push)
+    )
     return True
 
 

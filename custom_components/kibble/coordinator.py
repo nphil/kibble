@@ -1,4 +1,26 @@
-"""Polling coordinator for a Kibble feeder.
+"""Coordinator for a Kibble feeder: local push over the agent's WebSocket, with the HTTP poll
+below as the fallback and the first-contact check.
+
+## Push (docs/33-local-push-design.md)
+
+After the first successful poll proves the HTTP API (`async_config_entry_first_refresh`,
+rule `test-before-setup`), `async_start_push` opens the agent's push socket (`push.py`) in a
+background task owned by the config entry. Mirrors `homeassistant.components.wled`'s
+`_use_websocket`/`listen` line for line: while the socket is up `update_interval` is `None`
+(no scheduled polls at all) and every frame lands through `async_set_updated_data`; the moment
+it drops, `update_interval` is restored, an immediate refresh is requested, and the task
+reconnects with jittered exponential backoff (1 s .. 60 s) for the life of the entry. One
+listen task at a time -- a second `async_start_push` while one is alive is a no-op.
+
+A dropped socket on its own never marks entities unavailable: the device may be fine and only
+the socket died (HA restart, Wi-Fi blip). The fallback poll that follows decides, under the
+exact policy below. Every received frame counts as a successful contact (resets the failure
+counter) so `binary_sensor.reachable`'s meaning is unchanged. While connected, a 10-minute
+`resync` asks the agent for a full snapshot -- one frame, far cheaper than a poll -- bounding
+staleness for any field the agent might fail to mark.
+
+An agent without push (older build; connection refused) is detected on the first attempt and
+leaves the coordinator in plain polling mode with a single info log, not an error.
 
 ## Availability policy: why one failed poll no longer blanks every entity
 
@@ -52,17 +74,19 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   its own `asyncio.Lock` (see `api.py`'s module docstring) -- there is only ever one Kibble
   request in flight against the feeder at a time, whether it originates from this coordinator's
   poll or from an entity's write (`kibble.feed`, a switch flip, ...); nothing here fans out
-  several requests to the same, or different, endpoints concurrently. Nothing in this module
-  opens a long-lived connection either: every call is a bounded, ordinary request/response,
-  never a stream or a poll held open past its own timeout.
+  several requests to the same, or different, endpoints concurrently. The one long-lived
+  connection is the push socket, and it is deliberately on a *different port and thread* on
+  the agent (`agent/src/push.rs`) so it can never hold the HTTP server's single connection slot.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 
@@ -71,9 +95,10 @@ from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.components.media_source import async_resolve_media, is_media_source_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -106,6 +131,7 @@ from .const import (
     ISSUE_FEEDER_UNRESPONSIVE,
     parse_vendor_pet_ids,
 )
+from .push import Frame, KibblePush, KibblePushClosed, KibblePushUnsupported, merge_frame
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +152,15 @@ CONSECUTIVE_FAILURES_FOR_UNAVAILABLE = 3
 
 # Cap on `UpdateFailed.retry_after`'s exponential backoff once the feeder is confirmed down.
 MAX_RETRY_AFTER = 60.0
+
+# Push reconnect backoff bounds (seconds), jittered -- see the module docstring. The floor is
+# short because the common drop is an agent restart (a few seconds); the cap keeps a feeder
+# that is genuinely off the network from being knocked on more than once a minute.
+PUSH_BACKOFF_MIN = 1.0
+PUSH_BACKOFF_MAX = 60.0
+# While connected, ask for a full snapshot this often: one small frame that bounds staleness
+# for any field the agent might fail to mark. Far cheaper than a poll cycle.
+PUSH_RESYNC_SECONDS = 600.0
 
 type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
@@ -272,14 +307,120 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # See the module docstring's availability policy.
         self.consecutive_failures = 0
         self.last_error: str | None = None
+        # Push channel (module docstring). `_push_task` is the single-connection guard:
+        # `async_start_push` is a no-op while it is alive.
+        self._push: KibblePush | None = None
+        self._push_task: asyncio.Task[None] | None = None
+        self.push_connected = False
+        self.push_reconnects = 0
+        self.push_last_frame: float | None = None
+        self.push_unsupported = False
 
     @property
     def feeder_reachable(self) -> bool:
-        """True iff the *most recent* poll succeeded outright -- stricter than `.available`
-        (`CoordinatorEntity.available`/`last_update_success`), which stays `True` through the
-        tolerance window described in the module docstring. Backs the disabled-by-default
-        "Feeder reachable" diagnostic binary sensor."""
+        """True iff the *most recent* contact (poll or push frame) succeeded outright --
+        stricter than `.available` (`CoordinatorEntity.available`/`last_update_success`), which
+        stays `True` through the tolerance window described in the module docstring. Backs the
+        disabled-by-default "Feeder reachable" diagnostic binary sensor."""
         return self.consecutive_failures == 0
+
+    # --- push ------------------------------------------------------------------------------
+
+    @callback
+    def async_start_push(self) -> None:
+        """Start the push listener as an entry-owned background task. Idempotent: one task."""
+        if self._push_task is not None and not self._push_task.done():
+            return
+        self._push_task = self.entry.async_create_background_task(
+            self.hass, self._push_loop(), name="kibble push"
+        )
+
+    @callback
+    def async_cancel_push(self) -> None:
+        """Entry unload: cancel the listener task. The task's own `finally` closes the socket
+        (`KibblePush.listen` closes on the way out), so nothing is left open."""
+        task, self._push_task = self._push_task, None
+        if task is not None:
+            task.cancel()
+        self._set_push_connected(False)
+
+    async def async_stop_push(self, _event: Event | None = None) -> None:
+        """HA stop: cancel and wait, then close the socket cleanly so the agent sees a close
+        frame rather than a reset."""
+        task, self._push_task = self._push_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self._push is not None:
+            await self._push.close()
+            self._push = None
+        self._set_push_connected(False)
+
+    def _set_push_connected(self, connected: bool) -> None:
+        if connected == self.push_connected:
+            return
+        self.push_connected = connected
+        # wled: "Stop polling as long as we have a websocket"; restore + refresh on drop.
+        self.update_interval = None if connected else timedelta(seconds=DEFAULT_SCAN_INTERVAL)
+
+    async def _push_loop(self) -> None:
+        """Connect, consume frames, reconnect with backoff. Runs for the life of the entry."""
+        backoff = PUSH_BACKOFF_MIN
+        while True:
+            push = KibblePush(async_get_clientsession(self.hass), self.entry.data[CONF_HOST])
+            self._push = push
+            try:
+                await self._consume(push)
+                backoff = PUSH_BACKOFF_MIN  # a real session ran; start fresh next time
+            except KibblePushUnsupported as err:
+                if not self.push_unsupported:
+                    _LOGGER.info("Feeder agent offers no push channel (%s); polling instead", err)
+                self.push_unsupported = True
+                return
+            except KibblePushClosed as err:
+                _LOGGER.log(
+                    logging.DEBUG if self.push_reconnects else logging.INFO,
+                    "Feeder push channel closed (%s); polling until it reconnects", err,
+                )
+            finally:
+                self._push = None
+                if self.push_connected:
+                    self._set_push_connected(False)
+                    # Pull data now rather than waiting a full fallback interval: the
+                    # existing availability policy decides whether the *feeder* is down.
+                    self.hass.async_create_task(self.async_request_refresh())
+            self.push_reconnects += 1
+            # Jittered exponential backoff, capped -- never a reconnect storm.
+            await asyncio.sleep(backoff + random.uniform(0, backoff / 2))
+            backoff = min(backoff * 2, PUSH_BACKOFF_MAX)
+
+    async def _consume(self, push: KibblePush) -> None:
+        last_resync = self.hass.loop.time()
+        async for frame in push.listen():
+            self.push_last_frame = self.hass.loop.time()
+            if frame.type == "hello":
+                continue
+            if frame.type in ("snapshot", "update"):
+                if not self.push_connected:
+                    self._set_push_connected(True)
+                self._apply_frame(frame)
+            if self.hass.loop.time() - last_resync >= PUSH_RESYNC_SECONDS:
+                await push.resync()
+                last_resync = self.hass.loop.time()
+
+    @callback
+    def _apply_frame(self, frame: Frame) -> None:
+        """One frame -> `KibbleData`, through the same parsers as the poll. A frame is a
+        successful contact: the failure counter resets exactly as a good poll would."""
+        if self.data is None:
+            return  # first refresh has not completed; the poll path will seed us
+        pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
+        data = merge_frame(self.data, frame)
+        if "events" in frame.fields:
+            data = replace(data, vendor_sightings=vendor_sightings(data.events, pet_ids))
+        self._handle_poll_success()
+        self.async_set_updated_data(data)
 
     async def _async_update_data(self) -> KibbleData:
         try:

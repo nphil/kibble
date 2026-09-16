@@ -4,12 +4,12 @@ rules:
     status: done
     comment: All kibble.* actions registered in async_setup_entry via _async_register_services.
   appropriate-polling:
-    status: done
+    status: exempt
     comment: |
-      DataUpdateCoordinator, update_interval=DEFAULT_SCAN_INTERVAL (10s) -- config_shm reads are
-      "nearly free" on-device (const.py); the limit is the feeder's single-client HTTP server,
-      not the poll rate. See coordinator.py's module docstring for the full reasoning, including
-      the new POLL_TIMEOUT/backoff behavior.
+      Push-based: the agent's WebSocket (port 8766, agent/src/push.rs) delivers every field
+      the moment it changes and the coordinator sets update_interval=None while it is
+      connected. The 45 s HTTP poll remains only as the fallback when the socket is down and
+      as the first-contact check (test-before-setup). docs/33-local-push-design.md.
   brands:
     status: exempt
     comment: |
