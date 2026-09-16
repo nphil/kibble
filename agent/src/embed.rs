@@ -118,18 +118,29 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// Tests run on parallel threads, and a `fork` on one thread inherits every fd the others
+    /// hold at that instant -- including a sibling test's script still open for writing in
+    /// [`script`]. That child then keeps the write fd until its own `exec` completes, and the
+    /// sibling's `exec` of that script fails with ETXTBSY ("Text file busy"). Holding this lock
+    /// from script creation through the spawn makes the two steps atomic across tests.
+    static SPAWN: Mutex<()> = Mutex::new(());
 
-    /// Writes a tiny `/bin/sh` script standing in for `kibble-embed` and returns its path --
-    /// these tests exercise `kibbled`'s own subprocess/parsing plumbing on the host (any Linux
-    /// box, no ARM/NPU/musl involved), not the real helper binary or a live model.
-    fn script(tag: &str, body: &str) -> std::path::PathBuf {
+    /// Writes a tiny `/bin/sh` script standing in for `kibble-embed`, runs [`extract_with`]
+    /// against it, and removes it -- these tests exercise `kibbled`'s own subprocess/parsing
+    /// plumbing on the host (any Linux box, no ARM/NPU/musl involved), not the real helper
+    /// binary or a live model.
+    fn run_script(tag: &str, body: &str, model: &Path, crop: &Path) -> Result<Embedding, EmbedError> {
+        let _guard = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("kibble-embed-test-{tag}-{}-{n}.sh", std::process::id()));
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        let result = extract_with(&path, model, crop);
+        fs::remove_file(&path).ok();
+        result
     }
 
     fn raw_bytes(feat: [f32; EMBED_DIM], prob: f32) -> Vec<u8> {
@@ -172,9 +183,7 @@ mod tests {
 
     #[test]
     fn extract_with_a_nonzero_exit_reports_exit_status_and_stderr() {
-        let helper = script("exit-nonzero", "echo 'boom' >&2\nexit 3\n");
-        let result = extract_with(&helper, Path::new("model"), Path::new("crop.jpg"));
-        fs::remove_file(&helper).ok();
+        let result = run_script("exit-nonzero", "echo 'boom' >&2\nexit 3\n", Path::new("model"), Path::new("crop.jpg"));
         match result {
             Err(EmbedError::ExitStatus { code: Some(3), stderr }) => {
                 assert!(stderr.contains("boom"));
@@ -185,9 +194,7 @@ mod tests {
 
     #[test]
     fn extract_with_wrong_length_stdout_is_a_bad_output_error() {
-        let helper = script("bad-len", "printf 'not enough bytes'\n");
-        let result = extract_with(&helper, Path::new("model"), Path::new("crop.jpg"));
-        fs::remove_file(&helper).ok();
+        let result = run_script("bad-len", "printf 'not enough bytes'\n", Path::new("model"), Path::new("crop.jpg"));
         match result {
             Err(EmbedError::BadOutputLen(n)) => assert_eq!(n, "not enough bytes".len()),
             other => panic!("expected BadOutputLen, got {other:?}"),
@@ -202,9 +209,7 @@ mod tests {
         // od turns the raw bytes into `\xHH`-escaped octal-dump form that `printf` can emit
         // byte-for-byte from a POSIX shell with no helper language (python/perl) required.
         let escaped: String = bytes.iter().map(|b| format!("\\{b:03o}")).collect();
-        let helper = script("ok", &format!("printf '{escaped}'\n"));
-        let result = extract_with(&helper, Path::new("model"), Path::new("crop.jpg")).unwrap();
-        fs::remove_file(&helper).ok();
+        let result = run_script("ok", &format!("printf '{escaped}'\n"), Path::new("model"), Path::new("crop.jpg")).unwrap();
         assert_eq!(result.feat[3], 42.0);
         assert_eq!(result.prob, 0.5);
     }
@@ -213,9 +218,12 @@ mod tests {
     fn extract_with_passes_model_and_crop_paths_as_the_two_arguments() {
         // `$1`/`$2` echoed back through stdout, then padded/truncated by the assertion logic
         // below to prove argv wiring without needing well-formed embedding bytes for this case.
-        let helper = script("argv", "printf '%s|%s' \"$1\" \"$2\" 1>&2\nexit 9\n");
-        let result = extract_with(&helper, Path::new("/alg/model.axmodel"), Path::new("/opt/kibble/faces/pending/1.jpg"));
-        fs::remove_file(&helper).ok();
+        let result = run_script(
+            "argv",
+            "printf '%s|%s' \"$1\" \"$2\" 1>&2\nexit 9\n",
+            Path::new("/alg/model.axmodel"),
+            Path::new("/opt/kibble/faces/pending/1.jpg"),
+        );
         match result {
             Err(EmbedError::ExitStatus { stderr, .. }) => {
                 assert_eq!(stderr, "/alg/model.axmodel|/opt/kibble/faces/pending/1.jpg");
