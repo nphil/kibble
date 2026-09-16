@@ -67,8 +67,9 @@ class KibblePushClosed(Exception):
 
 
 class KibblePushUnsupported(KibblePushClosed):
-    """The agent does not offer push at all (older build, or the port is refused) -- the
-    coordinator stays in polling mode without treating it as an error."""
+    """The agent answered but does not speak this protocol (HTTP handshake rejected, or a
+    `hello` with another `proto`). Permanent for that agent build: the coordinator stays in
+    polling mode and stops trying. A refused/unreachable port is NOT this -- see `listen`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,10 +162,14 @@ class KibblePush:
                 max_msg_size=MAX_FRAME_BYTES,
                 autoping=True,
             )
-        except (aiohttp.ClientConnectorError, aiohttp.WSServerHandshakeError) as err:
-            # Connection refused / no such service: an agent without push. Not an error.
-            raise KibblePushUnsupported(str(err)) from err
-        except (aiohttp.ClientError, TimeoutError) as err:
+        except aiohttp.WSServerHandshakeError as err:
+            # The port answered HTTP but refused the upgrade: an agent that is not ours or
+            # predates push. Permanent for this agent build -- the coordinator stops trying.
+            raise KibblePushUnsupported(f"handshake rejected: {err.status}") from err
+        except (aiohttp.ClientError, TimeoutError, OSError) as err:
+            # Includes "connection refused": also what a *restarting* agent looks like for a
+            # few seconds, so this is never treated as permanent -- the coordinator retries
+            # with backoff, and the fallback poll (plain HTTP) decides availability meanwhile.
             raise KibblePushClosed(f"connect failed: {err}") from err
 
         ws = self._ws

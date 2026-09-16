@@ -209,6 +209,23 @@ async def test_push_loop_falls_back_to_polling_and_refreshes_on_drop(monkeypatch
     coord.async_request_refresh.assert_awaited()
 
 
+async def test_connection_refused_is_retried_not_treated_as_unsupported(monkeypatch) -> None:
+    """A restarting agent refuses connections for a few seconds. That must reconnect, never
+    latch `push_unsupported` -- the exact regression seen live on the first deploy."""
+    import aiohttp
+    from kibble.push import KibblePush
+
+    class _Session:
+        async def ws_connect(self, *a, **k):
+            raise aiohttp.ClientConnectorError(Mock(), OSError(111, "Connection refused"))
+
+    push = KibblePush(_Session(), "h")
+    with pytest.raises(KibblePushClosed) as excinfo:
+        async for _ in push.listen():
+            pass
+    assert not isinstance(excinfo.value, KibblePushUnsupported)
+
+
 async def test_agent_without_push_leaves_polling_untouched(monkeypatch) -> None:
     coord = _bare_coordinator(monkeypatch, data=_data())
     monkeypatch.setattr(
