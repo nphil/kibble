@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -381,16 +381,34 @@ impl Cache {
 
     /// Writes via a temp file + rename so a crash mid-write can never leave a half-written,
     /// corrupt cache behind -- the last-known-good file survives until the new one is complete.
+    /// `fsync`s the temp file's data *and* the containing directory before returning: `/opt` is
+    /// flash (a UBIFS-on-UBI volume, `docs/design-agent.md`), and the boot script's respawn
+    /// loop can relaunch a crashed `kibbled` within 5 seconds (`docs/design-agent.md`'s own
+    /// `app_init.sh`) -- with nothing forcing this write past the page cache, a crash in that
+    /// window could lose a `scheduler.rs::claim_fire` record that had already returned `Ok`,
+    /// which is exactly the double-feed this project's whole design exists to prevent
+    /// (STUDY-schedule-encoding.md §11.1 item 4: record before dispense is only a real guarantee
+    /// if the record actually reaches durable storage before the dispense call fires).
     fn save(&self, path: &Path) -> io::Result<()> {
         let tmp = path.with_file_name(format!(
             "{}.tmp",
             path.file_name().and_then(|n| n.to_str()).unwrap_or("schedule.json")
         ));
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+        fs::create_dir_all(&dir)?;
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(self.to_json().as_bytes())?;
+            f.sync_all()?; // the data itself must be durable before the rename makes it visible
         }
-        fs::write(&tmp, self.to_json())?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        // Best-effort: makes the *rename* durable too (so a crash right after this call can
+        // never resurrect the pre-rename file), but the content itself is already safely on
+        // flash via the `sync_all()` above regardless of whether this succeeds.
+        if let Ok(dir_handle) = fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
     }
 
     fn to_json(&self) -> String {
