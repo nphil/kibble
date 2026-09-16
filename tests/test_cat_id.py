@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from kibble.api import DetectionEvent, IdentifyResult, KibbleError, ReviewFace
-from kibble.binary_sensor import PRESENCE_WINDOW, is_present
+from kibble.binary_sensor import PRESENCE_WINDOW, KibbleCatPresentBinarySensor, is_present, last_seen
 from kibble.const import parse_vendor_pet_ids
 from kibble.coordinator import KibbleCoordinator, VendorSighting, vendor_sightings
 from kibble.image import _image_url
@@ -222,6 +222,42 @@ def test_is_present_false_once_a_vendor_sighting_ages_out() -> None:
     old = _sighting("Kitty", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 1))
     assert is_present("Kitty", identify, (old,), _NOW) is False
 
+
+
+def test_last_seen_is_the_newest_of_both_sources() -> None:
+    identify = _identify("Kitty", _ts_seconds_ago(600))
+    sightings = (_sighting("Kitty", _ts_seconds_ago(90)), _sighting("Pancake", _ts_seconds_ago(10)))
+    seen = last_seen("Kitty", identify, sightings)
+    assert seen is not None and (_NOW - seen).total_seconds() == pytest.approx(90, abs=1)
+
+
+def test_last_seen_none_when_never_identified() -> None:
+    assert last_seen("Kitty", _identify("Pancake", _ts_seconds_ago(5)), ()) is None
+
+
+def test_cat_present_last_seen_attribute_prefers_a_newer_live_sighting_over_restored() -> None:
+    restored = _NOW.replace(hour=0, minute=0, second=0)  # earlier the same day
+    live = _sighting("Kitty", _ts_seconds_ago(30))
+    sensor = SimpleNamespace(
+        _cat_name="Kitty",
+        _restored_last_seen=restored,
+        coordinator=SimpleNamespace(data=SimpleNamespace(identify=_identify(None, None), vendor_sightings=(live,))),
+    )
+    sensor._live_last_seen = lambda: KibbleCatPresentBinarySensor._live_last_seen(sensor)
+    attrs = KibbleCatPresentBinarySensor.extra_state_attributes.fget(sensor)
+    assert attrs["last_seen"] == datetime.fromtimestamp(live.ts, tz=timezone.utc).isoformat()
+
+
+def test_cat_present_last_seen_attribute_falls_back_to_restored_with_no_live_sighting() -> None:
+    restored = datetime(2026, 9, 16, 10, 0, tzinfo=timezone.utc)
+    sensor = SimpleNamespace(
+        _cat_name="Kitty",
+        _restored_last_seen=restored,
+        coordinator=SimpleNamespace(data=SimpleNamespace(identify=_identify(None, None), vendor_sightings=())),
+    )
+    sensor._live_last_seen = lambda: KibbleCatPresentBinarySensor._live_last_seen(sensor)
+    attrs = KibbleCatPresentBinarySensor.extra_state_attributes.fget(sensor)
+    assert attrs["last_seen"] == restored.isoformat()
 
 # --- coordinator.vendor_sightings / const.parse_vendor_pet_ids --------------------------------
 

@@ -33,7 +33,8 @@ views:
             entity: binary_sensor.plant_room_cat_feeder_kitty_present
             primary: Kitty
             secondary: >-
-              {% if is_state(entity, 'on') %}At the bowl now{% else %}Last here {{ relative_time(states[entity].last_changed) }} ago{% endif %}
+              {% set seen = state_attr(entity, 'last_seen') %}
+              {% if is_state(entity, 'on') %}At the bowl now{% elif seen %}Last here {{ relative_time(seen | as_datetime) }} ago{% else %}Not seen yet{% endif %}
             icon: mdi:cat
             icon_color: teal
             tap_action:
@@ -49,7 +50,8 @@ views:
             entity: binary_sensor.plant_room_cat_feeder_pancake_present
             primary: Pancake
             secondary: >-
-              {% if is_state(entity, 'on') %}At the bowl now{% else %}Last here {{ relative_time(states[entity].last_changed) }} ago{% endif %}
+              {% set seen = state_attr(entity, 'last_seen') %}
+              {% if is_state(entity, 'on') %}At the bowl now{% elif seen %}Last here {{ relative_time(seen | as_datetime) }} ago{% else %}Not seen yet{% endif %}
             icon: mdi:cat
             icon_color: purple
             tap_action:
@@ -265,10 +267,10 @@ views:
     path: cats
     icon: mdi:cat
     type: sections
-    max_columns: 1
+    max_columns: 4
     sections:
       - type: grid
-        column_span: 1
+        column_span: 4
         cards:
           - type: custom:kibble-cats-card
             device_id: 8aac9123dc81c88408b6704f72ea583d

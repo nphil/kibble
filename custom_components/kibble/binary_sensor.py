@@ -14,6 +14,7 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util, slugify
 
 from .api import IdentifyResult
@@ -164,6 +165,19 @@ def is_present(
     )
 
 
+def last_seen(
+    cat_name: str, identify: IdentifyResult, sightings: Sequence[VendorSighting]
+) -> datetime | None:
+    """When `cat_name` was most recently identified, by either source, or None if never this
+    run. The same two inputs `is_present` latches on, so the two can never disagree."""
+    candidates = [s.ts for s in sightings if s.cat == cat_name]
+    if identify.cat == cat_name and identify.ts is not None:
+        candidates.append(identify.ts)
+    if not candidates:
+        return None
+    return dt_util.utc_from_timestamp(max(candidates))
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
@@ -267,10 +281,16 @@ class KibbleSettingBinarySensor(KibbleEntity, BinarySensorEntity):
         return None if value is None else bool(value)
 
 
-class KibbleCatPresentBinarySensor(KibbleEntity, BinarySensorEntity):
+class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEntity):
     """Whether this specific cat was the most recently identified visitor, recently enough to
     still call it present -- see [`is_present`]/[`PRESENCE_WINDOW`]. Created dynamically as
-    `GET /cats` reports new cats (`async_setup_entry` above)."""
+    `GET /cats` reports new cats (`async_setup_entry` above).
+
+    The `last_seen` attribute is what the dashboard's cat tiles show ("Last here 2 hours
+    ago"). The vendor's `track` sightings live only in the agent's memory, so after an agent
+    restart there is nothing to derive it from until the next visit; like
+    `KibbleVendorLastSeenPetSensor`, the last value is restored across that gap and any newer
+    live identification wins over it."""
 
     _attr_translation_key = "cat_present"
 
@@ -284,8 +304,32 @@ class KibbleCatPresentBinarySensor(KibbleEntity, BinarySensorEntity):
         # changes, and an already-capitalised or multi-word name is left alone.
         display = cat_name[:1].upper() + cat_name[1:] if cat_name else cat_name
         self._attr_translation_placeholders = {"cat_name": display}
+        self._restored_last_seen: datetime | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._live_last_seen() is not None:
+            return
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+        restored = last_state.attributes.get("last_seen")
+        if isinstance(restored, str):
+            self._restored_last_seen = dt_util.parse_datetime(restored)
+
+    def _live_last_seen(self) -> datetime | None:
+        data = self.coordinator.data
+        return last_seen(self._cat_name, data.identify, data.vendor_sightings)
 
     @property
     def is_on(self) -> bool:
         data = self.coordinator.data
         return is_present(self._cat_name, data.identify, data.vendor_sightings, dt_util.utcnow())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        live = self._live_last_seen()
+        seen = live
+        if seen is None or (self._restored_last_seen is not None and self._restored_last_seen > seen):
+            seen = self._restored_last_seen
+        return {"last_seen": seen.isoformat() if seen is not None else None}
