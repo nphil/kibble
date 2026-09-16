@@ -17,6 +17,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util, slugify
 
 from .api import IdentifyResult
+from .const import DEFAULT_SCAN_INTERVAL
 from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
 from .entity import KibbleEntity
 
@@ -28,9 +29,16 @@ PARALLEL_UPDATES = 0
 # a device-measured value -- see docs/27-cat-id.md's honesty section. Two independent sources
 # feed it: Kibble's own classifier (`GET /identify`, every enrolled cat) and the vendor's
 # on-device identifier (`track` detections, only for cats mapped through the `vendor_pet_ids`
-# option -- on this feeder that is the one cat enrolled in the Petkit app). Both are discrete,
-# event-driven identifications, not a dwell time, so each latches for this window.
-PRESENCE_WINDOW = timedelta(minutes=15)
+# option). Both are discrete, event-driven identifications, not a dwell time, so each latches
+# for this window.
+#
+# Sized to the delivery path, not to taste: a sighting reaches HA up to one poll late
+# (`DEFAULT_SCAN_INTERVAL`, 45 s), so a window shorter than one poll could expire before it is
+# ever displayed, and one exactly one poll long is visible for a single refresh at best. Two
+# polls plus slack is the smallest window that guarantees the entity turns on and stays on
+# across at least one full refresh. The check itself is a timestamp comparison at read time --
+# no polling, no timers, no load -- so nothing is saved by going lower.
+PRESENCE_WINDOW = timedelta(seconds=DEFAULT_SCAN_INTERVAL * 2 + 30)
 
 
 # Every boolean setting `agent/src/settings.rs` marks read-only. The three writable booleans
