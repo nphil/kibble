@@ -91,6 +91,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -185,6 +186,49 @@ const MAX_EVENTS: usize = 50;
 /// Where a watched crop is copied before the vendor's own pipeline can overwrite it in place
 /// (all three watched files are fixed, reused filenames -- the vendor does not rotate them).
 const EVENTS_DIR: &str = "/opt/kibble/events";
+
+/// A name is safe to join onto `EVENTS_DIR` if it has no path separators and doesn't spell a
+/// traversal -- every name this module itself generates already satisfies this (`poll_loop`'s
+/// own `{ts}-{class}.jpg`), but `GET /events/<file>`'s `name` comes from an HTTP client. Mirrors
+/// `faces.rs`'s identical check -- this project's established per-module convention (see also
+/// `feed_capture.rs`'s `is_safe_feed_file_name`) rather than one shared utility.
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && name != "." && name != ".."
+}
+
+#[derive(Debug)]
+pub enum EventFileError {
+    InvalidName,
+    NotFound,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for EventFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventFileError::InvalidName => write!(f, "invalid file name"),
+            EventFileError::NotFound => write!(f, "no such event file"),
+            EventFileError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// `GET /events/<file>`: the raw bytes of one detection crop `poll_loop` wrote to `EVENTS_DIR`
+/// (`Detection::image` already names the exact file, for every class -- `face`/`visit`/`eat`
+/// alike -- see the module doc's "what this module actually taps" section, and
+/// `scrypted-plugin/README.md`'s "Agent-side TODO"). Same path-safety rules as
+/// `faces::read_pending`: no traversal, no absolute paths (rejected by [`is_safe_name`]'s
+/// no-separator check before ever reaching `join`), serves only from `EVENTS_DIR`.
+pub fn read_event(name: &str) -> Result<Vec<u8>, EventFileError> {
+    if !is_safe_name(name) {
+        return Err(EventFileError::InvalidName);
+    }
+    match fs::read(Path::new(EVENTS_DIR).join(name)) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(EventFileError::NotFound),
+        Err(e) => Err(EventFileError::Io(e)),
+    }
+}
 
 pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -476,5 +520,46 @@ mod tests {
         feed.push("face", Some("1-Rashy.jpg".to_string()), Some("Rashy".to_string()));
         let inner = feed.inner.lock().unwrap();
         assert_eq!(inner.events.back().unwrap().cat.as_deref(), Some("Rashy"));
+    }
+
+    // --- GET /events/<file> path safety -------------------------------------------------------
+
+    #[test]
+    fn read_event_rejects_path_traversal() {
+        let err = read_event("../../etc/passwd").unwrap_err();
+        assert!(matches!(err, EventFileError::InvalidName));
+    }
+
+    #[test]
+    fn read_event_rejects_absolute_paths() {
+        let err = read_event("/etc/passwd").unwrap_err();
+        assert!(matches!(err, EventFileError::InvalidName));
+    }
+
+    #[test]
+    fn read_event_reports_not_found_for_a_missing_file() {
+        let err = read_event("2026-01-01-nope.jpg").unwrap_err();
+        assert!(matches!(err, EventFileError::NotFound | EventFileError::Io(_)));
+    }
+
+    #[test]
+    fn read_event_serves_a_real_file_written_by_the_poller() {
+        // Exercises the exact naming convention `poll_loop` uses, end to end, without needing
+        // the real device -- the file this module actually watches (`SAVE_FACE_JPG` etc.) is
+        // vendor-only, but the copy step (`fs::write` into `EVENTS_DIR`) is pure filesystem
+        // logic this test can drive directly.
+        let _ = fs::create_dir_all(EVENTS_DIR);
+        let name = format!("{}-visit-readtest.jpg", now_unix());
+        fs::write(Path::new(EVENTS_DIR).join(&name), b"fake-jpeg-bytes").unwrap();
+        assert_eq!(read_event(&name).unwrap(), b"fake-jpeg-bytes");
+        let _ = fs::remove_file(Path::new(EVENTS_DIR).join(&name));
+    }
+
+    #[test]
+    fn is_safe_name_rejects_empty_dot_and_dotdot() {
+        assert!(!is_safe_name(""));
+        assert!(!is_safe_name("."));
+        assert!(!is_safe_name(".."));
+        assert!(is_safe_name("1700000000-face.jpg"));
     }
 }

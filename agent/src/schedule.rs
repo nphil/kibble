@@ -1,11 +1,22 @@
 //! The feed schedule.
 //!
-//! The MCU owns firing; kibbled owns the only readable copy. STUDY-schedule.md §4 found three
-//! independent, mutually-reinforcing dead ends for reading a schedule back (`ctrl`'s own
-//! `dispatch_handler_ble_get_schedule` is a stub that always returns 0 and never touches the bus;
-//! `ble`'s 30-entry dispatch table has no "get schedule" counterpart; the MCU's CMD 0x04 ack
-//! carries only a one-byte result code, never content) — so this module's persisted cache, not a
-//! device read, is the source of truth for every `GET`.
+//! Persisted cache of every entry, its enabled state, and (via `scheduler.rs`) the duplicate-
+//! fire bookkeeping that makes a restart safe -- see that module's doc for the actual firing
+//! logic. This module owns: the HTTP-facing CRUD (`replace`/`add`/`remove`/`set_enabled`), the
+//! on-disk format (`/opt/kibble/schedule.json`), and the vendor-facing wire encoding.
+//!
+//! ## Who actually fires a feed
+//!
+//! STUDY-schedule-encoding.md §6-§8 settled a question this module's own doc used to leave open:
+//! the MCU is **not** an autonomous timer. `ctrl` zeroes any usable positive countdown before it
+//! reaches the wire (§6), and `ctrl` itself re-fetches "what's next" after every feed (§8) --
+//! textbook host-side-scheduler behaviour, not "delegate to the MCU and forget". So `kibbled`
+//! (`scheduler.rs`) is the real scheduler: it owns the clock and calls the already-proven
+//! `feed_ctrl` dispense path directly, at the appointed local time. The wire write this module
+//! still does on every mutation (`push`, below) is retained as a **cosmetic bookkeeping sync**
+//! only -- it keeps the device's own record consistent with what a real vendor write would look
+//! like (`time` always `0`, matching confirmed real-device behaviour), in case the app is ever
+//! used to read schedule status. It is not, and must never become, the trigger.
 //!
 //! Write semantics, mirrored from `ctrl` (STUDY-schedule.md §3.2): a write **replaces the whole
 //! table** — there is no single-entry add/delete on the wire — and every write re-sends the RTC
@@ -15,15 +26,20 @@
 //!
 //! An entry disabled in the cache is simply omitted from the wire table: `enable` is not a wire
 //! field (the 22-byte struct is fully accounted for without one), so "disabled" has no on-device
-//! representation to send — STUDY-schedule.md's own struct recovery found no room for it.
+//! representation to send — STUDY-schedule.md's own struct recovery found no room for it. The
+//! scheduler (`scheduler.rs`) independently skips a disabled entry too, so this stays consistent
+//! either way.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bus::{msg, Sender};
 use crate::http::{json_field, query_field};
+use crate::localtime::{self, Tz};
 
 /// Vendor's hard payload clamp (`bus::MAX_PAYLOAD` = 540 bytes) leaves room for exactly this many
 /// 22-byte entries after the 2-byte header (24*22 + 2 = 530 <= 540; a 25th entry would silently
@@ -63,32 +79,6 @@ pub fn parse_time_of_day(s: &str) -> Option<u16> {
 /// The inverse of [`parse_time_of_day`].
 pub fn format_time_of_day(minute_of_day: u16) -> String {
     format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
-}
-
-/// Converts one entry's local time-of-day into the wire `time` field sent to the MCU.
-///
-/// **Pending confirmation — see the project report.** STUDY-schedule.md §3.4 (this repo's own
-/// disassembly of `ctrl`'s schedule-entry builder) found that `ctrl` discards ("zeroes") any
-/// non-negative JSON `t` before it reaches the wire and only preserves a *negative* `t` verbatim
-/// — which does not match a plain minute-of-day passthrough for the ordinary case. Independently,
-/// `dwyschka/localkit`'s `Time::calculateLatest()` (a production Petkit-cloud reimplementation
-/// tuned against real D4SH units — the same model as this device) computes `t` as a positive
-/// count of seconds from "now" until this item's next occurrence, floored at 1, with its own
-/// comments describing empirically tuning that value to single-second accuracy against real
-/// observed firing behaviour. These two static sources disagree on whether a positive `t` is
-/// preserved (Localkit's model, implemented here) or discarded (this repo's disassembly) for the
-/// ordinary case. Do not use this in a live send with a non-empty table until that conflict is
-/// resolved and confirmed — a 0-entry table (no entries, hence no `time` field at all) is
-/// unaffected and safe regardless.
-pub fn wire_time_seconds_until(minute_of_day: u16, now_unix: u64) -> i32 {
-    const DAY_SECS: i64 = 86_400;
-    let now_second_of_day = (now_unix % DAY_SECS as u64) as i64;
-    let target_second_of_day = minute_of_day as i64 * 60;
-    let mut delta = target_second_of_day - now_second_of_day;
-    if delta <= 0 {
-        delta += DAY_SECS; // today's occurrence already passed (or is this instant) -> tomorrow
-    }
-    delta.clamp(1, i32::MAX as i64) as i32
 }
 
 /// The 4-byte RTC payload `ctrl` sends immediately before every schedule write (STUDY-schedule.md
@@ -210,13 +200,14 @@ fn parse_amount(obj: &str, key: &str) -> Result<u8, String> {
     Ok(n as u8)
 }
 
-/// Finds `"key": [ ... ]` and returns the raw text strictly between the brackets, respecting
-/// nested braces/brackets/strings so a comma inside a value never splits early.
-fn json_array_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+/// Finds `"key":` followed by `open` (`'['` or `'{'`) and returns the raw text strictly up to
+/// its matching close, respecting nested braces/brackets/strings so a comma inside a value never
+/// splits early. Shared by [`json_array_body`] (arrays) and [`json_object_body`] (objects).
+fn balanced_body<'a>(body: &'a str, key: &str, open: char) -> Option<&'a str> {
     let pat = format!("\"{key}\"");
     let after_key = &body[body.find(&pat)? + pat.len()..];
     let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let inner = after_colon.strip_prefix('[')?;
+    let inner = after_colon.strip_prefix(open)?;
     let mut depth = 1i32;
     let mut in_str = false;
     let mut escape = false;
@@ -239,6 +230,18 @@ fn json_array_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Finds `"key": [ ... ]` and returns the raw text strictly between the brackets.
+fn json_array_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    balanced_body(body, key, '[')
+}
+
+/// Finds `"key": { ... }` and returns the raw text strictly between the braces -- the
+/// object-shaped counterpart of [`json_array_body`], used for `fired` (keyed by arbitrary
+/// schedule entry ids, not a fixed field name).
+fn json_object_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    balanced_body(body, key, '{')
 }
 
 /// Splits the inside of a JSON array (as returned by [`json_array_body`]) into its top-level
@@ -276,6 +279,25 @@ fn split_top_level(inner: &str) -> Vec<&str> {
     out
 }
 
+/// Splits an object's inner content (as returned by [`json_object_body`]) into `(key, raw
+/// value)` pairs, for objects whose keys are arbitrary data (not fixed field names) -- e.g. the
+/// `fired` map, keyed by schedule entry id. Reuses [`split_top_level`]'s nesting/string-aware
+/// comma splitting, then peels the leading quoted key off each piece. Matches this file's (and
+/// the rest of the agent's) accepted hand-rolled-JSON limitation of not unescaping backslash
+/// sequences -- ids are trusted plain strings, exactly like every other id round-tripped through
+/// this project's own JSON writers.
+fn split_object_pairs(inner: &str) -> Vec<(&str, &str)> {
+    split_top_level(inner)
+        .into_iter()
+        .filter_map(|pair| {
+            let rest = pair.strip_prefix('"')?;
+            let (key, after_quote) = rest.split_once('"')?;
+            let value = after_quote.trim_start().strip_prefix(':')?.trim();
+            Some((key, value))
+        })
+        .collect()
+}
+
 /// Parses a top-level `{"entries":[...]}` body (shared by `PUT /schedule` and the on-disk cache).
 pub fn parse_entries(body: &str) -> Result<Vec<Entry>, String> {
     let inner = json_array_body(body, "entries").ok_or("missing \"entries\" array")?;
@@ -293,17 +315,59 @@ pub fn entry_id_from_query(query: &str) -> Option<&str> {
     query_field(query, "id").filter(|s| !s.is_empty())
 }
 
-/// The persisted cache: every entry kibbled knows about (enabled or not) plus when it last
-/// changed.
+/// What happened, or didn't, the one time the scheduler (`scheduler.rs`) evaluated one entry's
+/// one calendar-day occurrence. Persisted per entry in [`Cache::fired`] so a restart can never
+/// re-evaluate (and so never re-fire, nor retry) an occurrence already resolved either way --
+/// STUDY-schedule-encoding.md §11.1 items 3-4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Dispensed,
+    Missed,
+}
+
+impl Outcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Dispensed => "dispensed",
+            Outcome::Missed => "missed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Outcome> {
+        match s {
+            "dispensed" => Some(Outcome::Dispensed),
+            "missed" => Some(Outcome::Missed),
+            _ => None,
+        }
+    }
+}
+
+/// One entry's most recently resolved occurrence (see [`Outcome`]). Only the latest is kept --
+/// `scheduler.rs` never looks back more than one calendar day, so once an occurrence is resolved
+/// it is never revisited and older history has no bearing on correctness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiredRecord {
+    /// The local calendar date (`YYYY-MM-DD`) the resolved occurrence was due on.
+    pub date: String,
+    pub outcome: Outcome,
+    /// Unix time the resolution was recorded -- for observability only, never re-derived.
+    pub at_utc: u64,
+}
+
+/// The persisted cache: every entry kibbled knows about (enabled or not), when it last changed,
+/// and (`fired`) the scheduler's own per-entry duplicate-fire tracking -- all three share one
+/// file (`/opt/kibble/schedule.json`) and one lock ([`Schedule`]'s internal mutex) so an HTTP
+/// mutation and a scheduler tick can never race each other into a lost update.
 #[derive(Debug, Clone, PartialEq)]
 struct Cache {
     entries: Vec<Entry>,
     last_modified: u64,
+    fired: HashMap<String, FiredRecord>,
 }
 
 impl Cache {
     fn empty() -> Self {
-        Cache { entries: Vec::new(), last_modified: 0 }
+        Cache { entries: Vec::new(), last_modified: 0, fired: HashMap::new() }
     }
 
     fn load(path: &Path) -> io::Result<Self> {
@@ -331,18 +395,49 @@ impl Cache {
 
     fn to_json(&self) -> String {
         let entries: Vec<String> = self.entries.iter().map(Entry::to_json).collect();
+        let mut fired: Vec<(&String, &FiredRecord)> = self.fired.iter().collect();
+        fired.sort_by(|a, b| a.0.cmp(b.0)); // stable file contents; HashMap iteration order isn't
+        let fired_json: Vec<String> = fired
+            .iter()
+            .map(|(id, r)| {
+                format!(
+                    r#""{}":{{"date":"{}","outcome":"{}","at_utc":{}}}"#,
+                    id.escape_debug(),
+                    r.date.escape_debug(),
+                    r.outcome.as_str(),
+                    r.at_utc,
+                )
+            })
+            .collect();
         format!(
-            r#"{{"entries":[{}],"last_modified":{}}}"#,
+            r#"{{"entries":[{}],"last_modified":{},"fired":{{{}}}}}"#,
             entries.join(","),
             self.last_modified,
+            fired_json.join(","),
         )
     }
 
     fn parse(s: &str) -> Option<Self> {
         let entries = parse_entries(s).ok()?;
         let last_modified = json_field(s, "last_modified").and_then(|v| v.parse().ok()).unwrap_or(0);
-        Some(Cache { entries, last_modified })
+        let fired = json_object_body(s, "fired").map(parse_fired_map).unwrap_or_default();
+        Some(Cache { entries, last_modified, fired })
     }
+}
+
+/// Parses the inside of a `"fired": { ... }` object (see [`json_object_body`]) into entry-id ->
+/// [`FiredRecord`] pairs. A pair that doesn't parse cleanly is dropped rather than failing the
+/// whole cache load -- matches this file's existing "skip the piece, load has the rest" style.
+fn parse_fired_map(inner: &str) -> HashMap<String, FiredRecord> {
+    split_object_pairs(inner)
+        .into_iter()
+        .filter_map(|(id, value)| {
+            let date = json_field(value, "date")?.to_string();
+            let outcome = Outcome::parse(json_field(value, "outcome")?)?;
+            let at_utc = json_field(value, "at_utc")?.parse().ok()?;
+            Some((id.to_string(), FiredRecord { date, outcome, at_utc }))
+        })
+        .collect()
 }
 
 /// Errors from a schedule mutation: `Invalid` is the caller's fault (bad input, unknown id, over
@@ -352,102 +447,170 @@ pub enum Error {
     Internal(String),
 }
 
-/// Owns the cache and the bus handle used to push it. One instance per running agent.
+/// Owns the cache and the bus handle used to push it. One instance, shared (via `Arc`) between
+/// the HTTP handler and `scheduler.rs`'s background tick thread -- the internal mutex is what
+/// makes `claim_fire` the single atomic gate STUDY-schedule-encoding.md §11.1 items 3-4 need.
 pub struct Schedule {
     path: PathBuf,
-    cache: Cache,
+    cache: Mutex<Cache>,
 }
 
 impl Schedule {
     pub fn load(path: PathBuf) -> io::Result<Self> {
         let cache = Cache::load(&path)?;
-        Ok(Self { path, cache })
+        Ok(Self { path, cache: Mutex::new(cache) })
     }
 
-    /// Body for `GET /schedule`. Always the cache -- see the module docs for why that is
-    /// authoritative -- with an explicit flag so a client never mistakes it for a live device
-    /// read.
-    pub fn snapshot_json(&self) -> String {
-        let entries: Vec<String> = self.cache.entries.iter().map(Entry::to_json).collect();
+    /// Test-only: seeds a schedule with `entries` and no bus dependency, for `scheduler.rs`'s
+    /// tests, which need a `Schedule` to exist without ever touching the bus (matching this
+    /// project's convention of not exercising real hardware from unit tests).
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(path: PathBuf, entries: Vec<Entry>) -> Self {
+        let cache = Cache { entries, last_modified: 0, fired: HashMap::new() };
+        cache.save(&path).expect("seed_for_test: write schedule cache");
+        Schedule { path, cache: Mutex::new(cache) }
+    }
+
+    /// Body for `GET /schedule`: the cache -- see the module docs for why that is authoritative
+    /// -- plus, per entry, when it will next fire and what happened the last time the scheduler
+    /// (`scheduler.rs`) resolved it.
+    pub fn snapshot_json(&self, tz: &Tz, now_utc: i64, scheduler_enabled: bool) -> String {
+        let guard = self.cache.lock().unwrap();
+        let entries: Vec<String> = guard
+            .entries
+            .iter()
+            .map(|e| entry_status_json(e, guard.fired.get(&e.id), tz, now_utc))
+            .collect();
         format!(
-            r#"{{"entries":[{}],"count":{},"last_modified":{},"source":"agent_cache","note":"the MCU has no schedule read-back (STUDY-schedule.md \u00a74); this is kibbled's own record of the last table it sent"}}"#,
+            r#"{{"entries":[{}],"count":{},"last_modified":{},"scheduler_enabled":{},"source":"agent_cache","note":"the MCU has no schedule read-back (STUDY-schedule.md \u00a74); entries are kibbled's own record, and (STUDY-schedule-encoding.md \u00a711) kibbled itself -- not the MCU -- is what actually fires each one at its local time"}}"#,
             entries.join(","),
-            self.cache.entries.len(),
-            self.cache.last_modified,
+            guard.entries.len(),
+            guard.last_modified,
+            scheduler_enabled,
         )
     }
 
+    /// Every entry, cloned out -- so a caller (the scheduler tick loop) can iterate without
+    /// holding the lock across a subsequent bus call or dispense.
+    pub fn entries_snapshot(&self) -> Vec<Entry> {
+        self.cache.lock().unwrap().entries.clone()
+    }
+
+    /// The last occurrence resolved for `entry_id`, if any.
+    pub fn fired_record(&self, entry_id: &str) -> Option<FiredRecord> {
+        self.cache.lock().unwrap().fired.get(entry_id).cloned()
+    }
+
+    /// Atomically checks whether `entry_id`'s occurrence on `date` (or any *later* date) has
+    /// already been resolved and, if not, durably records `outcome` for it before returning --
+    /// see `scheduler.rs`'s module doc for why this exact ordering (record before dispense) is
+    /// the safety-critical property here. Only the single most recent resolved date is kept per
+    /// entry (`fired` is keyed by entry id alone), so this compares lexicographically against
+    /// `date` (ISO `YYYY-MM-DD` sorts correctly as plain strings) rather than for exact equality
+    /// -- `scheduler.rs` evaluates *both* yesterday and today's occurrence every tick, in that
+    /// order, and an exact-equality check would let resolving today's occurrence "forget" that
+    /// yesterday's was already independently resolved (and vice versa on the next tick),
+    /// re-triggering it. Monotonic dates make "already resolved" mean "at or before the latest
+    /// date this entry has ever resolved", which is exactly what "never look back" requires.
+    /// `Ok(true)` means this call is the one that newly claimed the occurrence (the caller
+    /// should act on `outcome` only in that case, and only once); `Ok(false)` means an earlier
+    /// tick, an earlier process, or a racing thread already resolved this date or a later one.
+    pub fn claim_fire(&self, entry_id: &str, date: &str, outcome: Outcome, at_utc: u64) -> io::Result<bool> {
+        let mut guard = self.cache.lock().unwrap();
+        if guard.fired.get(entry_id).is_some_and(|r| r.date.as_str() >= date) {
+            return Ok(false);
+        }
+        let mut next = guard.clone();
+        next.fired.insert(entry_id.to_string(), FiredRecord { date: date.to_string(), outcome, at_utc });
+        next.save(&self.path)?;
+        *guard = next;
+        Ok(true)
+    }
+
     /// `PUT /schedule` — replaces the whole table.
-    pub fn replace(&mut self, entries: Vec<Entry>, ble: &Sender, now: u64) -> Result<(), Error> {
+    pub fn replace(&self, entries: Vec<Entry>, ble: &Sender, now: u64) -> Result<(), Error> {
         if entries.len() > MAX_ENTRIES {
             return Err(Error::Invalid(cap_error(entries.len())));
         }
-        self.persist_then_push(Cache { entries, last_modified: now }, ble, now)
+        self.persist_then_push(entries, ble, now)
     }
 
     /// `POST /schedule/entry` — adds one entry, then resends the whole table.
-    pub fn add(&mut self, entry: Entry, ble: &Sender, now: u64) -> Result<(), Error> {
-        if self.cache.entries.iter().any(|e| e.id == entry.id) {
-            return Err(Error::Invalid(format!("entry id {:?} already exists", entry.id)));
-        }
-        if self.cache.entries.len() >= MAX_ENTRIES {
-            return Err(Error::Invalid(cap_error(self.cache.entries.len() + 1)));
-        }
-        let mut entries = self.cache.entries.clone();
-        entries.push(entry);
-        self.persist_then_push(Cache { entries, last_modified: now }, ble, now)
+    pub fn add(&self, entry: Entry, ble: &Sender, now: u64) -> Result<(), Error> {
+        let entries = {
+            let guard = self.cache.lock().unwrap();
+            if guard.entries.iter().any(|e| e.id == entry.id) {
+                return Err(Error::Invalid(format!("entry id {:?} already exists", entry.id)));
+            }
+            if guard.entries.len() >= MAX_ENTRIES {
+                return Err(Error::Invalid(cap_error(guard.entries.len() + 1)));
+            }
+            let mut entries = guard.entries.clone();
+            entries.push(entry);
+            entries
+        };
+        self.persist_then_push(entries, ble, now)
     }
 
     /// `DELETE /schedule/entry?id=` — removes one entry, then resends the whole table.
-    pub fn remove(&mut self, id: &str, ble: &Sender, now: u64) -> Result<(), Error> {
-        if !self.cache.entries.iter().any(|e| e.id == id) {
-            return Err(Error::Invalid(format!("no schedule entry with id {id:?}")));
-        }
-        let entries: Vec<Entry> = self.cache.entries.iter().filter(|e| e.id != id).cloned().collect();
-        self.persist_then_push(Cache { entries, last_modified: now }, ble, now)
+    pub fn remove(&self, id: &str, ble: &Sender, now: u64) -> Result<(), Error> {
+        let entries = {
+            let guard = self.cache.lock().unwrap();
+            if !guard.entries.iter().any(|e| e.id == id) {
+                return Err(Error::Invalid(format!("no schedule entry with id {id:?}")));
+            }
+            guard.entries.iter().filter(|e| e.id != id).cloned().collect()
+        };
+        self.persist_then_push(entries, ble, now)
     }
 
     /// `POST /schedule/entry/enabled` — flips one entry's enabled flag, then resends the whole
     /// table (a disabled entry is simply omitted from the wire array).
-    pub fn set_enabled(&mut self, id: &str, enabled: bool, ble: &Sender, now: u64) -> Result<(), Error> {
-        if !self.cache.entries.iter().any(|e| e.id == id) {
-            return Err(Error::Invalid(format!("no schedule entry with id {id:?}")));
-        }
-        let mut entries = self.cache.entries.clone();
-        for e in entries.iter_mut() {
-            if e.id == id {
-                e.enabled = enabled;
+    pub fn set_enabled(&self, id: &str, enabled: bool, ble: &Sender, now: u64) -> Result<(), Error> {
+        let entries = {
+            let guard = self.cache.lock().unwrap();
+            if !guard.entries.iter().any(|e| e.id == id) {
+                return Err(Error::Invalid(format!("no schedule entry with id {id:?}")));
             }
-        }
-        self.persist_then_push(Cache { entries, last_modified: now }, ble, now)
+            let mut entries = guard.entries.clone();
+            for e in entries.iter_mut() {
+                if e.id == id {
+                    e.enabled = enabled;
+                }
+            }
+            entries
+        };
+        self.persist_then_push(entries, ble, now)
     }
 
     /// Writes the cache first -- so a crash mid-send still leaves the intent recorded -- then
-    /// pushes it to the device.
-    fn persist_then_push(&mut self, cache: Cache, ble: &Sender, now: u64) -> Result<(), Error> {
-        cache
-            .save(&self.path)
-            .map_err(|e| Error::Internal(format!("save schedule cache: {e}")))?;
-        self.cache = cache;
+    /// pushes it to the device. Re-reads `fired` fresh under the same lock that commits
+    /// `entries` (rather than accepting a pre-built `Cache`), so a concurrent `scheduler.rs`
+    /// `claim_fire` landing between an entries-mutation's validation step and this call can never
+    /// be lost.
+    fn persist_then_push(&self, entries: Vec<Entry>, ble: &Sender, now: u64) -> Result<(), Error> {
+        {
+            let mut guard = self.cache.lock().unwrap();
+            let cache = Cache { entries, last_modified: now, fired: guard.fired.clone() };
+            cache.save(&self.path).map_err(|e| Error::Internal(format!("save schedule cache: {e}")))?;
+            *guard = cache;
+        }
         self.push(ble, now)
     }
 
     /// Re-sends the RTC then the full (enabled-only) wire table, mirroring `ctrl`
-    /// (STUDY-schedule.md §3.2).
+    /// (STUDY-schedule.md §3.2). The wire `time` field is always `0` now: STUDY-schedule-
+    /// encoding.md §6/§11 confirms the real device zeroes any non-negative `time` before it ever
+    /// reaches the MCU, so this write's only remaining purpose is cosmetic bookkeeping sync with
+    /// vendor behaviour -- `scheduler.rs`, not this table, is what actually fires a feed.
     fn push(&self, ble: &Sender, now: u64) -> Result<(), Error> {
         ble.send(msg::BLE_SET_RTC, &rtc_payload(now))
             .map_err(|e| Error::Internal(format!("RTC send failed: {e}")))?;
-        let wire: Vec<WireEntry> = self
-            .cache
-            .entries
+        let entries = self.entries_snapshot();
+        let wire: Vec<WireEntry> = entries
             .iter()
             .filter(|e| e.enabled)
-            .map(|e| WireEntry {
-                id: e.id.clone(),
-                amount_l: e.amount_l,
-                amount_r: e.amount_r,
-                time: wire_time_seconds_until(e.minute_of_day, now),
-            })
+            .map(|e| WireEntry { id: e.id.clone(), amount_l: e.amount_l, amount_r: e.amount_r, time: 0 })
             .collect();
         let payload = encode_table(&wire).map_err(Error::Invalid)?;
         ble.send(msg::BLE_SET_SCHEDULE, &payload)
@@ -455,9 +618,33 @@ impl Schedule {
     }
 }
 
+/// One entry's `GET /schedule` JSON, including scheduler-derived fields (`next_fire_utc`,
+/// `last_fired_*`) -- kept separate from [`Entry::to_json`] (the on-disk persistence shape,
+/// which has no business knowing about timezones or "now").
+fn entry_status_json(e: &Entry, fired: Option<&FiredRecord>, tz: &Tz, now_utc: i64) -> String {
+    let next_fire_json = if e.enabled {
+        localtime::next_occurrence_utc(tz, e.minute_of_day, now_utc).to_string()
+    } else {
+        "null".to_string()
+    };
+    let (last_date_json, last_outcome_json) = match fired {
+        Some(r) => (format!("\"{}\"", r.date.escape_debug()), format!("\"{}\"", r.outcome.as_str())),
+        None => ("null".to_string(), "null".to_string()),
+    };
+    format!(
+        r#"{{"id":"{}","time":"{}","amount_l":{},"amount_r":{},"enabled":{},"next_fire_utc":{next_fire_json},"last_fired_date":{last_date_json},"last_fired_outcome":{last_outcome_json}}}"#,
+        e.id.escape_debug(),
+        format_time_of_day(e.minute_of_day),
+        e.amount_l,
+        e.amount_r,
+        e.enabled,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // --- entry encode/decode round-trip -------------------------------------------------------
 
@@ -585,9 +772,10 @@ mod tests {
     }
 
     #[test]
-    fn wire_time_round_trips_to_the_same_time_of_day() {
-        // Whatever the eventual encoding, format_time_of_day(minute_of_day) must be independent
-        // of "now" -- only the wire value (tested separately, pending live confirmation) varies.
+    fn format_and_parse_time_of_day_round_trip() {
+        // Pure HH:MM <-> minute-of-day conversion, independent of "now" or any timezone -- the
+        // wire `time` field itself is now always 0 (STUDY-schedule-encoding.md §11); the real
+        // local-time math lives in `scheduler.rs`/`localtime.rs`.
         for minute in [0u16, 1, 60, 719, 720, 1439] {
             assert_eq!(parse_time_of_day(&format_time_of_day(minute)), Some(minute));
         }
@@ -675,6 +863,7 @@ mod tests {
                 enabled: false,
             }],
             last_modified: 1_700_000_000,
+            fired: HashMap::new(),
         };
         let parsed = Cache::parse(&cache.to_json()).unwrap();
         assert_eq!(parsed, cache);
@@ -701,6 +890,7 @@ mod tests {
                 enabled: true,
             }],
             last_modified: 42,
+            fired: HashMap::new(),
         };
         cache.save(&path).unwrap();
         assert_eq!(Cache::load(&path).unwrap(), cache);
@@ -717,27 +907,191 @@ mod tests {
         assert_eq!(entry_id_from_query("id="), None);
     }
 
-    // --- wire time (candidate encoding; see doc comment on wire_time_seconds_until) -----------
+    // --- json_object_body / split_object_pairs ------------------------------------------------
 
     #[test]
-    fn wire_time_counts_seconds_to_the_next_occurrence_today() {
-        // now = 08:00:00 exactly, target 09:00 -> 3600s away.
-        let now = 8 * 3600;
-        assert_eq!(wire_time_seconds_until(9 * 60, now), 3600);
+    fn json_object_body_extracts_nested_object_text() {
+        let body = r#"{"entries":[],"fired":{"a":{"date":"2026-09-16","outcome":"dispensed","at_utc":1},"b":{"date":"2026-09-15","outcome":"missed","at_utc":2}},"last_modified":0}"#;
+        let inner = json_object_body(body, "fired").unwrap();
+        assert_eq!(
+            inner,
+            r#""a":{"date":"2026-09-16","outcome":"dispensed","at_utc":1},"b":{"date":"2026-09-15","outcome":"missed","at_utc":2}"#
+        );
     }
 
     #[test]
-    fn wire_time_rolls_to_tomorrow_once_today_has_passed() {
-        // now = 08:00:00, target 07:00 (already passed today) -> 23h away, not negative.
-        let now = 8 * 3600;
-        assert_eq!(wire_time_seconds_until(7 * 60, now), 23 * 3600);
+    fn json_object_body_missing_key_is_none() {
+        assert_eq!(json_object_body(r#"{"entries":[]}"#, "fired"), None);
     }
 
     #[test]
-    fn wire_time_is_floored_at_one_not_zero() {
-        // now exactly on the target minute -> due right now, still must not encode as 0/negative.
-        let now = 8 * 3600; // 08:00:00
-        let v = wire_time_seconds_until(8 * 60, now);
-        assert!(v >= 1, "must never be 0 or negative for a non-negative delta: got {v}");
+    fn split_object_pairs_splits_arbitrary_keys() {
+        let inner = r#""a":{"x":1},"b":{"y":2}"#;
+        assert_eq!(split_object_pairs(inner), vec![("a", r#"{"x":1}"#), ("b", r#"{"y":2}"#)]);
+    }
+
+    #[test]
+    fn split_object_pairs_on_empty_object_is_empty() {
+        assert_eq!(split_object_pairs(""), Vec::<(&str, &str)>::new());
+    }
+
+    // --- Outcome / FiredRecord persistence ----------------------------------------------------
+
+    #[test]
+    fn outcome_round_trips_through_its_string_form() {
+        assert_eq!(Outcome::parse(Outcome::Dispensed.as_str()), Some(Outcome::Dispensed));
+        assert_eq!(Outcome::parse(Outcome::Missed.as_str()), Some(Outcome::Missed));
+        assert_eq!(Outcome::parse("bogus"), None);
+    }
+
+    #[test]
+    fn cache_with_fired_records_round_trips_through_json() {
+        let mut fired = HashMap::new();
+        fired.insert(
+            "breakfast".to_string(),
+            FiredRecord { date: "2026-09-16".into(), outcome: Outcome::Dispensed, at_utc: 1_789_594_000 },
+        );
+        fired.insert(
+            "dinner".to_string(),
+            FiredRecord { date: "2026-09-15".into(), outcome: Outcome::Missed, at_utc: 1_789_500_000 },
+        );
+        let cache = Cache { entries: Vec::new(), last_modified: 5, fired };
+        let parsed = Cache::parse(&cache.to_json()).unwrap();
+        assert_eq!(parsed, cache);
+    }
+
+    #[test]
+    fn cache_with_no_fired_key_at_all_parses_as_empty() {
+        // Forward compatibility with a cache file written before this field existed.
+        let parsed = Cache::parse(r#"{"entries":[],"last_modified":0}"#).unwrap();
+        assert_eq!(parsed.fired, HashMap::new());
+    }
+
+    // --- claim_fire: the atomic record-before-dispense gate ---------------------------------
+
+    #[test]
+    fn claim_fire_first_call_for_an_occurrence_claims_it() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-claim-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let schedule = Schedule::seed_for_test(path.clone(), Vec::new());
+        let claimed = schedule.claim_fire("breakfast", "2026-09-16", Outcome::Dispensed, 1_789_594_000).unwrap();
+        assert!(claimed, "the first call for a fresh occurrence must claim it");
+        let record = schedule.fired_record("breakfast").unwrap();
+        assert_eq!(record.date, "2026-09-16");
+        assert_eq!(record.outcome, Outcome::Dispensed);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_fire_is_durably_recorded_before_returning() {
+        // Proves the record survives even if the process is dropped immediately after -- i.e.
+        // the disk write, not just an in-memory flag, completes before `claim_fire` returns.
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-durable-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        {
+            let schedule = Schedule::seed_for_test(path.clone(), Vec::new());
+            assert!(schedule.claim_fire("breakfast", "2026-09-16", Outcome::Dispensed, 1).unwrap());
+        } // `schedule` dropped here -- nothing further flushes anything.
+        let reloaded = Schedule::load(path.clone()).unwrap();
+        let record = reloaded.fired_record("breakfast").unwrap();
+        assert_eq!(record.date, "2026-09-16");
+        assert_eq!(record.outcome, Outcome::Dispensed);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_fire_same_occurrence_twice_only_claims_once() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-dup-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let schedule = Schedule::seed_for_test(path.clone(), Vec::new());
+        assert!(schedule.claim_fire("breakfast", "2026-09-16", Outcome::Dispensed, 1).unwrap());
+        // Same entry, same date -- a second tick, or a restart re-evaluating the same day, must
+        // never re-claim it (STUDY-schedule-encoding.md §11.1 item 3).
+        assert!(!schedule.claim_fire("breakfast", "2026-09-16", Outcome::Missed, 2).unwrap());
+        // And the original outcome is untouched by the rejected second call.
+        assert_eq!(schedule.fired_record("breakfast").unwrap().outcome, Outcome::Dispensed);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_fire_a_later_date_for_the_same_entry_claims_fresh() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-nextday-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let schedule = Schedule::seed_for_test(path.clone(), Vec::new());
+        assert!(schedule.claim_fire("breakfast", "2026-09-16", Outcome::Dispensed, 1).unwrap());
+        assert!(schedule.claim_fire("breakfast", "2026-09-17", Outcome::Dispensed, 2).unwrap());
+        assert_eq!(schedule.fired_record("breakfast").unwrap().date, "2026-09-17");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Regression: `scheduler.rs`'s `tick()` resolves *both* yesterday's and today's occurrence
+    /// every cycle, in that order, for the same entry id. An exact-date-equality check here
+    /// once let resolving today "forget" that yesterday was already independently resolved
+    /// (`fired` keeps only the one latest record per entry), letting a later tick re-claim --
+    /// and re-dispense -- an occurrence already settled. The fix compares dates monotonically.
+    #[test]
+    fn claim_fire_does_not_allow_reclaiming_an_earlier_date_once_a_later_one_is_resolved() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-monotonic-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let schedule = Schedule::seed_for_test(path.clone(), Vec::new());
+        assert!(schedule.claim_fire("breakfast", "2026-01-14", Outcome::Missed, 1).unwrap());
+        assert!(schedule.claim_fire("breakfast", "2026-01-15", Outcome::Dispensed, 2).unwrap());
+        // Re-checking the *earlier* date (exactly what a later tick's "yesterday" candidate
+        // does) must not be treated as fresh just because the record has since moved on.
+        assert!(!schedule.claim_fire("breakfast", "2026-01-14", Outcome::Dispensed, 3).unwrap());
+        let record = schedule.fired_record("breakfast").unwrap();
+        assert_eq!(record.date, "2026-01-15", "the later resolution must survive untouched");
+        assert_eq!(record.outcome, Outcome::Dispensed);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_fire_two_threads_racing_the_same_occurrence_only_one_wins() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-race-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let schedule = Arc::new(Schedule::seed_for_test(path.clone(), Vec::new()));
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let schedule = Arc::clone(&schedule);
+                std::thread::spawn(move || {
+                    schedule.claim_fire("breakfast", "2026-09-16", Outcome::Dispensed, 1_000 + i).unwrap()
+                })
+            })
+            .collect();
+        let claimed_count = handles.into_iter().map(|h| h.join().unwrap()).filter(|&claimed| claimed).count();
+        assert_eq!(claimed_count, 1, "exactly one of the racing threads must have claimed the occurrence");
+        let _ = fs::remove_file(&path);
+    }
+
+    // --- entries_snapshot / snapshot_json -----------------------------------------------------
+
+    #[test]
+    fn entries_snapshot_reflects_current_entries() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-snapshot-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let entries = vec![Entry { id: "a".into(), minute_of_day: 90, amount_l: 1, amount_r: 1, enabled: true }];
+        let schedule = Schedule::seed_for_test(path.clone(), entries.clone());
+        assert_eq!(schedule.entries_snapshot(), entries);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_json_includes_next_fire_and_scheduler_fields() {
+        let path = std::env::temp_dir().join(format!("kibble-sched-test-snapjson-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let entries = vec![
+            Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true },
+            Entry { id: "off".into(), minute_of_day: 8 * 60, amount_l: 1, amount_r: 1, enabled: false },
+        ];
+        let schedule = Schedule::seed_for_test(path.clone(), entries);
+        let tz = localtime::DEVICE_TZ;
+        let now = tz.local_to_utc(localtime::Civil { year: 2026, month: 1, day: 15 }, 6 * 3600);
+        let json = schedule.snapshot_json(&tz, now, false);
+        assert!(json.contains(r#""scheduler_enabled":false"#));
+        assert!(json.contains(r#""id":"morning""#));
+        assert!(json.contains("\"next_fire_utc\":"), "enabled entry must carry a next-fire value");
+        assert!(json.contains(r#""id":"off""#));
+        assert!(json.contains(r#""next_fire_utc":null"#), "a disabled entry never fires");
+        let _ = fs::remove_file(&path);
     }
 }

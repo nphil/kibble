@@ -7,8 +7,11 @@
 //!                                   subset only
 //!   POST   /feed                    {"hopper": 1|2|"both", "amount": N, "id": "..."}  dispense
 //!   POST   /feed/cancel             stop a dispense in progress
-//!   GET    /schedule                kibbled's cached copy of the feed schedule (the MCU has no
-//!                                   read-back -- see schedule.rs)
+//!   GET    /schedule                kibbled's cached copy of the feed schedule plus, per entry,
+//!                                   its next local fire time and last resolved outcome -- see
+//!                                   schedule.rs/scheduler.rs (the MCU has no schedule read-back;
+//!                                   kibbled itself, not the MCU, is what actually fires a feed,
+//!                                   disabled by default behind `KIBBLE_SCHEDULER_ENABLED`)
 //!   PUT    /schedule                {"entries": [...]}  replace the whole table
 //!   POST   /schedule/entry          {"time": "HH:MM", "amount_l": N, "amount_r": N,
 //!                                   "id": "...", "enabled": bool}  add one entry
@@ -37,6 +40,8 @@
 //!                                   score/pet_id/box are honestly null -- see ai.rs's module doc
 //!   GET    /events/stream?since=N   long-poll for detections past sequence N (empty array on
 //!                                   timeout, ~25s)
+//!   GET    /events/<file>           one detection's raw crop bytes (`image/jpeg`), for every
+//!                                   class (`face`/`visit`/`eat`) -- `Detection.image` names it
 //!   GET    /faces/pending           pending face crops awaiting a human label (see faces.rs)
 //!   GET    /faces/pending/<name>    one pending crop's raw JPEG bytes
 //!   POST   /faces/label             {"name": "...", "cat": "..."}  moves a pending crop into
@@ -97,10 +102,12 @@ mod g711;
 mod http;
 mod md5;
 mod persist;
+mod localtime;
 mod rfc3640;
 mod ring;
 mod rtsp;
 mod schedule;
+mod scheduler;
 mod settings;
 mod state;
 mod wifi;
@@ -149,8 +156,10 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
     let ble_adv = advertise::BleAdv::spawn()
         .unwrap_or_else(|e| die(&format!("open ble_adv queue: {e}")));
-    let mut schedule = Schedule::load(PathBuf::from(schedule::CACHE_PATH))
-        .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH)));
+    let schedule = Arc::new(
+        Schedule::load(PathBuf::from(schedule::CACHE_PATH))
+            .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH))),
+    );
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| die(&format!("bind {bind}: {e}")));
 
     // Scans every labelled crop on disk and computes/caches any embedding not already cached --
@@ -185,8 +194,37 @@ fn main() {
     cloud::spawn_reconciler();
     persist::spawn_reconciler(Arc::clone(&shm));
     wifi::spawn_reconciler();
+
+    // Disabled by default -- see `scheduler.rs`'s module doc. Only when explicitly enabled do we
+    // even open the second bus sender the tick thread dispenses through.
+    let scheduler_enabled = scheduler::enabled_from_env();
+    if scheduler_enabled {
+        let scheduler_ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
+            .unwrap_or_else(|e| die(&format!("open ble queue for scheduler: {e}")));
+        scheduler::spawn(Arc::clone(&schedule), scheduler_ble);
+        eprintln!(
+            "kibbled: scheduler ENABLED ({}=1) -- will dispense directly at each enabled entry's local time",
+            scheduler::ENV_ENABLED
+        );
+    } else {
+        eprintln!("kibbled: scheduler disabled (default) -- set {}=1 to enable", scheduler::ENV_ENABLED);
+    }
+
     let _ = http::serve(listener, |req| {
-        route(req, &shm, &ble, &ble_adv, &mut schedule, &feeds, &ai_feed, &capture, &tail, &speaker_owner, &gallery)
+        route(
+            req,
+            &shm,
+            &ble,
+            &ble_adv,
+            &schedule,
+            scheduler_enabled,
+            &feeds,
+            &ai_feed,
+            &capture,
+            &tail,
+            &speaker_owner,
+            &gallery,
+        )
     });
 }
 
@@ -200,7 +238,8 @@ fn route(
     shm: &Shm,
     ble: &Sender,
     ble_adv: &BleAdv,
-    schedule: &mut Schedule,
+    schedule: &Schedule,
+    scheduler_enabled: bool,
     feeds: &rtsp::Feeds,
     ai_feed: &ai::Feed,
     capture: &feed_capture::FeedCapture,
@@ -226,13 +265,16 @@ fn route(
         ("GET", "/streams") => Response::Json(rtsp::streams_json(feeds)),
         ("GET", "/cloud") => Response::Json(cloud::status_json()),
         ("POST", "/cloud") => cloud_write(req),
-        ("GET", "/schedule") => Response::Json(schedule.snapshot_json()),
-        ("PUT", "/schedule") => put_schedule(req, schedule, ble),
-        ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble),
-        ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble),
-        ("POST", "/schedule/entry/enabled") => post_schedule_entry_enabled(req, schedule, ble),
+        ("GET", "/schedule") => Response::Json(schedule_status_json(schedule, scheduler_enabled)),
+        ("PUT", "/schedule") => put_schedule(req, schedule, ble, scheduler_enabled),
+        ("POST", "/schedule/entry") => post_schedule_entry(req, schedule, ble, scheduler_enabled),
+        ("DELETE", "/schedule/entry") => delete_schedule_entry(query, schedule, ble, scheduler_enabled),
+        ("POST", "/schedule/entry/enabled") => {
+            post_schedule_entry_enabled(req, schedule, ble, scheduler_enabled)
+        }
         ("GET", "/events") => Response::Json(ai_feed.snapshot_json()),
         ("GET", "/events/stream") => events_stream(query, ai_feed),
+        ("GET", p) if p.starts_with("/events/") => events_file_get(&p["/events/".len()..]),
         ("GET", "/faces/pending") => faces_pending_list(),
         ("GET", p) if p.starts_with("/faces/pending/") => {
             faces_pending_get(&p["/faces/pending/".len()..])
@@ -267,6 +309,18 @@ fn route(
 fn events_stream(query: &str, ai_feed: &ai::Feed) -> Response {
     let since: u64 = http::query_field(query, "since").and_then(|v| v.parse().ok()).unwrap_or(0);
     Response::Json(ai_feed.wait_since(since, ai::LONG_POLL_TIMEOUT))
+}
+
+/// `GET /events/<file>`: one detection crop's raw bytes -- mirrors `faces_pending_get` exactly
+/// (same path-safety rules, same content type; see `ai::read_event`'s doc for why this route
+/// exists: `Detection.image` names files here for every class, not just `face`).
+fn events_file_get(name: &str) -> Response {
+    match ai::read_event(name) {
+        Ok(bytes) => Response::Blob("image/jpeg", bytes),
+        Err(ai::EventFileError::InvalidName) => Response::BadRequest("invalid file name".into()),
+        Err(ai::EventFileError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
 }
 
 fn faces_pending_list() -> Response {
@@ -589,31 +643,36 @@ fn send_feed(ble: &Sender, f: FeedCtrl) -> Response {
     }
 }
 
-fn put_schedule(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+fn put_schedule(req: &Request, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
     let entries = match schedule::parse_entries(&req.body_str()) {
         Ok(v) => v,
         Err(e) => return Response::BadRequest(e),
     };
-    schedule_result(schedule.replace(entries, ble, schedule::now_unix()), schedule)
+    schedule_result(schedule.replace(entries, ble, schedule::now_unix()), schedule, scheduler_enabled)
 }
 
-fn post_schedule_entry(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+fn post_schedule_entry(req: &Request, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
     let entry = match schedule::parse_entry(&req.body_str()) {
         Ok(e) => e,
         Err(e) => return Response::BadRequest(e),
     };
-    schedule_result(schedule.add(entry, ble, schedule::now_unix()), schedule)
+    schedule_result(schedule.add(entry, ble, schedule::now_unix()), schedule, scheduler_enabled)
 }
 
-fn delete_schedule_entry(query: &str, schedule: &mut Schedule, ble: &Sender) -> Response {
+fn delete_schedule_entry(query: &str, schedule: &Schedule, ble: &Sender, scheduler_enabled: bool) -> Response {
     let id = match schedule::entry_id_from_query(query) {
         Some(id) => id,
         None => return Response::BadRequest("missing ?id=".into()),
     };
-    schedule_result(schedule.remove(id, ble, schedule::now_unix()), schedule)
+    schedule_result(schedule.remove(id, ble, schedule::now_unix()), schedule, scheduler_enabled)
 }
 
-fn post_schedule_entry_enabled(req: &Request, schedule: &mut Schedule, ble: &Sender) -> Response {
+fn post_schedule_entry_enabled(
+    req: &Request,
+    schedule: &Schedule,
+    ble: &Sender,
+    scheduler_enabled: bool,
+) -> Response {
     let id = match json_field(&req.body_str(), "id").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
         None => return Response::BadRequest("missing \"id\"".into()),
@@ -622,16 +681,24 @@ fn post_schedule_entry_enabled(req: &Request, schedule: &mut Schedule, ble: &Sen
         Some(v) => v != "false",
         None => return Response::BadRequest("missing \"enabled\"".into()),
     };
-    schedule_result(schedule.set_enabled(&id, enabled, ble, schedule::now_unix()), schedule)
+    schedule_result(schedule.set_enabled(&id, enabled, ble, schedule::now_unix()), schedule, scheduler_enabled)
+}
+
+/// `GET /schedule`'s body: the cache plus, per entry, its next local fire time and last
+/// resolved outcome -- see `schedule::Schedule::snapshot_json`. `now_utc`/[`localtime::DEVICE_TZ`]
+/// are computed fresh on every call (never cached), matching `scheduler.rs`'s own "always
+/// recompute from the current wall clock" rule.
+fn schedule_status_json(schedule: &Schedule, scheduler_enabled: bool) -> String {
+    schedule.snapshot_json(&localtime::DEVICE_TZ, schedule::now_unix() as i64, scheduler_enabled)
 }
 
 /// Shared success/error -> HTTP mapping for every schedule mutation: on success, echo the fresh
 /// cache so a client sees the effect immediately with no extra `GET`; `Invalid` is a 400 (the
 /// caller's fault -- bad input, unknown id, over the cap), `Internal` is a 500 (ours -- cache I/O,
 /// bus send).
-fn schedule_result(result: Result<(), schedule::Error>, schedule: &Schedule) -> Response {
+fn schedule_result(result: Result<(), schedule::Error>, schedule: &Schedule, scheduler_enabled: bool) -> Response {
     match result {
-        Ok(()) => Response::Json(schedule.snapshot_json()),
+        Ok(()) => Response::Json(schedule_status_json(schedule, scheduler_enabled)),
         Err(schedule::Error::Invalid(m)) => Response::BadRequest(m),
         Err(schedule::Error::Internal(m)) => Response::Error(m),
     }
