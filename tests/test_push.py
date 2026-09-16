@@ -1,4 +1,4 @@
-"""Local push (`push.py` + the coordinator's listen loop; docs/33-local-push-design.md).
+"""Local push (`push.py` + the coordinator's listen loop; docs/33-local-push.md).
 
 Pinned here, each on the observable contract rather than the plumbing:
 
