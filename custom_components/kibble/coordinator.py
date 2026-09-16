@@ -663,17 +663,24 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.client.wifi_forget(ssid)
         await self.async_request_refresh()
 
+    # The face-store writes use `async_refresh`, not `async_request_refresh`: the latter is
+    # debounced, so it returns before the new data exists. The cats card reads its own write
+    # the moment the service call resolves (re-querying `kibble/cats` for the sample counts and
+    # `kibble/faces/pending` for the queue), and with a debounced refresh it read the *previous*
+    # snapshot -- a crop visibly moved into a cat's gallery while that cat still claimed
+    # "0 samples". Hand-labelling is a handful of calls, not a burst, so coalescing buys
+    # nothing here.
     async def async_label_face(self, crop_id: str, cat: str) -> None:
         await self.client.label_face(crop_id, cat)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def async_unlabel_face(self, crop_id: str, cat: str) -> None:
         await self.client.unlabel_face(crop_id, cat)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def async_add_cat(self, name: str) -> None:
         await self.client.add_cat(name)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def async_identify_now(self) -> IdentifyResult:
         """Force an immediate `GET /identify` (bypassing the poll cache) and refresh so the

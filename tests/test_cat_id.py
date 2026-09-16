@@ -109,15 +109,15 @@ async def test_select_option_wraps_a_kibble_error_as_a_home_assistant_error() ->
 
 
 def _fake_coordinator(client: AsyncMock) -> SimpleNamespace:
-    return SimpleNamespace(client=client, async_request_refresh=AsyncMock())
+    return SimpleNamespace(client=client, async_refresh=AsyncMock())
 
 
-async def test_async_label_face_labels_then_requests_a_refresh() -> None:
+async def test_async_label_face_labels_then_refreshes_immediately() -> None:
     client = AsyncMock()
     fake_self = _fake_coordinator(client)
     await KibbleCoordinator.async_label_face(fake_self, "1-5.jpg", "Kitty")
     client.label_face.assert_awaited_once_with("1-5.jpg", "Kitty")
-    fake_self.async_request_refresh.assert_awaited_once()
+    fake_self.async_refresh.assert_awaited_once()
 
 
 async def test_async_unlabel_face_is_the_exact_inverse_call_shape() -> None:
@@ -128,7 +128,7 @@ async def test_async_unlabel_face_is_the_exact_inverse_call_shape() -> None:
     fake_self = _fake_coordinator(client)
     await KibbleCoordinator.async_unlabel_face(fake_self, "1-5.jpg", "Kitty")
     client.unlabel_face.assert_awaited_once_with("1-5.jpg", "Kitty")
-    fake_self.async_request_refresh.assert_awaited_once()
+    fake_self.async_refresh.assert_awaited_once()
 
 
 
