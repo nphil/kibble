@@ -385,6 +385,20 @@ fn build_sdp(base_url: &str, sps: &[u8], pps: &[u8], backchannel: bool) -> Strin
 /// interframes.
 const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a blocked write to a playing session's socket is tolerated before giving up on that
+/// session. Was 5s; raised after a live capture during a real Wi-Fi/USB-adapter hiccup (this
+/// feeder's USB Wi-Fi dongle re-enumerates roughly every ~190s, confirmed in `dmesg`) measured
+/// *simultaneous* multi-second write stalls across every path off the device at once -- both
+/// direct RTSP mounts, the Scrypted rebroadcast, and even a 127.0.0.1 loopback HTTP request --
+/// up to 13.3s for a single event, longer for a chained one. `ring.rs` buffers 12-20+s of
+/// history, so a write that unblocks inside that window can still resume from something close to
+/// current; the old 5s timeout instead killed the TCP connection *during* the hiccup, which is
+/// what forced Scrypted's Rebroadcast to fully reconnect (and HomeKit, watching through it, to
+/// need a manual restart) for a stall the ring had already ridden out. 30s clears every stall
+/// actually measured with real margin while still bounding how long a genuinely dead peer -- not
+/// just a hiccupping one -- can hold one of only [`MAX_SESSIONS_PER_STREAM`] slots.
+const PLAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Stream RTP over the same connection until the client tears down or disconnects. Runs entirely
 /// on this one thread: frame delivery is paced by this session's `Subscription::recv` timeout, and
 /// the control-socket check (keepalive/teardown) rides along on a much coarser timer so it never
@@ -399,7 +413,7 @@ fn stream_media(
     session_id: &str,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(PLAY_WRITE_TIMEOUT))?;
 
     let mut video_seq: u16 = 0;
     let mut audio_seq: u16 = 0;
