@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntryState
 from kibble.api import (
     CatInfo,
@@ -489,6 +490,19 @@ async def test_ws_faces_upload_maps_an_unknown_cat_to_not_found() -> None:
     )
     assert connection.send_error.call_args.args[1] == ERR_NOT_FOUND
     connection.send_result.assert_not_called()
+
+
+async def test_ws_faces_upload_rejects_malformed_base64_without_calling_the_agent() -> None:
+    coordinator = _fake_coordinator()
+    coordinator.async_upload_face_sample = AsyncMock()
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+    await ws_faces_upload.__wrapped__(
+        hass, connection, {"id": 16, "entry_id": "e1", "cat": "Kitty", "jpeg_b64": "not-base64!!"}
+    )
+    assert connection.send_error.call_args.args[1] == websocket_api.ERR_INVALID_FORMAT
+    connection.send_result.assert_not_called()
+    coordinator.async_upload_face_sample.assert_not_awaited()
 
 
 async def test_ws_faces_delete_sample_calls_the_coordinator_with_cat_and_name() -> None:

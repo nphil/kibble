@@ -7,6 +7,7 @@ the rest of this suite -- a `SimpleNamespace` stand-in for the aiohttp `Request`
 
 from __future__ import annotations
 
+import time
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -145,6 +146,20 @@ async def test_get_404s_when_no_track_image_is_paired() -> None:
     entry = _fake_entry(client)
     resp = await view_get(entry, kind="track", name="123")
     assert resp.status == HTTPStatus.NOT_FOUND
+
+
+async def test_get_track_kind_does_not_cache_before_the_pairing_window_settles() -> None:
+    """A `track` image's pairing (`websocket._track_pair`) can still change until
+    `ts + TRACK_PAIR_LOOKAHEAD_SECONDS`: a later, closer `eat`/`visit` recorded after this
+    exact request could still join the window and become the new answer for the same `ts`.
+    Caching it as immutable this early would let a browser keep serving a stale pairing
+    forever, even once the agent itself would answer differently."""
+    client = AsyncMock(track_image_bytes=AsyncMock(return_value=b"\xff\xd8live-jpeg"))
+    entry = _fake_entry(client)
+    recent_ts = int(time.time())
+    resp = await view_get(entry, kind="track", name=str(recent_ts))
+    assert resp.status == HTTPStatus.OK
+    assert resp.headers["Cache-Control"] == "no-store"
 
 
 async def test_get_sample_kind_calls_the_client_with_both_cat_and_name() -> None:

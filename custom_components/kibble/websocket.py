@@ -18,6 +18,7 @@ agent's own JSON result unwrapped. `_send_agent_error` is their shared failure m
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -383,7 +384,14 @@ async def ws_faces_upload(
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
-    jpeg = base64.b64decode(msg["jpeg_b64"], validate=True)
+    try:
+        jpeg = base64.b64decode(msg["jpeg_b64"], validate=True)
+    except binascii.Error as err:
+        # A malformed envelope, not an agent rejection -- the agent never sees this request.
+        # Caught here (not left to `websocket_api`'s generic handler) so a bad payload gets a
+        # clean `invalid_format` error instead of an "Unknown error" logged with a traceback.
+        connection.send_error(msg["id"], websocket_api.ERR_INVALID_FORMAT, str(err))
+        return
     try:
         result = await coordinator.async_upload_face_sample(msg["cat"], jpeg)
     except KibbleError as err:

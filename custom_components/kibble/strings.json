@@ -147,6 +147,9 @@
       "schedule_card_state": {
         "name": "Schedule card state"
       },
+      "next_feed": {
+        "name": "Next feed"
+      },
       "move_sensitivity": {
         "name": "Motion detection sensitivity"
       },
@@ -648,6 +651,9 @@
     },
     "no_pending_face": {
       "message": "No pending face to label right now."
+    },
+    "invalid_jpeg_data": {
+      "message": "The uploaded photo data isn't valid: {error}"
     }
   },
   "issues": {

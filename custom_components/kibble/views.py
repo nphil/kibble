@@ -7,14 +7,15 @@ directly, so it needs a request HA itself fetches and forwards. `kind` selects w
 store `name` (and, for `sample`, `cat`) names -- `event`/`pending`/`sample/<cat>`/`track` are
 already-JPEG passthroughs through `api.py`'s `*_bytes` methods (`track`'s `name` is a `track`
 detection's unix `ts`, not a filename -- the agent re-resolves and serves whichever `eat`/
-`visit` it judges paired with that timestamp live, so this never caches a stale pairing);
-`feed` is the one exception: `agent/src/feed_capture.rs` stores a raw H.264 keyframe, not a
-JPEG, so that case reuses `image.py`'s existing ffmpeg decode instead of a client byte-fetch.
+`visit` it judges paired with that timestamp live); `feed` is the one exception:
+`agent/src/feed_capture.rs` stores a raw H.264 keyframe, not a JPEG, so that case reuses
+`image.py`'s existing ffmpeg decode instead of a client byte-fetch.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from http import HTTPStatus
 
 from aiohttp import web
@@ -24,8 +25,24 @@ from homeassistant.config_entries import ConfigEntryState
 from .api import KibbleError, KibbleNotFoundError
 from .const import DOMAIN
 from .image import _feed_snapshot_url, _h264_keyframe_to_jpeg
+from .websocket import TRACK_PAIR_LOOKAHEAD_SECONDS
 
 CACHE_CONTROL = "private, max-age=31536000, immutable"
+
+
+def _track_cache_control(ts: int) -> str:
+    """A `track` image's live pairing (`websocket._track_pair`) can still change until
+    `ts + TRACK_PAIR_LOOKAHEAD_SECONDS`: a closer `eat`/`visit` recorded after this exact
+    request could still join the window and become the new answer for the same `ts`. Caching
+    today's answer as immutable before that window has fully elapsed would let a browser keep
+    serving a stale -- possibly wrong -- pairing forever, for the life of the cache, even
+    after the agent itself would now answer differently. Once the window has fully elapsed no
+    future event can ever join it, so the pairing is provably final and safe to cache exactly
+    like every other passthrough kind."""
+    if time.time() - ts < TRACK_PAIR_LOOKAHEAD_SECONDS:
+        return "no-store"
+    return CACHE_CONTROL
+
 
 # Mirrors `agent/src/faces.rs`/`ai.rs`'s own `is_safe_name`: no path separator, no leading dot
 # (rules out `.`/`..`/hidden-file games). Checked here too so a bad name 404s before ever
@@ -67,6 +84,7 @@ class KibbleImageView(HomeAssistantView):
             return web.Response(status=HTTPStatus.NOT_FOUND)
 
         client = entry.runtime_data.client
+        cache_control = CACHE_CONTROL
         try:
             if kind == "event":
                 jpeg: bytes | None = await client.event_bytes(name)
@@ -76,6 +94,7 @@ class KibbleImageView(HomeAssistantView):
                 jpeg = await client.sample_bytes(cat, name)
             elif kind == "track" and name.isdigit():
                 jpeg = await client.track_image_bytes(int(name))
+                cache_control = _track_cache_control(int(name))
             elif kind == "feed":
                 jpeg = await _h264_keyframe_to_jpeg(hass, _feed_snapshot_url(entry, name))
             else:
@@ -90,5 +109,5 @@ class KibbleImageView(HomeAssistantView):
             # decode failure as `None`, not an exception (see its own doc comment).
             return web.Response(status=HTTPStatus.NOT_FOUND)
         return web.Response(
-            body=jpeg, content_type="image/jpeg", headers={"Cache-Control": CACHE_CONTROL}
+            body=jpeg, content_type="image/jpeg", headers={"Cache-Control": cache_control}
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import re
 
@@ -526,8 +527,20 @@ def _async_register_services(hass: HomeAssistant) -> None:
             raise_agent_action_failed("Unlabel face", err)
 
     async def handle_upload_face_sample(call: ServiceCall) -> None:
+        try:
+            jpeg = base64.b64decode(call.data[ATTR_JPEG_B64], validate=True)
+        except binascii.Error as err:
+            # A malformed payload, not an agent rejection -- the agent never sees this call.
+            # Checked before resolving a device so a bad `jpeg_b64` value fails the same way
+            # regardless of which feeder (if any) would have handled it, and gets a clean,
+            # translated validation error instead of the base64 module's own uncaught
+            # exception in the log.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_jpeg_data",
+                translation_placeholders={"error": str(err)},
+            ) from err
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        jpeg = base64.b64decode(call.data[ATTR_JPEG_B64], validate=True)
         try:
             await coordinator.async_upload_face_sample(call.data[ATTR_CAT], jpeg)
         except KibbleError as err:

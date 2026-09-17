@@ -203,6 +203,7 @@ async def async_setup_entry(
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
     entities.append(KibbleScheduleSensor(coordinator))
     entities.append(KibbleScheduleCardStateSensor(coordinator))
+    entities.append(KibbleNextFeedSensor(coordinator))
     entities.append(KibbleCloudConnectionSensor(coordinator))
     entities.append(KibbleControlPathSensor(coordinator))
     entities.append(KibbleWifiNetworkSensor(coordinator))
@@ -274,10 +275,49 @@ class KibbleScheduleSensor(KibbleEntity, SensorEntity):
                     "amount_l": e.amount_l,
                     "amount_r": e.amount_r,
                     "enabled": e.enabled,
+                    "next_fire": _iso_or_none(e.next_fire_utc),
                 }
                 for e in schedule.entries
             ],
             "last_modified": schedule.last_modified,
+        }
+
+
+def _iso_or_none(ts: int | None) -> str | None:
+    return dt_util.utc_from_timestamp(ts).isoformat() if ts is not None else None
+
+
+def next_feed_at(entries: Sequence[ScheduleEntry]) -> int | None:
+    """The soonest fire across enabled entries, straight from kibbled's own scheduler (which
+    already knows about the entry's `since_utc`, so a just-added entry whose time passed today
+    correctly answers tomorrow). `None` when nothing is enabled."""
+    fires = [e.next_fire_utc for e in entries if e.enabled and e.next_fire_utc is not None]
+    return min(fires) if fires else None
+
+
+class KibbleNextFeedSensor(KibbleEntity, SensorEntity):
+    """When the next scheduled feed will happen -- a real timestamp, so the dashboard can say
+    "tomorrow 5:25 PM" instead of parroting the first entry's clock time, and automations can
+    trigger on it. Unknown while no entry is enabled; `paused`/`entries` tell why."""
+
+    _attr_translation_key = "next_feed"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "next_feed")
+
+    @property
+    def native_value(self) -> datetime | None:
+        ts = next_feed_at(self.coordinator.data.schedule.entries)
+        return dt_util.utc_from_timestamp(ts) if ts is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        entries = self.coordinator.data.schedule.entries
+        return {
+            "enabled_count": sum(1 for e in entries if e.enabled),
+            "paused_count": sum(1 for e in entries if not e.enabled),
+            "times": [e.time for e in sorted(entries, key=lambda e: e.time) if e.enabled],
         }
 
 
@@ -443,6 +483,8 @@ class KibbleControlPathSensor(KibbleEntity, SensorEntity):
     @property
     def native_value(self) -> str | None:
         return self.coordinator.control_path
+
+
 class KibbleWifiNetworkSensor(KibbleEntity, SensorEntity):
     """The feeder's current Wi-Fi association (`agent/src/wifi.rs`'s `GET /wifi`). State is the
     SSID (`None`/unknown while disconnected); bssid/band/signal/ip ride along as attributes so
