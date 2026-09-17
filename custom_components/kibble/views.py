@@ -4,11 +4,12 @@ Authenticated (`requires_auth = True`) -- unlike `image.py`'s existing entities,
 `ImageEntity._attr_image_url` straight at the agent's own LAN address for HA's own built-in
 image proxy to fetch, a card is not guaranteed to be able to reach the feeder's LAN address
 directly, so it needs a request HA itself fetches and forwards. `kind` selects which agent
-store `name` (and, for `sample`, `cat`) names -- `event`/`pending`/`sample/<cat>` are already-
-JPEG passthroughs through `api.py`'s `*_bytes` methods; `feed` is the one exception:
-`agent/src/feed_capture.rs` stores a raw H.264 keyframe, not a JPEG, so that case reuses
-`image.py`'s existing ffmpeg decode instead of a client byte-fetch -- see `DESIGN.md`'s "Data
-contracts" for the full shape.
+store `name` (and, for `sample`, `cat`) names -- `event`/`pending`/`sample/<cat>`/`track` are
+already-JPEG passthroughs through `api.py`'s `*_bytes` methods (`track`'s `name` is a `track`
+detection's unix `ts`, not a filename -- the agent re-resolves and serves whichever `eat`/
+`visit` it judges paired with that timestamp live, so this never caches a stale pairing);
+`feed` is the one exception: `agent/src/feed_capture.rs` stores a raw H.264 keyframe, not a
+JPEG, so that case reuses `image.py`'s existing ffmpeg decode instead of a client byte-fetch.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ def _is_safe_name(name: str) -> bool:
 
 class KibbleImageView(HomeAssistantView):
     """`GET /api/kibble/{entry_id}/image/{kind}/{name}`, `kind` one of `event`, `feed`,
-    `pending`, `sample/{cat}`."""
+    `pending`, `sample/{cat}`, `track`."""
 
     url = "/api/kibble/{entry_id}/image/{kind}/{name}"
     extra_urls = ["/api/kibble/{entry_id}/image/sample/{cat}/{name}"]
@@ -73,6 +74,8 @@ class KibbleImageView(HomeAssistantView):
                 jpeg = await client.pending_bytes(name)
             elif kind == "sample" and cat is not None:
                 jpeg = await client.sample_bytes(cat, name)
+            elif kind == "track" and name.isdigit():
+                jpeg = await client.track_image_bytes(int(name))
             elif kind == "feed":
                 jpeg = await _h264_keyframe_to_jpeg(hass, _feed_snapshot_url(entry, name))
             else:

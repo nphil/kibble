@@ -682,6 +682,24 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.client.add_cat(name)
         await self.async_refresh()
 
+    async def async_delete_cat(self, name: str) -> dict:
+        """Same immediate-refresh reasoning as the other face-store writes above: the cats
+        card's own delete confirmation re-queries `kibble/cats` right after this resolves and
+        must not still see the deleted cat."""
+        result = await self.client.delete_cat(name)
+        await self.async_refresh()
+        return result
+
+    async def async_upload_face_sample(self, cat: str, jpeg: bytes) -> dict:
+        result = await self.client.upload_face_sample(cat, jpeg)
+        await self.async_refresh()
+        return result
+
+    async def async_delete_face_sample(self, cat: str, name: str) -> dict:
+        result = await self.client.delete_face_sample(cat, name)
+        await self.async_refresh()
+        return result
+
     async def async_identify_now(self) -> IdentifyResult:
         """Force an immediate `GET /identify` (bypassing the poll cache) and refresh so the
         `last_seen_pet`/presence entities reflect it right away. Returns the result for the

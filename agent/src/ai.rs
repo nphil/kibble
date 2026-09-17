@@ -446,6 +446,55 @@ impl Feed {
             inner.events.iter().filter(|e| e.seq > since).map(Detection::to_json).collect();
         format!("[{}]", items.join(","))
     }
+
+    /// `GET /events/track/<ts>/image`: the raw bytes of the eat (preferred) or visit crop
+    /// paired with the track event at `ts` -- see [`select_track_image`]. `None` covers both
+    /// "nothing in the window" and "the window matched but its crop file is already gone from
+    /// disk" (pruned by [`prune_events_dir`] since) -- the caller maps both to 404, same as
+    /// `GET /events/<file>`'s own `NotFound`.
+    pub fn track_image(&self, ts: u64) -> Option<Vec<u8>> {
+        let name = {
+            let inner = self.inner.lock().unwrap();
+            select_track_image(inner.events.iter(), ts)?.to_string()
+        };
+        read_event(&name).ok()
+    }
+}
+
+/// Seconds *before* a track's own vendor `start_time` its paired eat/visit crop may have landed
+/// -- `ai.rs`'s poll loop ticks once a second and the vendor's crop file and the track block
+/// don't necessarily update on the exact same tick, so the crop can predate the track by a
+/// couple of seconds and still be the same visit.
+pub const TRACK_IMAGE_LOOKBACK_SECS: u64 = 5;
+/// Seconds *after* `start_time` the paired crop may still land -- generous, since an `eat`
+/// detection (the stronger signal [`select_track_image`] prefers) commonly fires well into a
+/// visit that started up to a couple of minutes earlier.
+pub const TRACK_IMAGE_LOOKAHEAD_SECS: u64 = 120;
+
+/// Picks the crop [`Feed::track_image`] serves for `GET /events/track/<ts>/image`: "the live
+/// image of the identified cat at the bowl" among every detection in `[ts -
+/// TRACK_IMAGE_LOOKBACK_SECS, ts + TRACK_IMAGE_LOOKAHEAD_SECS]` that carries an image. An `eat`
+/// detection is a much stronger signal that the identified cat was actually *at the bowl* than a
+/// generic `visit` (motion/scene-change anywhere in frame), so `eat` always wins over `visit`
+/// regardless of which is closer in time; within the same class, the closest to `ts` wins.
+/// `None` covers "nothing in the window" and "the window matched only a `face`/`track`
+/// detection, neither of which is a picture of a cat at the bowl". Pure over an iterator of
+/// [`Detection`]s, so it's directly unit-testable without a real [`Feed`].
+fn select_track_image<'a>(detections: impl Iterator<Item = &'a Detection>, ts: u64) -> Option<&'a str> {
+    let lo = ts.saturating_sub(TRACK_IMAGE_LOOKBACK_SECS);
+    let hi = ts.saturating_add(TRACK_IMAGE_LOOKAHEAD_SECS);
+    detections
+        .filter(|d| d.ts >= lo && d.ts <= hi)
+        .filter_map(|d| {
+            let rank: u8 = match d.class {
+                "eat" => 0,
+                "visit" => 1,
+                _ => return None,
+            };
+            Some((rank, d.ts.abs_diff(ts), d.image.as_deref()?))
+        })
+        .min_by_key(|&(rank, dist, _)| (rank, dist))
+        .map(|(_, _, image)| image)
 }
 
 /// One pass over every watched path: if its mtime advanced since `last_seen`, copy it out and
@@ -766,5 +815,83 @@ mod tests {
         assert!(!is_safe_name("."));
         assert!(!is_safe_name(".."));
         assert!(is_safe_name("1700000000-face.jpg"));
+    }
+
+    // --- GET /events/track/<ts>/image pairing (select_track_image) ---------------------------
+
+    fn det(ts: u64, class: &'static str, image: &str) -> Detection {
+        Detection {
+            seq: 0,
+            ts,
+            class,
+            score: None,
+            pet_id: None,
+            b0x: None,
+            image: Some(image.to_string()),
+            cat: None,
+            total_score: None,
+        }
+    }
+
+    #[test]
+    fn select_track_image_prefers_eat_over_a_closer_visit() {
+        // Both in range: the visit is far closer in time (1s away vs. the eat's 100s), but an
+        // eat still outranks any visit regardless of distance.
+        let events = [det(1100, "eat", "eat.jpg"), det(999, "visit", "visit.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), Some("eat.jpg"));
+    }
+
+    #[test]
+    fn select_track_image_falls_back_to_visit_when_no_eat_is_in_range() {
+        let events = [det(1050, "visit", "visit.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), Some("visit.jpg"));
+    }
+
+    #[test]
+    fn select_track_image_prefers_the_closer_of_two_eats() {
+        let events = [det(1100, "eat", "far.jpg"), det(1010, "eat", "near.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), Some("near.jpg"));
+    }
+
+    #[test]
+    fn select_track_image_accepts_the_lower_window_boundary_exactly() {
+        let events = [det(1000 - TRACK_IMAGE_LOOKBACK_SECS, "eat", "edge.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), Some("edge.jpg"));
+    }
+
+    #[test]
+    fn select_track_image_rejects_just_outside_the_lower_window_boundary() {
+        let events = [det(1000 - TRACK_IMAGE_LOOKBACK_SECS - 1, "eat", "toosoon.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), None);
+    }
+
+    #[test]
+    fn select_track_image_accepts_the_upper_window_boundary_exactly() {
+        let events = [det(1000 + TRACK_IMAGE_LOOKAHEAD_SECS, "eat", "edge.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), Some("edge.jpg"));
+    }
+
+    #[test]
+    fn select_track_image_rejects_just_outside_the_upper_window_boundary() {
+        let events = [det(1000 + TRACK_IMAGE_LOOKAHEAD_SECS + 1, "eat", "toolate.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), None);
+    }
+
+    #[test]
+    fn select_track_image_ignores_face_and_track_detections() {
+        let events = [det(1000, "face", "face.jpg"), det(1000, "track", "track.jpg")];
+        assert_eq!(select_track_image(events.iter(), 1000), None);
+    }
+
+    #[test]
+    fn select_track_image_ignores_a_detection_with_no_image() {
+        let mut d = det(1000, "eat", "placeholder.jpg");
+        d.image = None;
+        assert_eq!(select_track_image([d].iter(), 1000), None);
+    }
+
+    #[test]
+    fn select_track_image_is_none_with_nothing_in_range() {
+        assert_eq!(select_track_image(std::iter::empty::<&Detection>(), 1000), None);
     }
 }

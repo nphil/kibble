@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 
@@ -30,6 +31,7 @@ from .const import (
     ATTR_HOPPER2_G,
     ATTR_HOUR,
     ATTR_ID,
+    ATTR_JPEG_B64,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MINUTE,
     ATTR_PASSWORD,
@@ -50,6 +52,7 @@ from .const import (
     MIN_SCHEDULE_AMOUNT,
     SERVICE_ADD_CAT,
     SERVICE_CANCEL_FEED,
+    SERVICE_DELETE_CAT,
     SERVICE_FEED,
     SERVICE_IDENTIFY,
     SERVICE_LABEL_FACE,
@@ -65,6 +68,7 @@ from .const import (
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
     SERVICE_UNLABEL_FACE,
+    SERVICE_UPLOAD_FACE_SAMPLE,
     SERVICE_WIFI_CONNECT,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
@@ -199,6 +203,21 @@ UNLABEL_FACE_SCHEMA = vol.Schema(
 )
 
 ADD_CAT_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CAT_NAME): cv.string,
+    }
+)
+
+UPLOAD_FACE_SAMPLE_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Required(ATTR_CAT): cv.string,
+        vol.Required(ATTR_JPEG_B64): cv.string,
+    }
+)
+
+DELETE_CAT_SCHEMA = vol.Schema(
     {
         vol.Required("device_id"): cv.string,
         vol.Required(ATTR_CAT_NAME): cv.string,
@@ -476,12 +495,27 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Unlabel face", err)
 
+    async def handle_upload_face_sample(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        jpeg = base64.b64decode(call.data[ATTR_JPEG_B64], validate=True)
+        try:
+            await coordinator.async_upload_face_sample(call.data[ATTR_CAT], jpeg)
+        except KibbleError as err:
+            raise_agent_action_failed("Upload face sample", err)
+
     async def handle_add_cat(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_add_cat(call.data[ATTR_CAT_NAME])
         except KibbleError as err:
             raise_agent_action_failed("Add cat", err)
+
+    async def handle_delete_cat(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_delete_cat(call.data[ATTR_CAT_NAME])
+        except KibbleError as err:
+            raise_agent_action_failed("Delete cat", err)
 
     async def handle_identify(call: ServiceCall) -> ServiceResponse:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
@@ -570,7 +604,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_UNLABEL_FACE, handle_unlabel_face, UNLABEL_FACE_SCHEMA
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPLOAD_FACE_SAMPLE,
+        handle_upload_face_sample,
+        UPLOAD_FACE_SAMPLE_SCHEMA,
+    )
     hass.services.async_register(DOMAIN, SERVICE_ADD_CAT, handle_add_cat, ADD_CAT_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_DELETE_CAT, handle_delete_cat, DELETE_CAT_SCHEMA)
     hass.services.async_register(
         DOMAIN,
         SERVICE_IDENTIFY,

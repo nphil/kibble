@@ -57,6 +57,10 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+fn now_unix_millis() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
 /// A name is safe to join onto a directory we control if it has no path separators and doesn't
 /// spell a traversal -- the only names this module should ever be asked to read/move/label back
 /// are ones it generated itself, but `POST /faces/label`'s `name` comes from an HTTP client.
@@ -161,6 +165,8 @@ pub enum FaceError {
     InvalidName,
     InvalidCat(String),
     NotFound,
+    /// `POST /faces/upload`'s body failed [`validate_upload`] -- see [`UploadError`].
+    InvalidUpload(UploadError),
     Io(io::Error),
 }
 
@@ -170,9 +176,51 @@ impl std::fmt::Display for FaceError {
             FaceError::InvalidName => write!(f, "invalid file name"),
             FaceError::InvalidCat(c) => write!(f, "invalid \"cat\" {c:?}"),
             FaceError::NotFound => write!(f, "no such pending face crop"),
+            FaceError::InvalidUpload(e) => write!(f, "{e}"),
             FaceError::Io(e) => write!(f, "{e}"),
         }
     }
+}
+
+/// Ceiling on an uploaded face-crop JPEG's raw size (`POST /faces/upload`) -- generous for a
+/// 224x224 JPEG (a few tens of KB at the card's `canvas.toBlob` quality 0.9), while bounding a
+/// hostile or mistaken upload well below anything that could meaningfully dent this device's
+/// ~50 MB of free storage.
+pub const MAX_UPLOAD_BYTES: usize = 512 * 1024;
+
+/// Why [`validate_upload`] rejected a `POST /faces/upload` body, before ever touching disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadError {
+    /// Missing the JPEG SOI-plus-marker magic (`FF D8 FF`) -- not a JPEG at all, or truncated.
+    NotJpeg,
+    /// Over [`MAX_UPLOAD_BYTES`]; carries the actual (rejected) size.
+    TooLarge(usize),
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UploadError::NotJpeg => write!(f, "not a JPEG (missing FF D8 FF magic)"),
+            UploadError::TooLarge(n) => write!(f, "{n} bytes exceeds the {MAX_UPLOAD_BYTES}-byte limit"),
+        }
+    }
+}
+
+/// `POST /faces/upload`'s body validation, before anything touches disk. The browser has already
+/// cropped to exactly 224x224 (this module has no decoder to verify that itself -- only
+/// `kibble-embed` ever decodes a JPEG on this device, see `embed.rs`'s module doc), so the only
+/// two things worth checking server-side are "is this even a JPEG" and "is it a sane size" --
+/// both cheap, both catch a wrong `Content-Type`, wrong form field, or hostile upload before it
+/// ever reaches `kibble-embed`. Pure byte-slice logic, so it's directly unit-testable without a
+/// real HTTP request.
+pub fn validate_upload(bytes: &[u8]) -> Result<(), UploadError> {
+    if bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(UploadError::TooLarge(bytes.len()));
+    }
+    if !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Err(UploadError::NotJpeg);
+    }
+    Ok(())
 }
 
 /// `GET /faces/pending/<name>`: the raw JPEG bytes.
@@ -236,6 +284,17 @@ const RESERVED_BUCKETS: &[&str] = &[SKIP_BUCKET, NOT_A_CAT_BUCKET];
 
 pub fn is_reserved_bucket(cat: &str) -> bool {
     RESERVED_BUCKETS.contains(&cat)
+}
+
+/// The literal directory name [`PENDING_DIR`] resolves to ("pending") -- matches
+/// [`list_samples_in`]/[`read_sample_in`]'s existing per-call guard against ever treating the
+/// pending staging directory itself as if it were a real, enrollable cat
+/// (`enrolled_cats_exclude_pending_and_reserved_buckets`'s test comment: this exact phantom-cat
+/// class of bug already shipped once). [`Gallery::delete_cat`]/[`Gallery::delete_sample`]/
+/// [`Gallery::upload_sample`] reuse it since a stray `cat=pending` would otherwise be able to
+/// destroy or pollute the whole unreviewed-crop queue, not just mislabel one phantom cat.
+fn pending_dir_name() -> &'static str {
+    Path::new(PENDING_DIR).file_name().and_then(|s| s.to_str()).unwrap_or("pending")
 }
 
 /// Sidecar path for a crop's cached embedding: same directory and stem, `.emb` extension.
@@ -708,6 +767,21 @@ fn nearest_sample(cat_model: &catid::CatModel, crops: &[LabelledCrop]) -> Option
         .map(|(_, name)| name)
 }
 
+/// Below this, [`Gallery::upload_sample`] still stores and trains on the uploaded crop (a human
+/// explicitly chose it) but flags `"low_quality":true` in the response. The contract's own
+/// number, not a measurement -- unrelated to [`catid::Classifier::t_accept`]'s derived threshold,
+/// which compares embeddings *between* cats; this instead is the embedding model's own single-
+/// crop quality/liveness gate (`docs/27-cat-id.md`), read straight off `embed::Embedding::prob`.
+pub const LOW_QUALITY_PROB: f32 = 0.2;
+
+/// One successful `POST /faces/upload` -- see [`Gallery::upload_sample`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadedSample {
+    pub name: String,
+    pub samples: usize,
+    pub low_quality: bool,
+}
+
 impl Gallery {
     /// Builds the classifier from every labelled crop on disk, computing (and caching) any
     /// embedding that isn't already cached, and re-registers every enrolled cat directory even
@@ -814,6 +888,119 @@ impl Gallery {
         classifier.unlabel(cat, feat);
         let samples = all_sample_embeddings();
         apply_threshold(&mut classifier, &samples);
+    }
+
+    /// `DELETE /cats/<name>`: removes a cat entirely -- its whole directory (every labelled
+    /// sample and sidecar under it) and the classifier's in-memory model, together -- the
+    /// inverse of [`Gallery::add_cat`]. `name` is validated exactly like `add_cat`'s (no
+    /// traversal, not a reserved bucket -- those were never a real cat to begin with); an
+    /// unknown but validly-named cat is [`FaceError::NotFound`].
+    pub fn delete_cat(&self, name: &str) -> Result<(), FaceError> {
+        if !is_safe_name(name) || is_reserved_bucket(name) {
+            return Err(FaceError::InvalidCat(name.to_string()));
+        }
+        if name == pending_dir_name() {
+            return Err(FaceError::NotFound);
+        }
+        let dir = Path::new(FACES_ROOT).join(name);
+        if !dir.is_dir() {
+            return Err(FaceError::NotFound);
+        }
+        fs::remove_dir_all(&dir).map_err(FaceError::Io)?;
+        {
+            let mut classifier = self.inner.lock().unwrap();
+            classifier.remove_cat(name);
+            let samples = all_sample_embeddings();
+            apply_threshold(&mut classifier, &samples);
+        }
+        mark_faces_changed();
+        Ok(())
+    }
+
+    /// `DELETE /faces/samples/<cat>/<name>`: permanently removes one labelled sample (and its
+    /// `.emb`/`.guess` sidecars) and rebuilds `cat`'s centroid from every sample that remains.
+    /// Unlike [`Gallery::on_unlabelled`]'s O(1) subtraction (the exact inverse of the one
+    /// embedding just removed), this recomputes from scratch via
+    /// [`catid::Classifier::recompute_cat`] by re-reading every remaining `.emb` sidecar --
+    /// deletion is permanent, with no `POST /faces/label` path back the way an unlabel has, so
+    /// there is no single embedding to subtract for a photo a human uploaded directly (see
+    /// [`Gallery::upload_sample`]). `name`/`cat` are validated exactly like [`unlabel`]'s; a
+    /// missing sample is [`FaceError::NotFound`].
+    pub fn delete_sample(&self, cat: &str, name: &str) -> Result<(), FaceError> {
+        if !is_safe_name(name) {
+            return Err(FaceError::InvalidName);
+        }
+        if !is_safe_name(cat) {
+            return Err(FaceError::InvalidCat(cat.to_string()));
+        }
+        if cat == pending_dir_name() {
+            return Err(FaceError::NotFound);
+        }
+        let path = Path::new(FACES_ROOT).join(cat).join(name);
+        if !path.is_file() {
+            return Err(FaceError::NotFound);
+        }
+        fs::remove_file(&path).map_err(FaceError::Io)?;
+        let _ = fs::remove_file(embedding_path_for(&path));
+        let _ = fs::remove_file(guess_path_for(&path));
+        if !is_reserved_bucket(cat) {
+            let embeddings: Vec<[f32; embed::EMBED_DIM]> = list_labelled()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c.cat == cat)
+                .filter_map(|c| ensure_embedding(&c.jpg_path).ok())
+                .collect();
+            let mut classifier = self.inner.lock().unwrap();
+            classifier.recompute_cat(cat, &embeddings);
+            let samples = all_sample_embeddings();
+            apply_threshold(&mut classifier, &samples);
+        }
+        mark_faces_changed();
+        Ok(())
+    }
+
+    /// `POST /faces/upload?cat=<name>`: ingests a browser-cropped 224x224 JPEG directly into
+    /// `cat`'s permanent sample storage and its running centroid, in one step -- the manual
+    /// counterpart to `POST /faces/label`, which can only promote a crop the vendor's own
+    /// capture pipeline already wrote to [`PENDING_DIR`]. `cat` must already be enrolled
+    /// ([`FaceError::NotFound`] otherwise -- unlike `label`, upload never creates a cat: a human
+    /// adding reference photos has already gone through `POST /cats`). `bytes` is validated by
+    /// [`validate_upload`] before anything touches disk. Saved as `upload-<unix_ms>.jpg`; the
+    /// `upload-` prefix distinguishes an uploaded reference photo from a vendor-captured
+    /// `<ts>-<petid|unknown>.jpg` one at a glance -- and is the reason a client deletes it via
+    /// [`Gallery::delete_sample`], never `POST /faces/unlabel` (there is no vendor-side pending
+    /// queue an uploaded photo could ever return to). `low_quality` mirrors the embedding
+    /// model's own `prob` gate (`docs/27-cat-id.md`) falling under [`LOW_QUALITY_PROB`] -- still
+    /// stored and trained on regardless (a human explicitly chose this photo), just flagged so
+    /// the caller can say so. A failed embedding (helper crash, NPU unavailable) still leaves the
+    /// crop stored -- exactly `POST /faces/label`'s own log-and-continue behaviour -- reported as
+    /// `low_quality: false` (no measurement made, not a claim of high quality).
+    pub fn upload_sample(&self, bytes: &[u8], cat: &str) -> Result<UploadedSample, FaceError> {
+        if !is_safe_name(cat) {
+            return Err(FaceError::InvalidCat(cat.to_string()));
+        }
+        validate_upload(bytes).map_err(FaceError::InvalidUpload)?;
+        let dir = Path::new(FACES_ROOT).join(cat);
+        if is_reserved_bucket(cat) || cat == pending_dir_name() || !dir.is_dir() {
+            return Err(FaceError::NotFound);
+        }
+        let name = format!("upload-{}.jpg", now_unix_millis());
+        let dest = dir.join(&name);
+        fs::write(&dest, bytes).map_err(FaceError::Io)?;
+        let low_quality = match embed::extract(&dest) {
+            Ok(Embedding { feat, prob }) => {
+                let _ = save_embedding(&dest, &feat);
+                self.on_labelled(cat, &feat);
+                prob < LOW_QUALITY_PROB
+            }
+            Err(e) => {
+                eprintln!("kibbled: faces: embed uploaded {}: {e}", dest.display());
+                false
+            }
+        };
+        mark_faces_changed();
+        let samples = list_samples(cat).map(|v| v.len()).unwrap_or(0);
+        Ok(UploadedSample { name, samples, low_quality })
     }
 }
 
@@ -1412,5 +1599,47 @@ mod tests {
             },
         ];
         assert_eq!(nearest_sample(cat_model, &crops), Some("1-unknown.jpg".to_string()));
+    }
+
+    // --- POST /faces/upload body validation ---------------------------------------------------
+
+    #[test]
+    fn validate_upload_accepts_a_well_formed_small_jpeg() {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.extend(std::iter::repeat(0u8).take(100));
+        assert!(validate_upload(&bytes).is_ok());
+    }
+
+    #[test]
+    fn validate_upload_rejects_missing_jpeg_magic() {
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic, not JPEG
+        assert!(matches!(validate_upload(&bytes), Err(UploadError::NotJpeg)));
+    }
+
+    #[test]
+    fn validate_upload_rejects_an_empty_body() {
+        assert!(matches!(validate_upload(&[]), Err(UploadError::NotJpeg)));
+    }
+
+    #[test]
+    fn validate_upload_accepts_exactly_at_the_size_cap() {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF];
+        bytes.resize(MAX_UPLOAD_BYTES, 0);
+        assert!(validate_upload(&bytes).is_ok());
+    }
+
+    #[test]
+    fn validate_upload_rejects_a_body_one_byte_over_the_size_cap() {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF];
+        bytes.resize(MAX_UPLOAD_BYTES + 1, 0);
+        assert!(matches!(validate_upload(&bytes), Err(UploadError::TooLarge(n)) if n == MAX_UPLOAD_BYTES + 1));
+    }
+
+    #[test]
+    fn validate_upload_checks_size_before_magic_when_both_are_wrong() {
+        // An oversized non-JPEG body is still, unambiguously, "too large" -- checking size first
+        // means the caller never has to wonder whether a wrong-format body was even measured.
+        let bytes = vec![0u8; MAX_UPLOAD_BYTES + 1];
+        assert!(matches!(validate_upload(&bytes), Err(UploadError::TooLarge(_))));
     }
 }

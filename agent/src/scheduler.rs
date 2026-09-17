@@ -59,6 +59,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::bus::{msg, FeedCtrl, Sender};
+use crate::feed_capture::FeedCapture;
 use crate::localtime::{self, Civil, Tz};
 use crate::schedule::{Entry, Outcome, Schedule};
 
@@ -110,13 +111,20 @@ pub trait Dispenser {
 }
 
 /// Production dispenser: `bus::FeedCtrl` over `msg::BLE_FEED_CTRL`, the same already-proven,
-/// already-verified-by-dispensing bus message `POST /feed` sends.
+/// already-verified-by-dispensing bus message `POST /feed` sends. Also leaves a
+/// [`FeedCapture::note_scheduled_feed`] note immediately before that send -- the scheduled-feed
+/// counterpart of `main::feed`'s own note-then-send ordering (see that function's doc comment) --
+/// so `feed_capture.rs`'s watcher can attribute the resulting before/after pair's amounts to this
+/// fire without ever overriding its own `scheduled-<ts>-<n>` id or `manual: false` (a scheduler
+/// fire is not user-initiated the way `POST /feed` is; only the amounts were previously unknown).
 pub struct BusDispenser {
     pub ble: Sender,
+    pub capture: Arc<FeedCapture>,
 }
 
 impl Dispenser for BusDispenser {
     fn dispense(&self, id: &str, amount_l: u8, amount_r: u8) -> Result<(), String> {
+        self.capture.note_scheduled_feed(amount_l, amount_r);
         self.ble
             .send(
                 msg::BLE_FEED_CTRL,
@@ -129,10 +137,12 @@ impl Dispenser for BusDispenser {
 /// Spawns the background tick thread against the given (already-resolved-and-confirmed-
 /// supported) `tz`. Only ever called when [`enabled`] is true *and* `main.rs` has a [`Tz`] for
 /// the device's configured zone -- see the module doc's item 2. `main.rs` does not even open
-/// the extra bus sender dispensing needs unless both hold.
-pub fn spawn(schedule: Arc<Schedule>, ble: Sender, tz: Tz) {
+/// the extra bus sender dispensing needs unless both hold. `capture` is the same [`FeedCapture`]
+/// handle `main.rs` already spawned for `POST /feed`/`GET /feeds*` -- shared, not duplicated, so
+/// a scheduled and a manual fire can never race each other's notes.
+pub fn spawn(schedule: Arc<Schedule>, ble: Sender, tz: Tz, capture: Arc<FeedCapture>) {
     thread::spawn(move || {
-        let dispenser = BusDispenser { ble };
+        let dispenser = BusDispenser { ble, capture };
         loop {
             tick(&schedule, &dispenser, &tz, now_utc());
             thread::sleep(TICK_INTERVAL);

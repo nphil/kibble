@@ -1,8 +1,8 @@
 """`views.py`'s `KibbleImageView`: name/cat path-safety, entry_id resolution, per-`kind`
-dispatch (including the `feed` kind's ffmpeg-decode reuse), auth requirement, cache headers,
-and 404/502 mapping. Same duck-typed style as the rest of this suite -- a `SimpleNamespace`
-stand-in for the aiohttp `Request` (just `.app[KEY_HASS]`, which is all `get()` reads off it)
-rather than a real HTTP server.
+dispatch (including the `feed` kind's ffmpeg-decode reuse and the `track` kind's numeric-name
+requirement), auth requirement, cache headers, and 404/502 mapping. Same duck-typed style as
+the rest of this suite -- a `SimpleNamespace` stand-in for the aiohttp `Request` (just
+`.app[KEY_HASS]`, which is all `get()` reads off it) rather than a real HTTP server.
 """
 
 from __future__ import annotations
@@ -111,12 +111,40 @@ async def test_get_serves_a_passthrough_jpeg_with_the_right_content_type_and_cac
     getattr(client, client_attr).assert_awaited_once_with("a.jpg")
 
 
-async def view_get(entry: SimpleNamespace, *, kind: str, cat: str | None = None):
+async def view_get(
+    entry: SimpleNamespace, *, kind: str, cat: str | None = None, name: str = "a.jpg"
+):
     view = KibbleImageView()
-    kwargs = {"entry_id": "e1", "name": "a.jpg", "kind": kind}
+    kwargs = {"entry_id": "e1", "name": name, "kind": kind}
     if cat is not None:
         kwargs["cat"] = cat
     return await view.get(_fake_request(_fake_hass(entry)), **kwargs)
+
+
+async def test_get_track_kind_calls_track_image_bytes_with_ts_as_int() -> None:
+    client = AsyncMock(track_image_bytes=AsyncMock(return_value=b"\xff\xd8live-jpeg"))
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="track", name="1789528799")
+    assert resp.status == HTTPStatus.OK
+    assert resp.content_type == "image/jpeg"
+    assert resp.headers["Cache-Control"] == CACHE_CONTROL
+    assert resp.body == b"\xff\xd8live-jpeg"
+    client.track_image_bytes.assert_awaited_once_with(1789528799)
+
+
+async def test_get_track_kind_404s_for_a_non_numeric_name() -> None:
+    client = AsyncMock()
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="track", name="not-a-timestamp")
+    assert resp.status == HTTPStatus.NOT_FOUND
+    client.track_image_bytes.assert_not_awaited()
+
+
+async def test_get_404s_when_no_track_image_is_paired() -> None:
+    client = AsyncMock(track_image_bytes=AsyncMock(side_effect=KibbleNotFoundError("gone")))
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="track", name="123")
+    assert resp.status == HTTPStatus.NOT_FOUND
 
 
 async def test_get_sample_kind_calls_the_client_with_both_cat_and_name() -> None:

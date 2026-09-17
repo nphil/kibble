@@ -1,8 +1,9 @@
 """Cat-identification HA-side logic: the label-select's option-to-bucket mapping and its
-guard against acting with nothing pending, the pending-face image's cache-busting URL, and the
-per-cat presence window. Mirrors `test_coordinator_ble_wiring.py`'s style: duck-typed `self`
-stand-ins for the one seam worth pinning, rather than constructing a real `HomeAssistant` core
-instance this repo has no fixture for and these tests don't need.
+guard against acting with nothing pending, the pending-face image's cache-busting URL, the
+per-cat presence window, and the coordinator's cat/face-sample write methods (label, unlabel,
+delete cat, upload sample, delete sample). Mirrors `test_coordinator_ble_wiring.py`'s style:
+duck-typed `self` stand-ins for the one seam worth pinning, rather than constructing a real
+`HomeAssistant` core instance this repo has no fixture for and these tests don't need.
 """
 
 from __future__ import annotations
@@ -129,6 +130,35 @@ async def test_async_unlabel_face_is_the_exact_inverse_call_shape() -> None:
     await KibbleCoordinator.async_unlabel_face(fake_self, "1-5.jpg", "Kitty")
     client.unlabel_face.assert_awaited_once_with("1-5.jpg", "Kitty")
     fake_self.async_refresh.assert_awaited_once()
+
+
+async def test_async_delete_cat_deletes_then_refreshes_immediately() -> None:
+    client = AsyncMock(delete_cat=AsyncMock(return_value={}))
+    fake_self = _fake_coordinator(client)
+    result = await KibbleCoordinator.async_delete_cat(fake_self, "Ghost")
+    client.delete_cat.assert_awaited_once_with("Ghost")
+    fake_self.async_refresh.assert_awaited_once()
+    assert result == {}
+
+
+async def test_async_upload_face_sample_uploads_then_returns_the_agent_result() -> None:
+    client = AsyncMock(
+        upload_face_sample=AsyncMock(return_value={"name": "upload-1.jpg", "samples": 3})
+    )
+    fake_self = _fake_coordinator(client)
+    result = await KibbleCoordinator.async_upload_face_sample(fake_self, "Kitty", b"jpeg-bytes")
+    client.upload_face_sample.assert_awaited_once_with("Kitty", b"jpeg-bytes")
+    fake_self.async_refresh.assert_awaited_once()
+    assert result == {"name": "upload-1.jpg", "samples": 3}
+
+
+async def test_async_delete_face_sample_deletes_then_refreshes() -> None:
+    client = AsyncMock(delete_face_sample=AsyncMock(return_value={}))
+    fake_self = _fake_coordinator(client)
+    result = await KibbleCoordinator.async_delete_face_sample(fake_self, "Kitty", "upload-1.jpg")
+    client.delete_face_sample.assert_awaited_once_with("Kitty", "upload-1.jpg")
+    fake_self.async_refresh.assert_awaited_once()
+    assert result == {}
 
 
 

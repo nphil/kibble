@@ -42,6 +42,9 @@
 //!                                   timeout, ~25s)
 //!   GET    /events/<file>           one detection's raw crop bytes (`image/jpeg`), for every
 //!                                   class (`face`/`visit`/`eat`) -- `Detection.image` names it
+//!   GET    /events/track/<ts>/image the eat (preferred) or visit crop paired with a track event at
+//!                                   ts, within ai.rs's pairing window -- see ai.rs's module doc;
+//!                                   404 if none qualifies
 //!   GET    /faces/pending           `[{"name","ts","vendor_pet_id","guess":{"cat","score"}|null}]`
 //!                                   pending face crops awaiting a human label, newest last (see
 //!                                   faces.rs); `ts`/`vendor_pet_id` are parsed from the
@@ -59,10 +62,21 @@
 //!   GET    /faces/samples/<cat>     `[{"name","ts"}]` every labelled sample of one cat, oldest
 //!                                   first; unknown cat is a 404
 //!   GET    /faces/samples/<cat>/<name>  one labelled sample's raw JPEG bytes
+//!   POST   /faces/upload?cat=<name> raw JPEG body, already cropped to 224x224 by the caller --
+//!                                   ingest it directly into cat's permanent samples, bypassing the
+//!                                   vendor's own capture pipeline; low_quality:true in the
+//!                                   response when the model's own quality gate is unsure but the
+//!                                   crop is kept anyway; unknown cat is a 404
+//!   DELETE /faces/samples/<cat>/<name> permanently delete one labelled sample (no undo, unlike
+//!                                   POST /faces/unlabel) and recompute cat's centroid from what
+//!                                   remains
 //!   GET    /cats                    [{"name","samples","last_seen","avatar"}] every enrolled
 //!                                   cat (see catid.rs/faces.rs's Gallery); `avatar` is the
 //!                                   sample name nearest the cat's centroid, or null
 //!   POST   /cats                    {"name": "..."}  pre-register a cat with zero samples
+//!   DELETE /cats/<name>             remove a cat entirely: every labelled sample (and its
+//!                                   sidecars) plus the classifier's model for it; unknown cat is a
+//!                                   404, an invalid name is a 400
 //!   GET    /identify                {"cat","score","second_best","crop","source","ts"} --
 //!                                   Kibble's own classifier's best guess for the newest
 //!                                   pending crop, or ground truth from the most recently
@@ -225,7 +239,7 @@ fn main() {
         (true, Some(_)) => {
             let scheduler_ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
                 .unwrap_or_else(|e| die(&format!("open ble queue for scheduler: {e}")));
-            scheduler::spawn(Arc::clone(&schedule), scheduler_ble, tz.unwrap());
+            scheduler::spawn(Arc::clone(&schedule), scheduler_ble, tz.unwrap(), Arc::clone(&capture));
             eprintln!(
                 "kibbled: scheduler ENABLED (zone={timezone_name:?}) -- will dispense directly at each enabled entry's local time"
             );
@@ -339,6 +353,12 @@ fn route(
         }
         ("GET", "/events") => Response::Json(ai_feed.snapshot_json()),
         ("GET", "/events/stream") => events_stream(query, ai_feed),
+        ("GET", p) if p.starts_with("/events/track/") => {
+            match p["/events/track/".len()..].strip_suffix("/image") {
+                Some(ts_str) => events_track_image_get(ai_feed, ts_str),
+                None => Response::NotFound,
+            }
+        }
         ("GET", p) if p.starts_with("/events/") => events_file_get(&p["/events/".len()..]),
         ("GET", "/faces/pending") => json_response(faces_pending_json()),
         ("GET", p) if p.starts_with("/faces/pending/") => {
@@ -346,13 +366,18 @@ fn route(
         }
         ("POST", "/faces/label") => faces_label_post(req, gallery),
         ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery),
+        ("POST", "/faces/upload") => faces_upload_post(req, query, gallery),
         ("GET", "/faces/current") => faces_current_get(),
         ("GET", "/faces/current/info") => json_response(faces_current_info_json()),
         ("GET", p) if p.starts_with("/faces/samples/") => {
             faces_samples_route(&p["/faces/samples/".len()..])
         }
+        ("DELETE", p) if p.starts_with("/faces/samples/") => {
+            faces_samples_delete_route(&p["/faces/samples/".len()..], gallery)
+        }
         ("GET", "/cats") => cats_get(gallery),
         ("POST", "/cats") => cats_post(req, gallery),
+        ("DELETE", p) if p.starts_with("/cats/") => cats_delete(&p["/cats/".len()..], gallery),
         ("GET", "/identify") => json_response(identify_json(gallery)),
         ("GET", "/feeds") => json_response(feeds_json(capture)),
         ("GET", p) if p.starts_with("/feeds/") => feeds_get(capture, &p["/feeds/".len()..]),
@@ -432,6 +457,17 @@ fn events_file_get(name: &str) -> Response {
     }
 }
 
+/// `GET /events/track/<ts>/image`: see `ai::Feed::track_image`'s doc for the pairing rule.
+fn events_track_image_get(ai_feed: &ai::Feed, ts_str: &str) -> Response {
+    match ts_str.parse::<u64>() {
+        Ok(ts) => match ai_feed.track_image(ts) {
+            Some(bytes) => Response::Blob("image/jpeg", bytes),
+            None => Response::NotFound,
+        },
+        Err(_) => Response::BadRequest("invalid ts".into()),
+    }
+}
+
 /// `Result<json, error>` -> HTTP. The JSON producers below are shared with the push channel
 /// (`push::Serialize` in `main`), which is why they don't build a `Response` themselves.
 fn json_response(r: Result<String, String>) -> Response {
@@ -491,6 +527,27 @@ fn faces_sample_get(cat: &str, name: &str) -> Response {
         Ok(bytes) => Response::Blob("image/jpeg", bytes),
         Err(faces::FaceError::InvalidName) => Response::BadRequest("invalid file name".into()),
         Err(faces::FaceError::InvalidCat(_)) => Response::BadRequest("invalid cat".into()),
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+/// Routes `DELETE /faces/samples/<cat>/<name>` -- unlike the `GET` sibling
+/// ([`faces_samples_route`]), there is no valid `DELETE /faces/samples/<cat>` (deleting every
+/// sample of an entire cat in one call is `DELETE /cats/<name>`, not this route).
+fn faces_samples_delete_route(rest: &str, gallery: &faces::Gallery) -> Response {
+    match rest.split_once('/') {
+        Some((cat, name)) => faces_sample_delete(cat, name, gallery),
+        None => Response::NotFound,
+    }
+}
+
+fn faces_sample_delete(cat: &str, name: &str, gallery: &faces::Gallery) -> Response {
+    match gallery.delete_sample(cat, name) {
+        Ok(()) => Response::NoContent,
+        Err(e @ (faces::FaceError::InvalidName | faces::FaceError::InvalidCat(_))) => {
+            Response::BadRequest(e.to_string())
+        }
         Err(faces::FaceError::NotFound) => Response::NotFound,
         Err(e) => Response::Error(e.to_string()),
     }
@@ -569,6 +626,28 @@ fn faces_unlabel_post(req: &Request, gallery: &faces::Gallery) -> Response {
     }
 }
 
+/// `POST /faces/upload?cat=<name>`: raw JPEG body, already cropped to 224x224 by the caller --
+/// see `faces::Gallery::upload_sample`'s doc for the full contract.
+fn faces_upload_post(req: &Request, query: &str, gallery: &faces::Gallery) -> Response {
+    let cat = match http::query_field(query, "cat").filter(|s| !s.is_empty()) {
+        Some(c) => c,
+        None => return Response::BadRequest(r#""cat" is required"#.into()),
+    };
+    match gallery.upload_sample(&req.body, cat) {
+        Ok(s) => Response::Json(format!(
+            r#"{{"name":"{}","samples":{}{}}}"#,
+            s.name.escape_debug(),
+            s.samples,
+            if s.low_quality { r#","low_quality":true"# } else { "" }
+        )),
+        Err(e @ (faces::FaceError::InvalidCat(_) | faces::FaceError::InvalidUpload(_))) => {
+            Response::BadRequest(e.to_string())
+        }
+        Err(faces::FaceError::NotFound) => Response::NotFound,
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
 fn faces_current_get() -> Response {
     match faces::review_target() {
         Ok(Some(target)) => match fs::read(target.jpg_path()) {
@@ -608,6 +687,16 @@ fn cats_post(req: &Request, gallery: &faces::Gallery) -> Response {
     match gallery.add_cat(name) {
         Ok(()) => Response::Json(format!(r#"{{"ok":true,"name":"{}"}}"#, name.escape_debug())),
         Err(e @ faces::FaceError::InvalidCat(_)) => Response::BadRequest(e.to_string()),
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+/// `DELETE /cats/<name>`: see `faces::Gallery::delete_cat`'s doc for the full contract.
+fn cats_delete(name: &str, gallery: &faces::Gallery) -> Response {
+    match gallery.delete_cat(name) {
+        Ok(()) => Response::NoContent,
+        Err(e @ faces::FaceError::InvalidCat(_)) => Response::BadRequest(e.to_string()),
+        Err(faces::FaceError::NotFound) => Response::NotFound,
         Err(e) => Response::Error(e.to_string()),
     }
 }

@@ -222,6 +222,37 @@ impl Classifier {
         true
     }
 
+    /// Drops `name`'s entire model outright, regardless of its current sample count -- the
+    /// classifier-side half of `DELETE /cats/<name>` (`faces.rs::Gallery::delete_cat` has already
+    /// removed its directory by the time this runs). Distinct from repeatedly calling
+    /// [`Classifier::unlabel`] one sample at a time: that only prunes a cat once an existing
+    /// sample count reaches zero, so it can never remove an enrolled-but-sample-less cat (zero
+    /// samples to subtract) the way a real deletion needs to. A no-op if `name` isn't known.
+    pub fn remove_cat(&mut self, name: &str) {
+        self.cats.retain(|c| c.name != name);
+    }
+
+    /// Rebuilds `name`'s centroid from scratch given every embedding it should now have --
+    /// `DELETE /faces/samples/<cat>/<name>` uses this instead of a single [`Classifier::unlabel`]
+    /// subtraction because deletion is permanent and the caller
+    /// (`faces::Gallery::delete_sample`) already has to re-read every remaining `.emb` sidecar to
+    /// answer "how many samples does this cat have now" -- recomputing from that same pass avoids
+    /// any risk of the running sum ever drifting from what is actually still on disk. Registers
+    /// `name` if it wasn't already known (mirrors [`Classifier::ensure_cat`]) rather than pruning
+    /// it: a cat surviving with zero samples is the expected steady state after its last sample
+    /// is deleted, not a phantom to clean up (see `Gallery::add_cat`'s own doc).
+    pub fn recompute_cat(&mut self, name: &str, embeddings: &[[f32; EMBED_DIM]]) {
+        let model = self.find_or_create(name);
+        model.sum = [0.0; EMBED_DIM];
+        model.count = 0;
+        for raw in embeddings {
+            let mut normalized = *raw;
+            if l2_normalize(&mut normalized) {
+                model.add(&normalized);
+            }
+        }
+    }
+
     /// Ranks `embedding` against every enrolled cat's centroid.
     pub fn identify(&self, embedding: &[f32; EMBED_DIM]) -> Verdict {
         let mut normalized = *embedding;

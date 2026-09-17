@@ -252,7 +252,35 @@ unlabel_face:
       selector:
         text:
 
+upload_face_sample:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    cat:
+      required: true
+      selector:
+        text:
+    jpeg_b64:
+      required: true
+      selector:
+        text:
+
 add_cat:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kibble
+    name:
+      required: true
+      selector:
+        text:
+
+delete_cat:
   fields:
     device_id:
       required: true

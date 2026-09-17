@@ -457,10 +457,19 @@ class KibbleClient:
         *,
         data: bytes | None = None,
         timeout: ClientTimeout | None = None,
+        not_found_is_missing: bool = False,
     ) -> Any:
         """`payload` is sent as a JSON body; `data`, if given instead, is sent raw -- `/speak`
         and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
-        (mutually exclusive with `payload`; nothing here needs both at once)."""
+        (mutually exclusive with `payload`; nothing here needs both at once).
+
+        `not_found_is_missing`: a 404 here names a specific resource the caller asked for by
+        id/name (an unknown cat, an unknown sample) rather than a route this agent version
+        simply doesn't have -- raises `KibbleNotFoundError` (carrying the agent's own
+        `{"error": ...}` message, e.g. "not found") instead of the default "not supported by
+        this agent version" `KibbleError`, exactly like `_get_bytes` already does for crop
+        fetches, so callers (and `websocket.py`'s WS error mapping) can tell "this cat/sample
+        is gone" from "this agent is too old" apart."""
         async with self._lock:
             try:
                 async with self._session.request(
@@ -471,6 +480,17 @@ class KibbleClient:
                     timeout=timeout or TIMEOUT,
                 ) as resp:
                     if resp.status == 404:
+                        if not_found_is_missing:
+                            # Confirmed shape (agent contract): `{"error": "not found"}` --
+                            # read it so the WS error the card sees says something better than
+                            # a bare path. Falls back to `path` if a future not-found route
+                            # ever 404s with a non-JSON or unlabelled body.
+                            try:
+                                body = await resp.json(content_type=None)
+                            except ValueError:
+                                body = None
+                            detail = body.get("error", body) if isinstance(body, dict) else body
+                            raise KibbleNotFoundError(str(detail) if detail is not None else path)
                         raise KibbleError(f"{path} not supported by this agent version")
                     body = await resp.json(content_type=None)
                     if resp.status >= 400:
@@ -634,6 +654,14 @@ class KibbleClient:
         before its first crop is ever labelled. The agent 400s for a reserved bucket name."""
         await self._request("POST", "/cats", {"name": name})
 
+    async def delete_cat(self, name: str) -> dict:
+        """`DELETE /cats/<name>`: removes the cat, every one of its labelled samples (and
+        their `.emb` sidecars), and its trained classifier model outright. An unknown cat
+        404s -- see `_request`'s `not_found_is_missing`."""
+        return await self._request(
+            "DELETE", f"/cats/{quote(name, safe='')}", not_found_is_missing=True
+        )
+
     async def identify(self) -> IdentifyResult:
         return IdentifyResult.from_json(await self._request("GET", "/identify"))
 
@@ -649,6 +677,28 @@ class KibbleClient:
         """The exact inverse of `label_face` -- moves a labelled crop back to pending and
         corrects the centroid. A full re-label is this followed by another `label_face`."""
         await self._request("POST", "/faces/unlabel", {"name": crop_id, "cat": cat})
+
+    async def upload_face_sample(self, cat: str, jpeg: bytes) -> dict:
+        """`POST /faces/upload?cat=<cat>`: `jpeg` is raw bytes the browser has already
+        cropped to exactly 224x224 (`kibble-card`'s crop dialog) -- forwarded as-is, the same
+        raw-body shape `speak`/`save_clip` already use. `cat` must already exist; 404s like
+        `delete_cat`. Returns the agent's `{"name", "samples", "low_quality"?}` unchanged."""
+        return await self._request(
+            "POST",
+            f"/faces/upload?cat={quote(cat, safe='')}",
+            data=jpeg,
+            not_found_is_missing=True,
+        )
+
+    async def delete_face_sample(self, cat: str, name: str) -> dict:
+        """`DELETE /faces/samples/<cat>/<name>`: removes one already-labelled sample outright
+        -- the counterpart to `unlabel_face` for a sample with no pending-queue entry to move
+        back to (an uploaded photo never went through the pending review queue)."""
+        return await self._request(
+            "DELETE",
+            f"/faces/samples/{quote(cat, safe='')}/{quote(name, safe='')}",
+            not_found_is_missing=True,
+        )
 
     async def event_bytes(self, name: str) -> bytes:
         """`GET /events/<name>`: one detection crop's raw JPEG bytes -- the timeline's image
@@ -666,6 +716,13 @@ class KibbleClient:
         return await self._get_bytes(
             f"/faces/samples/{quote(cat, safe='')}/{quote(name, safe='')}"
         )
+
+    async def track_image_bytes(self, ts: int) -> bytes:
+        """`GET /events/track/<ts>/image`: the JPEG of whichever `eat` (preferred) or `visit`
+        event the agent judges paired with the `track` at `ts` -- the live image of the
+        identified cat at the bowl, as opposed to a stored/trained sample. Raises
+        `KibbleNotFoundError` when nothing qualifies, via the HTTP view's `kind="track"`."""
+        return await self._get_bytes(f"/events/track/{ts}/image")
 
     async def clips(self) -> list[ClipInfo]:
         return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips")]

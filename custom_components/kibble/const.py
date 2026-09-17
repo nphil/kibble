@@ -115,7 +115,9 @@ ATTR_PASSWORD = "password"
 
 SERVICE_LABEL_FACE = "label_face"
 SERVICE_UNLABEL_FACE = "unlabel_face"
+SERVICE_UPLOAD_FACE_SAMPLE = "upload_face_sample"
 SERVICE_ADD_CAT = "add_cat"
+SERVICE_DELETE_CAT = "delete_cat"
 SERVICE_IDENTIFY = "identify"
 
 ATTR_CROP_ID = "crop_id"
@@ -125,6 +127,9 @@ ATTR_CAT_NAME = "name"
 # it `{cat, name}`, not `{crop_id, cat}` like `label_face`; same identifier, different name
 # because that's what the two services' documented shapes each already commit to.
 ATTR_CROP_NAME = "name"
+# The raw bytes for `upload_face_sample`/`kibble/faces/upload` cross the wire as base64 (WS
+# messages and service calls are both JSON) -- this is that field's name on both.
+ATTR_JPEG_B64 = "jpeg_b64"
 
 # The two reserved `cat` bucket values `agent/src/faces.rs` treats specially: moved and
 # embedded like any real cat, but never counted as one (excluded from `GET /cats` and the

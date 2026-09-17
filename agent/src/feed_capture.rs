@@ -16,14 +16,17 @@
 //! ## Manual vs. scheduled feeds
 //!
 //! A manual `POST /feed` calls [`FeedCapture::note_manual_feed`] right after the bus send
-//! succeeds, recording the id/amounts about to take effect. The single background watcher thread
-//! (spawned once, [`spawn`]) polls the feeding flag continuously; on every `0` -> `1` transition
-//! it claims whatever manual-feed note is still pending (within [`MANUAL_FEED_WINDOW`] of being
-//! recorded) as this cycle's metadata, or -- if none is pending -- treats the cycle as a
-//! spontaneous (scheduled, or dispensed some other way) feed with unknown amounts. Either way the
-//! *mechanism* watched is the same real flag transition; nothing here is guessed or invented for
-//! the scheduled case, exactly per the assignment ("the before shot is whatever keyframe was
-//! cached when the flag went high -- good enough").
+//! succeeds, recording the id/amounts about to take effect. `scheduler.rs`'s `BusDispenser` does
+//! the analogous thing for a feed it fires itself, via [`FeedCapture::note_scheduled_feed`] --
+//! same timing (called immediately before its own bus send), but it only ever supplies amounts,
+//! never an id or `manual: true` (see [`ScheduledNote`]'s own doc). The single background
+//! watcher thread (spawned once, [`spawn`]) polls the feeding flag continuously; on every
+//! `0` -> `1` transition it claims whatever manual-feed note is still pending (within
+//! [`MANUAL_FEED_WINDOW`] of being recorded) as this cycle's metadata, else falls back to a
+//! synthesised `scheduled-<ts>-<n>` id, claiming a fresh [`ScheduledNote`]'s amounts if
+//! `scheduler.rs` left one, or leaving them `None` if nothing did -- a feed dispensed some other
+//! way entirely (the vendor's own app, a stale/already-claimed note) genuinely has unknown
+//! amounts, never guessed.
 //!
 //! ## Testing without dispensing
 //!
@@ -48,9 +51,11 @@ use crate::state::{off, Shm};
 pub const FEEDS_DIR: &str = "/opt/kibble/feeds";
 /// "cap at the last 20 feeds" -- 20 *events*, each up to a `.json` + two `.h264` files.
 pub const MAX_FEEDS: usize = 20;
-/// How long after `POST /feed` sends the bus message a manual-feed note stays claimable by the
-/// watcher thread's next observed flag transition. Feed latency was measured at 24 ms
-/// (`docs/design-agent.md`); this is generous headroom, not a tuned value.
+/// How long after the bus send that causes a feed -- a manual `POST /feed`'s own send, or
+/// `scheduler.rs`'s `BusDispenser` firing a scheduled one -- a pending note ([`ManualNote`] or
+/// [`ScheduledNote`]) stays claimable by the watcher thread's next observed flag transition. Feed
+/// latency was measured at 24 ms (`docs/design-agent.md`); this is generous headroom, not a
+/// tuned value.
 const MANUAL_FEED_WINDOW: Duration = Duration::from_secs(15);
 /// How often the watcher polls the feeding flag while idle, and while waiting for it to clear.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -67,6 +72,18 @@ fn now_unix() -> u64 {
 
 struct ManualNote {
     id: String,
+    amount1: u8,
+    amount2: u8,
+    noted_at: Instant,
+}
+
+/// Amounts a `scheduler.rs` fire is *about* to cause, left just before the bus send so the next
+/// observed 0->1 flag transition can pick them up -- same "leave a note, the watcher claims it"
+/// pattern as [`ManualNote`], but only ever supplies the amounts: unlike a manual note it never
+/// overrides the cycle's id (which stays the auto-generated `scheduled-<ts>-<n>` -- see
+/// [`FeedCapture::start_cycle`]'s doc) or flips `manual` to `true` (a scheduler fire is not
+/// user-initiated the way a `POST /feed` is).
+struct ScheduledNote {
     amount1: u8,
     amount2: u8,
     noted_at: Instant,
@@ -109,6 +126,8 @@ pub struct FeedCapture {
     dir: PathBuf,
     sub_feed: Arc<VideoFeed>,
     pending: Mutex<Option<ManualNote>>,
+    /// The scheduled-feed counterpart of `pending` -- see [`ScheduledNote`]'s own doc.
+    pending_scheduled: Mutex<Option<ScheduledNote>>,
     /// Disambiguates two feeds landing in the same wall-clock second.
     seq: AtomicU64,
 }
@@ -119,7 +138,13 @@ impl FeedCapture {
     }
 
     fn new_in(dir: impl Into<PathBuf>, sub_feed: Arc<VideoFeed>) -> Arc<FeedCapture> {
-        Arc::new(FeedCapture { dir: dir.into(), sub_feed, pending: Mutex::new(None), seq: AtomicU64::new(0) })
+        Arc::new(FeedCapture {
+            dir: dir.into(),
+            sub_feed,
+            pending: Mutex::new(None),
+            pending_scheduled: Mutex::new(None),
+            seq: AtomicU64::new(0),
+        })
     }
 
     /// Called by `POST /feed`'s handler right after the bus send succeeds. Not itself the
@@ -139,20 +164,44 @@ impl FeedCapture {
         }
     }
 
+    /// Called by `scheduler.rs`'s [`crate::scheduler::BusDispenser`] right before the bus send
+    /// for a scheduler-fired feed -- the scheduled-feed counterpart of [`Self::note_manual_feed`].
+    /// See [`ScheduledNote`]'s own doc for why this only ever supplies amounts, never an id or
+    /// `manual: true`.
+    pub fn note_scheduled_feed(&self, amount1: u8, amount2: u8) {
+        *self.pending_scheduled.lock().unwrap() = Some(ScheduledNote { amount1, amount2, noted_at: Instant::now() });
+    }
+
+    fn take_fresh_scheduled_amounts(&self) -> Option<(u8, u8)> {
+        let mut guard = self.pending_scheduled.lock().unwrap();
+        match guard.take() {
+            Some(note) if note.noted_at.elapsed() <= MANUAL_FEED_WINDOW => Some((note.amount1, note.amount2)),
+            _ => None,
+        }
+    }
+
     fn keyframe_bytes(&self) -> Option<Vec<u8>> {
         self.sub_feed.latest_keyframe().map(|f| f.data)
     }
 
     /// Grab the "before" frame and record which feed (manual note, if a fresh one is pending, or
     /// a synthesised spontaneous id) this cycle belongs to. Called by the watcher the instant it
-    /// observes the flag go high.
+    /// observes the flag go high. A spontaneous cycle's amounts come from a fresh
+    /// [`ScheduledNote`] when `scheduler.rs` left one via [`Self::note_scheduled_feed`], else stay
+    /// `None` -- a feed dispensed some other way entirely (the vendor's own app, a stale or
+    /// already-claimed note) genuinely has unknown amounts, never guessed.
     fn start_cycle(&self) -> (String, Option<u8>, Option<u8>, bool, Option<Vec<u8>>) {
         let before = self.keyframe_bytes();
         match self.take_fresh_manual_note() {
             Some((id, a1, a2)) => (id, Some(a1), Some(a2), true, before),
             None => {
                 let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-                (format!("scheduled-{}-{seq}", now_unix()), None, None, false, before)
+                let id = format!("scheduled-{}-{seq}", now_unix());
+                let (amount1, amount2) = match self.take_fresh_scheduled_amounts() {
+                    Some((a1, a2)) => (Some(a1), Some(a2)),
+                    None => (None, None),
+                };
+                (id, amount1, amount2, false, before)
             }
         }
     }

@@ -501,6 +501,24 @@
         }
       }
     },
+    "upload_face_sample": {
+      "name": "Upload face sample",
+      "description": "Add an externally-supplied, already-cropped 224x224 JPEG photo as a labelled training sample for a cat.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to upload a sample to."
+        },
+        "cat": {
+          "name": "Cat",
+          "description": "The cat to train. Must already exist."
+        },
+        "jpeg_b64": {
+          "name": "JPEG (base64)",
+          "description": "Base64-encoded, already-cropped 224x224 JPEG bytes."
+        }
+      }
+    },
     "add_cat": {
       "name": "Add cat",
       "description": "Pre-register a cat with zero samples, so it appears as a label option before its first crop is labelled.",
@@ -512,6 +530,20 @@
         "name": {
           "name": "Name",
           "description": "The new cat's name."
+        }
+      }
+    },
+    "delete_cat": {
+      "name": "Delete cat",
+      "description": "Remove a cat, every one of its labelled samples, and its trained classifier model.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to delete a cat from."
+        },
+        "name": {
+          "name": "Name",
+          "description": "The cat's name to delete."
         }
       }
     },
