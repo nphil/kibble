@@ -75,6 +75,16 @@ pub mod msg {
     /// `/proc/ax_proc/ao`'s `SndFrm` by exactly +23, without touching `audio_out_thread`'s
     /// guard flag or the ring. The only speaker path `kibbled` has ever made audible.
     pub const PLAY_AAC_FILE: u16 = 0x2;
+    /// ctrl -> ble: generic "forward this byte to the T31 MCU as a bare UART CMD" passthrough
+    /// (`subchip_req_data` in docs/16-schedule.md's 30-entry table). Payload byte 0 is the UART
+    /// CMD; the handler drops everything past it and the wrapper it tail-calls always sends a
+    /// NULL/zero-length UART payload, so this can only ever request a bare, no-data command --
+    /// see [`super::bowl_fill`] for the full disassembly trace (GOT resolution, cross-checked
+    /// against two independently-known handler addresses) and why `0x19` (Food Surplus Ctrl) is
+    /// the one CMD byte this crate ever sends through it. Never send an unvalidated/caller-
+    /// supplied byte here: this same numbering is also where the feed command lives (`cmd = 5`
+    /// at this layer -- see [`super::bowl_fill`]'s module doc for how that was confirmed).
+    pub const SUBCHIP_REQ_DATA: u16 = 0x601b;
 }
 
 type MqdT = c_int;

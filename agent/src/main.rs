@@ -111,6 +111,7 @@ mod ai;
 mod audioout;
 mod backchannel;
 mod backup;
+mod bowl_fill;
 mod bus;
 mod clips;
 mod catid;
@@ -189,6 +190,21 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
     let ble_adv = advertise::BleAdv::spawn()
         .unwrap_or_else(|e| die(&format!("open ble_adv queue: {e}")));
+    let bowl_fill = Arc::new(bowl_fill::BowlFillRefresh::new(
+        Sender::open(Peer::Ble, SRC_AS_CTRL)
+            .unwrap_or_else(|e| die(&format!("open ble queue for bowl fill: {e}"))),
+    ));
+    // Startup catch-up: a reading left invalidated by a feed that happened while kibbled was
+    // down (or that has simply never been asked for, since the cloud never will be) shouldn't
+    // wait for the next feed cycle to resolve. `request_if_due` still enforces "never mid-feed"
+    // and the one-per-minute floor, so this is a no-op on every ordinary restart where both
+    // readings are already valid.
+    {
+        let snap = shm.snapshot();
+        if snap.bowl_fill_1.is_none() || snap.bowl_fill_2.is_none() {
+            bowl_fill.request_if_due(&shm);
+        }
+    }
     let schedule = Arc::new(
         Schedule::load(PathBuf::from(schedule::CACHE_PATH))
             .unwrap_or_else(|e| die(&format!("load {}: {e}", schedule::CACHE_PATH))),
@@ -207,7 +223,7 @@ fn main() {
     let speaker_owner = audioout::SpeakerOwner::new();
     let rtsp_listener =
         TcpListener::bind(RTSP_BIND).unwrap_or_else(|e| die(&format!("bind {RTSP_BIND}: {e}")));
-    let capture = feed_capture::spawn(Arc::clone(&shm), Arc::clone(&sub_feed));
+    let capture = feed_capture::spawn(Arc::clone(&shm), Arc::clone(&sub_feed), Arc::clone(&bowl_fill));
     let feeds = Arc::new(rtsp::Feeds {
         main: main_feed,
         sub: sub_feed,

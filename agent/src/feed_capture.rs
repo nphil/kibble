@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::bowl_fill::BowlFillRefresh;
 use crate::ring::VideoFeed;
 use crate::state::{off, Shm};
 
@@ -362,7 +363,7 @@ fn evict_oldest_if_over_cap(dir: &Path, cap: usize) -> io::Result<()> {
 /// falls, settle, capture "after", persist. Split out from [`spawn`]'s loop so it's callable
 /// (with a real `Shm`) independent of the infinite loop, but still not part of the unit-tested
 /// surface -- it always needs the real feeding flag.
-fn run_one_cycle(shm: &Shm, capture: &FeedCapture) -> bool {
+fn run_one_cycle(shm: &Shm, capture: &FeedCapture, bowl_fill: &BowlFillRefresh) -> bool {
     if !wait_for_flag(shm, true, None) {
         return false;
     }
@@ -386,6 +387,11 @@ fn run_one_cycle(shm: &Shm, capture: &FeedCapture) -> bool {
         }
         Err(e) => eprintln!("kibbled: feed capture: failed to save {id}: {e}"),
     }
+    // The feeding flag just cleared, so the vendor has already invalidated `bowl_fill` to
+    // "unknown" for this cycle -- ask the MCU for a fresh reading now instead of leaving it
+    // stuck until the next cloud round-trip that, with the cloud disabled, never comes. Gated
+    // internally (never mid-feed, at most once a minute), so this is always safe to call here.
+    bowl_fill.request_if_due(shm);
     true
 }
 
@@ -408,11 +414,11 @@ fn wait_for_flag(shm: &Shm, want: bool, timeout: Option<Duration>) -> bool {
 
 /// Start the persistent watcher thread and return the shared handle `main.rs` routes
 /// `POST /feed`'s success path and `GET /feeds*` against.
-pub fn spawn(shm: Arc<Shm>, sub_feed: Arc<VideoFeed>) -> Arc<FeedCapture> {
+pub fn spawn(shm: Arc<Shm>, sub_feed: Arc<VideoFeed>, bowl_fill: Arc<BowlFillRefresh>) -> Arc<FeedCapture> {
     let capture = FeedCapture::new(sub_feed);
     let handle = Arc::clone(&capture);
     thread::spawn(move || loop {
-        run_one_cycle(&shm, &handle);
+        run_one_cycle(&shm, &handle, &bowl_fill);
     });
     capture
 }
