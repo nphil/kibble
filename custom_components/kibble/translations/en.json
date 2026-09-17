@@ -26,6 +26,12 @@
       "reachable": {
         "name": "Feeder reachable"
       },
+      "hopper_1_empty": {
+        "name": "Hopper 1 empty"
+      },
+      "hopper_2_empty": {
+        "name": "Hopper 2 empty"
+      },
       "time_display": {
         "name": "Video timestamp overlay"
       },

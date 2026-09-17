@@ -423,6 +423,24 @@
     "sample_value_redacted": "6 (matches known volume=6)"
   },
   {
+    "offset": 10235,
+    "size": 1,
+    "type": "u8 enum (0/1/2)",
+    "key": "hopper-1 food level -- ctrl's outbound JSON key \"food1\" (Table A's state.ble.sta_data.food1_lack)",
+    "section": "state",
+    "confidence": "high",
+    "sample_value_redacted": "2 (full/ok); domain is 0=empty, 1=low, 2=full/ok, 0xff=never reported since boot -- see docs/07-config.md §10"
+  },
+  {
+    "offset": 10236,
+    "size": 1,
+    "type": "u8 enum (0/1/2)",
+    "key": "hopper-2 food level -- ctrl's outbound JSON key \"food2\" (Table A's state.ble.sta_data.food2_lack)",
+    "section": "state",
+    "confidence": "high",
+    "sample_value_redacted": "2 (full/ok); same domain as offset 10235 -- see docs/07-config.md §10"
+  },
+  {
     "offset": 4892,
     "size": 2432,
     "type": "int64[]",

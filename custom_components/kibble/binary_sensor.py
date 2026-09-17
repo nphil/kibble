@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -146,6 +147,32 @@ SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KibbleHopperEmptyDescription(BinarySensorEntityDescription):
+    """A per-hopper "food ran out" flag and which slot of `FeederState.hopper_empty` it reads."""
+
+    index: int
+
+
+# The feeder's own low-food threshold, mirrored locally -- kibble docs/07-config.md: `ctrl`'s
+# tone-alarm gate and `ble`'s warning-flag setter/clearer both fire whenever a hopper's raw
+# 0/1/2 level reads below 2, so that is what "empty" means here too, not just a literal 0.
+HOPPER_EMPTY_SENSORS: tuple[KibbleHopperEmptyDescription, ...] = (
+    KibbleHopperEmptyDescription(
+        key="hopper_1_empty",
+        translation_key="hopper_1_empty",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        index=0,
+    ),
+    KibbleHopperEmptyDescription(
+        key="hopper_2_empty",
+        translation_key="hopper_2_empty",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        index=1,
+    ),
+)
+
+
 def is_present(
     cat_name: str,
     identify: IdentifyResult,
@@ -189,6 +216,7 @@ async def async_setup_entry(
         KibbleReachableBinarySensor(coordinator),
     ]
     entities.extend(KibbleSettingBinarySensor(coordinator, d) for d in SETTING_SENSORS)
+    entities.extend(KibbleHopperEmptySensor(coordinator, d) for d in HOPPER_EMPTY_SENSORS)
     async_add_entities(entities)
 
     # Per-cat presence entities are created dynamically from `GET /cats` -- there is no fixed
@@ -264,6 +292,28 @@ class KibbleReachableBinarySensor(KibbleEntity, BinarySensorEntity):
             "consecutive_failures": self.coordinator.consecutive_failures,
             "last_error": self.coordinator.last_error,
         }
+
+
+class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):
+    """Whether one hopper's food-level sensor is at or below the vendor's own low-food
+    threshold (`agent/src/state.rs::off::FOOD_1`/`FOOD_2`, kibble docs/07-config.md).
+
+    The device reports three raw levels (0 empty, 1 low, 2 full/ok), not a plain boolean --
+    this collapses to `True` for 0 and 1, matching the exact threshold the feeder's own
+    firmware uses internally to decide "sound the low-food alert" (two independent vendor
+    code paths agree on it, disassembly-proven, see the offset doc comment). `None` while
+    the byte still holds the boot-time "never reported yet" sentinel.
+    """
+
+    entity_description: KibbleHopperEmptyDescription
+
+    def __init__(self, coordinator: KibbleCoordinator, description: KibbleHopperEmptyDescription) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.coordinator.data.state.hopper_empty[self.entity_description.index]
 
 
 class KibbleSettingBinarySensor(KibbleEntity, BinarySensorEntity):

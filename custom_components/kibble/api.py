@@ -78,6 +78,10 @@ class FeederState:
     desiccant_days: int
     feeding: bool
     bowl_fill: tuple[int | None, int | None]
+    #: Per-hopper "is the food level at or below the vendor's own low-food threshold" flag --
+    #: `GET /state`'s `hopper_empty`, `[hopper_1, hopper_2]`. `None` while the feeder has never
+    #: reported a level for that hopper since its last boot (kibble docs/07-config.md).
+    hopper_empty: tuple[bool | None, bool | None]
     #: Kibble's own bowl-fullness estimate, computed on-device from the camera by the same
     #: vendor vision model the feeder itself uses -- the vendor only runs that model while its
     #: cloud session is up (kibble docs/34), so this is the only reading that exists with the
@@ -96,6 +100,7 @@ class FeederState:
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> FeederState:
         fill = data.get("bowl_fill") or [None, None]
+        hopper_empty = data.get("hopper_empty") or [None, None]
         local = data.get("bowl_fill_local") or [None, None]
         local_frame = data.get("bowl_fill_local_frame_unix")
         # `kibbled_last_exit_code` is null on a first, clean start -- a real 0 means "the
@@ -111,6 +116,10 @@ class FeederState:
             desiccant_days=int(data.get("desiccant_days") or 0),
             feeding=bool(data.get("feeding")),
             bowl_fill=(fill[0], fill[1] if len(fill) > 1 else None),
+            hopper_empty=(
+                hopper_empty[0],
+                hopper_empty[1] if len(hopper_empty) > 1 else None,
+            ),
             bowl_fill_local=(
                 local[0],
                 int(local_frame) if isinstance(local_frame, (int, float)) else None,

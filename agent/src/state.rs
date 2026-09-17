@@ -36,6 +36,24 @@ pub mod off {
     /// a FEED_LOG report, decrements it in `dispatch_handler_ble_res_feed_log` at 0x174b4).
     /// It reads 4 on a device where every feed works, so a non-zero value is not a fault.
     pub const EVENT_COUNTER: usize = 10184;
+    /// Per-hopper food-level sensor, mirrored byte-for-byte from the T31 MCU's own UART status
+    /// frame (frame byte +7 for hopper 1, +8 for hopper 2) by `ble`'s frame-receive handler
+    /// (`ble` vaddr `0x18408`): an unconditional word-copy loop at `0x18644`-`0x1865e` writes
+    /// frame[0..12) into `config_shm[10228..10240)`, which places frame+7/+8 at exactly these
+    /// two offsets (cross-checked against two already-known neighbours copied by the same loop:
+    /// frame+5 -> `config_shm[10233]`, frame+10 -> `off::FEEDING`). u8, three observed levels --
+    /// 0 = empty, 1 = low, 2 = full/ok -- not a boolean despite the Table A debug-string name
+    /// `state.ble.sta_data.food1_lack`/`food2_lack` (docs/07-config.md); `0xff` is a boot-time
+    /// "never reported yet" sentinel (`ble` tests `== 0xff` at `0x184a4`/`0x186b6`; `ctrl`'s own
+    /// reset-to-defaults path writes the literal `0xff` into `FOOD_2` at `0x88ac8`). The `< 2`
+    /// threshold is disassembly-proven, not assumed: `ctrl`'s low-food tone-alarm gate (vaddr
+    /// `0x8e208`-`0x8e21c`) fires whenever `food1 == 0 || food2 <= 1 || food1 == 1`, and `ble`'s
+    /// own warning-flag setter/clearer agrees exactly (sets `config_shm[9976]` at `0x14a8e`-
+    /// `0x14ab6` under the identical condition; clears it at `0x186bc`-`0x186dc` only when
+    /// `food1 == 2 && food2 == 2`). Live-read 2026-09-17: both bytes = 2 (both hoppers stocked).
+    /// See docs/07-config.md and docs/appendix-config-layout.json for the full evidence trail.
+    pub const FOOD_1: usize = 10235; // u8; frame+7; 0/1/2, 0xff = unset
+    pub const FOOD_2: usize = 10236; // u8; frame+8; 0/1/2, 0xff = unset
     /// Transient "a feed cycle is running" flag: 0 -> 1 -> 0 around a dispense.
     pub const FEEDING: usize = 10238;
     /// Watchdog liveness counters, one u32 per supervised process, followed at `slot + 0x20`
@@ -58,6 +76,19 @@ pub mod off {
     /// 2026-09-16: `pet_id` here equalled the single enrolled `petId` in
     /// `/opt/pet_name_color.json` with a `start_time` 169 s after a `visit` crop.
     pub const PET_TRACK: usize = 10368;
+}
+
+/// A hopper's raw food-level byte (`off::FOOD_1`/`off::FOOD_2`: 0/1/2, or `0xff` "never
+/// reported since boot") collapsed to "is this a problem" -- pure so the tests can drive every
+/// boundary without a live `config_shm`, the same reasoning as `ai.rs::track_key`. `< 2` is the
+/// vendor's own threshold, not an assumption: see the doc comment on `off::FOOD_1` for the two
+/// independent disassembled consumers (`ctrl`'s tone-alarm gate, `ble`'s own warning-flag
+/// setter/clearer) that both use exactly this boundary.
+fn hopper_empty_from_byte(raw: u8) -> Option<bool> {
+    match raw {
+        0xff => None,
+        v => Some(v < 2),
+    }
 }
 
 /// Bytes of the PetTrack block this module decodes: header (16) + 20 tracker entries of 24.
@@ -205,6 +236,12 @@ impl Shm {
         }
     }
 
+    /// A hopper's food level collapsed to "is this a problem" -- see
+    /// [`hopper_empty_from_byte`] for the threshold evidence.
+    pub fn hopper_empty(&self, at: usize) -> Option<bool> {
+        hopper_empty_from_byte(self.u8(at))
+    }
+
     /// `usr.user_info.timezone_name` -- the device's real, cloud-configured IANA zone, read live
     /// rather than assumed. Empty if `config_shm` hasn't been populated yet (before the vendor's
     /// own `loaded` flag goes up) or if the field is genuinely blank.
@@ -237,6 +274,8 @@ impl Shm {
             feeding: self.u8(off::FEEDING) != 0,
             bowl_fill_1: self.bowl_fill(off::BOWL_FILL_1),
             bowl_fill_2: self.bowl_fill(off::BOWL_FILL_2),
+            hopper_1_empty: self.hopper_empty(off::FOOD_1),
+            hopper_2_empty: self.hopper_empty(off::FOOD_2),
             event_counter: self.u8(off::EVENT_COUNTER),
             timezone_name,
             scheduler_tz_supported,
@@ -261,6 +300,9 @@ pub struct Snapshot {
     pub feeding: bool,
     pub bowl_fill_1: Option<u32>,
     pub bowl_fill_2: Option<u32>,
+    /// A hopper's food level collapsed to a problem flag -- see [`Shm::hopper_empty`].
+    pub hopper_1_empty: Option<bool>,
+    pub hopper_2_empty: Option<bool>,
     pub event_counter: u8,
     /// `usr.user_info.timezone_name`, as read live from `config_shm` -- see
     /// `Shm::timezone_name`.
@@ -280,6 +322,13 @@ impl Snapshot {
         fn opt(v: Option<u32>) -> String {
             v.map_or("null".into(), |n| n.to_string())
         }
+        fn opt_bool(v: Option<bool>) -> &'static str {
+            match v {
+                None => "null",
+                Some(true) => "true",
+                Some(false) => "false",
+            }
+        }
         let track = match self.track {
             Some(t) => format!(
                 r#"{{"pet_id":{},"start_unix":{},"value":{}}}"#,
@@ -290,8 +339,8 @@ impl Snapshot {
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
-                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"event_counter":{},"#,
-                r#""timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
+                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"#,
+                r#""event_counter":{},"timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
             ),
             self.serial.escape_debug(),
             self.firmware.escape_debug(),
@@ -301,6 +350,8 @@ impl Snapshot {
             self.feeding,
             opt(self.bowl_fill_1),
             opt(self.bowl_fill_2),
+            opt_bool(self.hopper_1_empty),
+            opt_bool(self.hopper_2_empty),
             self.event_counter,
             self.timezone_name.escape_debug(),
             self.scheduler_tz_supported,
@@ -323,6 +374,8 @@ mod tests {
             feeding: false,
             bowl_fill_1: Some(50),
             bowl_fill_2: None,
+            hopper_1_empty: Some(false),
+            hopper_2_empty: Some(false),
             event_counter: 3,
             timezone_name: "America/New_York".into(),
             scheduler_tz_supported: true,
@@ -386,5 +439,24 @@ mod tests {
         let json = s.to_json();
         assert!(json.contains(r#""timezone_name":"Europe/London""#));
         assert!(json.contains(r#""scheduler_tz_supported":false"#));
+    }
+
+    #[test]
+    fn hopper_empty_from_byte_thresholds_at_two_and_treats_0xff_as_unset() {
+        // The vendor's own boundary (docs/07-config.md): both `ctrl`'s tone-alarm gate and
+        // `ble`'s warning-flag setter/clearer treat 0 and 1 as a problem, 2 as fine.
+        assert_eq!(hopper_empty_from_byte(0), Some(true));
+        assert_eq!(hopper_empty_from_byte(1), Some(true));
+        assert_eq!(hopper_empty_from_byte(2), Some(false));
+        assert_eq!(hopper_empty_from_byte(3), Some(false));
+        assert_eq!(hopper_empty_from_byte(0xff), None);
+    }
+
+    #[test]
+    fn to_json_reports_hopper_empty() {
+        let mut s = sample();
+        s.hopper_1_empty = Some(true);
+        s.hopper_2_empty = None;
+        assert!(s.to_json().contains(r#""hopper_empty":[true,null]"#));
     }
 }

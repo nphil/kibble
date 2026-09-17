@@ -166,7 +166,7 @@ after all (unresolved — see Open Questions).
 
 ## 7. Struct coverage
 
-`config_layout.json` has **55 entries** covering **4,345 of 11,952 bytes directly with offset
+`config_layout.json` has **57 entries** covering **4,347 of 11,952 bytes directly with offset
 evidence (36.4%)** of the struct, spanning `confidence: "high"` (unique string/value match — device
 identity, network, OTA info, timezone, PID cluster), `"medium"` (plausible structural match, exact
 sub-field identity within a cluster unconfirmed), and `"low"` (region located, individual field
@@ -193,6 +193,15 @@ they live at an offset whose 1-byte value happens to coincide with a byte inside
 already-explained multi-byte value (an 8-bit field is much harder to rule out via "nonzero word"
 scanning than a 4-byte one). **This is the single biggest open item** — see Open Questions.
 
+**UPDATE (2026-09-17):** `food1_lack`/`food2_lack` -- or rather, the two hopper-level bytes
+`ctrl`'s own outbound status JSON reports under the wire keys `"food1"`/`"food2"` -- are now
+resolved to exact offsets, by a different method than either option this section originally
+proposed (no relocation-aware decompiler was needed, and no second capture): see §10. The
+"could not be located among 438 nonzero words" finding above is now explained rather than
+contradicted -- the live values at the time of *this* section's capture were almost certainly
+`2` each (§10's "full/ok" level), not `0`/`1`, so they were never distinguishable from
+surrounding non-zero struct noise by value-anchoring alone.
+
 ## 8. Open Questions
 
 1. **`state.ble.*` exact offsets** — needs either (a) a disassembly pass with relocation-aware
@@ -201,6 +210,9 @@ scanning than a 4-byte one). **This is the single biggest open item** — see Op
    code, unlike `pktool`'s dump table), or (b) a second `config_shm.bin` capture taken *during* an
    active feed cycle, where `moto_runt_data.*`/`sta_data.feed_sta` would go transiently nonzero and
    become value-anchorable — both require live-device access this study was barred from.
+   **UPDATE (2026-09-17):** resolved for `food1_lack`/`food2_lack` specifically, by a third
+   method neither (a) nor (b) anticipated -- see §10. The other 25 `state.ble.*` fields in this
+   item remain open.
 2. **Is `pktool get_config_info`'s underlying dump function reachable code at all?** My search
    found zero evidence any of its 228 debug strings are referenced from executable code — either the
    feature is implemented through a completely different (e.g. table-driven, GOT-indirected in a way
@@ -232,6 +244,116 @@ scanning than a 4-byte one). **This is the single biggest open item** — see Op
 Local copies of `config_shm.bin`, `ctrl`, `ble`, `pktool`, `media`, and the scratch analysis venv/
 scripts (`/tmp/petkit-cfg/`) are removed at the end of this study; no secret-bearing files were
 written outside `/tmp/petkit-cfg` (deleted) and the two deliverables listed in the task contract.
+
+## 10. UPDATE (2026-09-17): hopper food-level bytes resolved -- `FOOD_1`/`FOOD_2`
+
+Resolved as a side effect of a different task (exposing per-hopper "food ran out" flags
+locally): `config_shm[10235]` (hopper 1) and `config_shm[10236]` (hopper 2), both `u8`. Method
+was neither of §8 item 1's two proposed options -- no relocation-aware decompiler, no second
+capture. Instead: `ctrl`'s own outbound-report code turned out to be resolvable after all, by
+bulk-computing every `ldr rX,[pc,#N] ... add rX,pc` pair's target in `ctrl`'s `.text` (this
+document's own §6.2 method, which had previously resolved exactly one string this way) and
+matching against the cJSON key-string cluster `"DCV\0runtime\0mem\0cpu\0ubat\0cameraStatus\0
+door\0food1\0food2\0food\0bowl\0feeding\0eating\0ota\0ultra_sta\0ready\0"` (`ctrl` `.rodata`,
+file offset `0x95d81`, next to the literal `"sta sensor json create err!"`) -- the same cluster
+`34-bowl-fill-surplus.md` Part 2 already used to resolve `"bowl"`. All addresses below are from
+`/tmp/ctrl_full.bin` (md5
+`c645c0665da2cf73db93ffa8d9d0ea68`) and `/tmp/ble.bin` (md5 `133ee0b50aecf9419ac64d0c150c8de5`),
+both confirmed byte-identical to the live `/app/bin/{ctrl,ble}` this session via `md5sum`.
+
+### Offset resolution [HIGH]
+
+`ctrl`'s "build current device state" routine (vaddr `0x3184c`-`0x318ae`) copies ~15
+`config_shm` fields into a local struct field-by-field; two adjacent `u8` reads:
+
+```
+31866: movw r2, #10235   ; 0x27fb
+3186a: ldrb r2, [r3, r2]  ; r3 = g_config
+3186c: str.w r2, [r4, #0xf4]
+31870: movw r2, #10236   ; 0x27fc
+31874: ldrb r2, [r3, r2]
+31876: str.w r2, [r4, #0xf8]
+```
+
+A later block in the same function (`0x31c66`-`0x31d38`) diffs each local-struct field against a
+shadow copy and, if changed (or a `config_shm[9924]` reporting gate is set), calls a local
+helper (`0x8beec`) with `(json_object, key_string, value_as_double)`. Resolving each call's key
+string (same pc-relative pair-scan method) gives an exact, position-by-position map -- including
+two fields whose `config_shm` offset was **already known**, giving a live cross-check for the
+method itself, not just the two new fields:
+
+| local offset | `config_shm` offset | resolved JSON key | cross-check |
+|---|---|---|---|
+| `+0xf0` | *(hardcoded `1`, not a `config_shm` read)* | `"door"` | -- |
+| `+0xf4` | **10235** | `"food1"` | new |
+| `+0xf8` | **10236** | `"food2"` | new |
+| `+0xfc` | 9916 | `"bowl"` | == `off::BOWL_FILL_1` (already known) |
+| `+0x100` | 10238 | `"feeding"` | == `off::FEEDING` (already known) |
+| `+0x104` | 2960 | `"eating"` | -- |
+| `+0x108` | 3876 (as a bool) | `"ultra_sta"` | -- |
+
+The `+0xfc`/`+0x100` rows resolving to exactly `off::BOWL_FILL_1`/`off::FEEDING` -- offsets this
+document already trusted at HIGH confidence from unrelated evidence -- is what makes the two new
+rows HIGH rather than MEDIUM confidence: the same method, on the same call, gets known-good
+answers right next to the new ones.
+
+### Independent confirmation from the writer side [HIGH]
+
+`ble`'s MCU-status-frame handler (vaddr `0x18408`, nearest symbol
+`pkmcu_get_RTC_data@@Base+0x664`; parameter `r4`/`r0` = incoming frame pointer) reads frame
+bytes `+7`/`+8` (`0x1841e`, `0x18430`) to detect a change against the *current* `config_shm[10235]`/
+`[10236]` (`0x18424`, `0x1842e`), and unconditionally raw-copies frame bytes into
+`config_shm[10228..10240)` a few dozen instructions later (`0x18644`-`0x1865e`, three 4-byte
+word-copies from `frame+0`): position arithmetic places `frame+7` at `config_shm[10235]` and
+`frame+8` at `config_shm[10236]` -- and the same loop's neighbouring words cross-check cleanly
+against two more already-known offsets (`frame+5` -> `config_shm[10233]`, confirmed by a direct
+comparison at `ble` `0x184cc`; `frame+10` -> `config_shm[10238]` = `off::FEEDING`). So the value
+is a byte-for-byte mirror of the T31 MCU's own status frame, not a `ble`- or `ctrl`-computed
+derivative.
+
+### Encoding: three levels, not a boolean [HIGH]
+
+Table A names these fields `state.ble.sta_data.food1_lack`/`food2_lack` (a boolean-sounding
+name), but the live byte is **not** 0/1. Two independent consumers, in the two different
+binaries above, agree exactly on a `< 2` threshold, proving the real domain is `{0, 1, 2}`:
+
+- `ctrl`'s low-food tone-alarm gate (vaddr `0x8e1e8`-`0x8e21c`, guarded by a separate
+  `config_shm[2860]` enable flag) fires whenever `food1 == 0 || food2 <= 1 || food1 == 1` --
+  i.e. unless both are `>= 2`.
+- `ble` sets a `config_shm[9976]` "low-food warning active" flag under the identical condition
+  (`0x14a8e`-`0x14ab6`), and clears it (`0x186bc`-`0x186dc`) **only** when
+  `frame_food1 == 2 && frame_food2 == 2` (plus a `config_shm[9928]` gate `== 0`).
+
+Reading: **0 = empty, 1 = low, 2 = full/ok** -- 2 is the ceiling every consumer checks against;
+no comparison against any higher value was found in either binary. `kibbled`
+(`agent/src/state.rs::off::FOOD_1`/`FOOD_2`) collapses this to a boolean the same way the
+vendor's own alarm logic does (`< 2` = problem), not just `== 0`, since that is the feeder's own
+definition of "needs attention," not an invented threshold.
+
+### Sentinel: `0xff` = never reported since boot [MED/HIGH]
+
+`ble` treats the byte `== 0xff` as "still uninitialised" on both fields (`0x1849e`-`0x184a6` for
+`FOOD_1`, `0x186b0`-`0x186b8` for `FOOD_2`) rather than a real level. `ctrl` has a
+reset-to-defaults routine (vaddr near `0x88a90`-`0x88ad2`, run on some wifi/network-reconnect
+path not fully traced) that writes the literal `0xff` into `FOOD_2` (`0x88ac6`-`0x88ac8`,
+`movs r2,#255; strb r2,[r4,r3]`) and an unresolved register into `FOOD_1` at the adjacent site
+(`0x88ac0`) -- **[MED]** on that register's exact value (not traced back further), **[HIGH]** on
+`0xff` being a genuine sentinel given `ble`'s own explicit `== 0xff` checks. `kibbled` mirrors
+this exactly as `Shm::bowl_fill`'s `u32::MAX` handling: `0xff` -> `None`, not `Some(false)`.
+
+### Live values (2026-09-17)
+
+`dd`+`od` off the live `/dev/shm/config_shm`: `config_shm[10235] = 2`, `config_shm[10236] = 2`
+(both hoppers stocked) -- consistent with `GET /state`'s new `"hopper_empty":[false,false]`
+after deploying the change below.
+
+### What shipped
+
+`agent/src/state.rs`: `off::FOOD_1`/`off::FOOD_2`, `Shm::hopper_empty`/`hopper_empty_from_byte`,
+`Snapshot::{hopper_1_empty,hopper_2_empty}`, `to_json`'s `"hopper_empty":[bool|null,bool|null]`.
+`custom_components/kibble`: `FeederState.hopper_empty`, two `binary_sensor` entities
+(`hopper_1_empty`/`hopper_2_empty`, `device_class: problem`, `on` = empty per the `< 2` reading
+above). See `appendix-config-layout.json` for the machine-readable offset entries.
 
 ---
 
