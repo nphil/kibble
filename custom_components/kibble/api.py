@@ -121,15 +121,19 @@ class ScheduleEntry:
     amount_l: int
     amount_r: int
     enabled: bool
+    #: When kibbled's scheduler will next fire this entry (unix seconds), `None` when disabled.
+    next_fire_utc: int | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> ScheduleEntry:
+        next_fire = data.get("next_fire_utc")
         return cls(
             id=str(data.get("id", "")),
             time=str(data.get("time", "")),
             amount_l=int(data.get("amount_l") or 0),
             amount_r=int(data.get("amount_r") or 0),
             enabled=bool(data.get("enabled", True)),
+            next_fire_utc=int(next_fire) if next_fire is not None else None,
         )
 
 

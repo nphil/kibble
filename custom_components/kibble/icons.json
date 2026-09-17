@@ -231,6 +231,9 @@
       },
       "agent_starts": {
         "default": "mdi:restart"
+      },
+      "next_feed": {
+        "default": "mdi:clock-outline"
       }
     },
     "select": {
