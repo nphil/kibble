@@ -205,11 +205,20 @@ struct Watched {
 const WATCHED: &[Watched] = &[
     Watched { path: PET_FACE_PIC_JPG, class: "face", is_face_crop: true },
     Watched { path: FPRE_PET_JPEG, class: "visit", is_face_crop: false },
-    Watched { path: FPRE_EAT_JPEG, class: "eat", is_face_crop: false },
 ];
 
-/// How often the poll loop re-`stat`s the watched files. `media` writes these on its own
-/// detection cadence (seconds, not frames), so sub-second polling would buy nothing.
+/// An `"eat"` event with no frame of its own borrows the `"visit"` frame from at most this
+/// many seconds earlier: `media` raises the visit ~3 s before it decides the pet is eating
+/// (measured 57705.8 -> 57708.4 on the 2026-09-17 live meal, docs/34 Part 9), and the visit
+/// frame is that same cat at that same bowl. Anything older is a different visit.
+const EAT_VISIT_FRAME_LOOKBACK_SECS: u64 = 15;
+
+/// How often the poll loop re-`stat`s the watched files and re-reads the `EATING` flag.
+/// `media` writes the files on its own detection cadence (seconds, not frames), so sub-second
+/// polling would buy nothing -- and it is exactly why `/tmp/fPre_eat.jpeg` is *not* a watched
+/// file any more: `media` writes it and hands ctrl the eat-start message 35 ms later, and ctrl
+/// consumes it on receipt, so a 1 s poll saw it on zero of the meals observed (docs/34 Part 9).
+/// The `EATING` flag in config_shm stays up for the whole meal instead.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// How long `GET /events/stream` will block waiting for a new event past `?since=`.
 ///
@@ -390,6 +399,11 @@ impl Feed {
                 found.push((ts, "track", None, Some(fields)));
                 continue;
             }
+            if rest == "eat.json" {
+                let Ok(json) = fs::read_to_string(e.path()) else { continue };
+                found.push((ts, "eat", parse_eat_record(&json), None));
+                continue;
+            }
             let class = match rest.strip_suffix(".jpg").or_else(|| rest.strip_suffix(".jpeg")) {
                 Some("visit") => "visit",
                 Some("eat") => "eat",
@@ -452,6 +466,12 @@ impl Feed {
 
     fn push(&self, class: &'static str, image: Option<String>, cat: Option<String>) {
         self.push_detection(now_unix(), class, image, cat, None, None);
+    }
+
+    /// The visit frame an eat beginning at `ts` may borrow -- see [`select_eat_frame`].
+    fn recent_visit_frame(&self, ts: u64) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        select_eat_frame(inner.events.iter(), ts).map(str::to_string)
     }
 
     /// The vendor identified a pet: publish it under the vendor's own `start_time`, and persist
@@ -656,6 +676,35 @@ fn parse_track_record(json: &str) -> Option<(u32, f32)> {
     Some((pet_id, total_score))
 }
 
+/// Writes `EVENTS_DIR/<ts>-eat.json` for an eat that has no frame of its own: `{"image":"<name>"}`
+/// naming the borrowed visit frame (already on disk under its own name), or `{}` when there was
+/// none within [`EAT_VISIT_FRAME_LOOKBACK_SECS`]. An eat whose own frame *was* still on disk
+/// when the flag rose is saved as `<ts>-eat.jpg` like any other crop and needs no sidecar.
+fn save_eat_record(ts: u64, image: Option<&str>) -> io::Result<()> {
+    let json = match image {
+        Some(name) => format!(r#"{{"image":"{}"}}"#, name.escape_debug()),
+        None => "{}".to_string(),
+    };
+    fs::write(Path::new(EVENTS_DIR).join(format!("{ts}-eat.json")), json)
+}
+
+/// The inverse of [`save_eat_record`]: the borrowed frame's name, if the record has one and it
+/// is still a safe name (`prune_events_dir` may since have deleted the file; the timeline then
+/// simply shows the row without a picture, the same as an eat that never had one).
+fn parse_eat_record(json: &str) -> Option<String> {
+    crate::http::json_field(json, "image").filter(|name| is_safe_name(name)).map(str::to_string)
+}
+
+/// The frame to show for an eat that began at `ts` when its own JPEG is already gone: the most
+/// recent `"visit"` frame no older than [`EAT_VISIT_FRAME_LOOKBACK_SECS`]. Pure; see the
+/// constant's doc for the measurement behind the window.
+fn select_eat_frame<'a>(detections: impl Iterator<Item = &'a Detection>, ts: u64) -> Option<&'a str> {
+    detections
+        .filter(|d| d.class == "visit" && d.ts <= ts && ts - d.ts <= EAT_VISIT_FRAME_LOOKBACK_SECS)
+        .max_by_key(|d| d.ts)
+        .and_then(|d| d.image.as_deref())
+}
+
 /// Identity of a tracker entry for change detection: the vendor rewrites the block on every
 /// visit, and a new `(pet_id, start_time)` pair is what "a new identification" means. Pure so
 /// the tests can drive it without a live `config_shm`.
@@ -671,6 +720,9 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
     let mut last_seen: Vec<Option<SystemTime>> =
         WATCHED.iter().map(|w| fs::metadata(w.path).and_then(|m| m.modified()).ok()).collect();
     let mut last_track = shm.pet_track().as_ref().and_then(track_key);
+    // Same startup rule for the eat flag: a meal already in progress when kibbled starts is
+    // not a new event (and would be re-announced on every restart mid-meal otherwise).
+    let mut last_eating = shm.eating();
     // The vendor-state fields HA reads from `GET /state` (bowl fill, desiccant, feeding, the
     // identification block) have no producer of their own on our side -- media/ble write them
     // straight into config_shm -- so this loop's existing 1 s tick doubles as their change
@@ -713,6 +765,36 @@ fn poll_loop(feed: Arc<Feed>, gallery: Arc<faces::Gallery>, shm: Arc<Shm>) {
                 feed.push(w.class, saved.then_some(name), cat);
             }
         }
+        // The eat event: `media`'s own verdict, read as a level not an edge-triggered file (see
+        // `POLL_INTERVAL`). Rising edge = one `"eat"` event; the falling edge only changes the
+        // `eating` field of `GET /state` (the snapshot compare below pushes it).
+        let eating = shm.eating();
+        if eating && !last_eating {
+            let ts = now_unix();
+            // Its own frame, if ctrl has not consumed it yet (a ~35 ms window; usually gone).
+            let own = fs::read(FPRE_EAT_JPEG).ok();
+            let image = match own {
+                Some(bytes) => {
+                    let name = format!("{ts}-eat.jpg");
+                    let saved = fs::write(Path::new(EVENTS_DIR).join(&name), &bytes).is_ok();
+                    if saved {
+                        prune_events_dir();
+                    }
+                    saved.then_some(name)
+                }
+                None => {
+                    let borrowed = feed.recent_visit_frame(ts);
+                    if let Err(e) = save_eat_record(ts, borrowed.as_deref()) {
+                        eprintln!("kibbled: ai: save eat record for ts={ts}: {e}");
+                    } else {
+                        prune_events_dir();
+                    }
+                    borrowed
+                }
+            };
+            feed.push_detection(ts, "eat", image, None, None, None);
+        }
+        last_eating = eating;
         // `None` here means a torn read (media was mid-write) -- keep the previous key and
         // look again next tick rather than treating it as "the block emptied".
         if let Some(track) = shm.pet_track() {
@@ -1009,6 +1091,29 @@ mod tests {
         fs::write(Path::new(EVENTS_DIR).join(&name), b"fake-jpeg-bytes").unwrap();
         assert_eq!(read_event(&name).unwrap(), b"fake-jpeg-bytes");
         let _ = fs::remove_file(Path::new(EVENTS_DIR).join(&name));
+    }
+
+    #[test]
+    fn eat_borrows_the_latest_visit_frame_within_the_lookback_only() {
+        // A visit 3 s before the meal (the measured vendor cadence) is the frame to show.
+        let events = [det(1000 - 3, "visit", "near.jpg"), det(1000 - 10, "visit", "far.jpg")];
+        assert_eq!(select_eat_frame(events.iter(), 1000), Some("near.jpg"));
+        // Exactly at the window's edge still counts; one past it is a different visit.
+        let edge = [det(1000 - EAT_VISIT_FRAME_LOOKBACK_SECS, "visit", "edge.jpg")];
+        assert_eq!(select_eat_frame(edge.iter(), 1000), Some("edge.jpg"));
+        let stale = [det(1000 - EAT_VISIT_FRAME_LOOKBACK_SECS - 1, "visit", "stale.jpg")];
+        assert_eq!(select_eat_frame(stale.iter(), 1000), None);
+        // Only visit frames: a face crop or an earlier eat is never the picture of this meal,
+        // and a visit *after* the meal began belongs to the next one.
+        let others = [det(999, "face", "face.jpg"), det(998, "eat", "eat.jpg"), det(1001, "visit", "later.jpg")];
+        assert_eq!(select_eat_frame(others.iter(), 1000), None);
+    }
+
+    #[test]
+    fn eat_record_round_trips_the_borrowed_frame_and_rejects_unsafe_names() {
+        assert_eq!(parse_eat_record(r#"{"image":"1700000000-visit.jpg"}"#), Some("1700000000-visit.jpg".to_string()));
+        assert_eq!(parse_eat_record("{}"), None);
+        assert_eq!(parse_eat_record(r#"{"image":"../etc/passwd"}"#), None);
     }
 
     #[test]

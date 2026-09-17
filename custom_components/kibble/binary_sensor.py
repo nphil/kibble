@@ -213,6 +213,7 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     entities: list[BinarySensorEntity] = [
         KibbleFeedingSensor(coordinator),
+        KibbleEatingSensor(coordinator),
         KibbleReachableBinarySensor(coordinator),
     ]
     entities.extend(KibbleSettingBinarySensor(coordinator, d) for d in SETTING_SENSORS)
@@ -252,6 +253,26 @@ class KibbleFeedingSensor(KibbleEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.coordinator.data.state.feeding
+
+
+class KibbleEatingSensor(KibbleEntity, BinarySensorEntity):
+    """Whether a pet is eating at the bowl right now, per the feeder's own vision detector.
+
+    `media` raises this flag when its eat state machine fires (the same verdict the
+    Petkit app's "ate" notifications come from) and clears it when the meal ends --
+    typically a minute or two later. Read straight from the device's shared memory, so
+    it works with the cloud disabled.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_translation_key = "eating"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "eating")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.state.eating
 
 
 class KibbleReachableBinarySensor(KibbleEntity, BinarySensorEntity):

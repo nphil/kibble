@@ -23,6 +23,9 @@
       "feeding": {
         "name": "Feeding"
       },
+      "eating": {
+        "name": "Eating"
+      },
       "reachable": {
         "name": "Feeder reachable"
       },

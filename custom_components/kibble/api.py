@@ -77,6 +77,9 @@ class FeederState:
     volume: int
     desiccant_days: int
     feeding: bool
+    #: `GET /state`'s `eating`: `media`'s own eat-in-progress flag (kibble docs/34 Part 9) --
+    #: set the moment its detector decides a pet is eating, cleared when the meal ends.
+    eating: bool
     bowl_fill: tuple[int | None, int | None]
     #: Per-hopper "is the food level at or below the vendor's own low-food threshold" flag --
     #: `GET /state`'s `hopper_empty`, `[hopper_1, hopper_2]`. `None` while the feeder has never
@@ -119,6 +122,7 @@ class FeederState:
             volume=int(data.get("volume") or 0),
             desiccant_days=int(data.get("desiccant_days") or 0),
             feeding=bool(data.get("feeding")),
+            eating=bool(data.get("eating")),
             bowl_fill=(fill[0], fill[1] if len(fill) > 1 else None),
             hopper_empty=(
                 hopper_empty[0],

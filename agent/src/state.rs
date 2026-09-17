@@ -56,6 +56,13 @@ pub mod off {
     pub const FOOD_2: usize = 10236; // u8; frame+8; 0/1/2, 0xff = unset
     /// Transient "a feed cycle is running" flag: 0 -> 1 -> 0 around a dispense.
     pub const FEEDING: usize = 10238;
+    /// `media`'s own "a pet is eating right now" flag, u8: `eat_event_start_signal` stores 1
+    /// (media 0x1df10, right after it writes `/tmp/fPre_eat.jpeg` and just before it sends
+    /// ctrl the `E_EVT_RPT_TYPE_PET_EAT_START` 0x1002), `eat_event_over_signal` stores 0
+    /// (0x1e110). ctrl reports it to the cloud as `"eating"`. This, not the JPEG, is what
+    /// `ai.rs` derives the `"eat"` event from: the picture lives ~35 ms before ctrl consumes
+    /// and removes it (docs/34 Part 9), the flag lives for the whole meal.
+    pub const EATING: usize = 2960;
     /// Watchdog liveness counters, one u32 per supervised process, followed at `slot + 0x20`
     /// by that process's pid. Live series (2026-09-16, 45 samples at 2 s): each owned slot
     /// cycles 0/1/2 -- a small counter, not the 0<->1 toggle the first study guessed -- and
@@ -245,6 +252,11 @@ impl Shm {
         }
     }
 
+    /// Whether `media`'s eat detector currently sees a pet eating -- see [`off::EATING`].
+    pub fn eating(&self) -> bool {
+        self.u8(off::EATING) != 0
+    }
+
     /// A hopper's food level collapsed to "is this a problem" -- see
     /// [`hopper_empty_from_byte`] for the threshold evidence.
     pub fn hopper_empty(&self, at: usize) -> Option<bool> {
@@ -291,6 +303,7 @@ impl Shm {
             volume: self.u8(off::VOLUME),
             desiccant_days: self.u8(off::DESICCANT_DAYS),
             feeding: self.u8(off::FEEDING) != 0,
+            eating: self.eating(),
             bowl_fill_1: self.bowl_fill(off::BOWL_FILL_1),
             bowl_fill_2: self.bowl_fill(off::BOWL_FILL_2),
             hopper_1_empty: self.hopper_empty(off::FOOD_1),
@@ -319,6 +332,8 @@ pub struct Snapshot {
     pub volume: u8,
     pub desiccant_days: u8,
     pub feeding: bool,
+    /// `media`'s eat-in-progress flag -- see [`off::EATING`].
+    pub eating: bool,
     pub bowl_fill_1: Option<u32>,
     pub bowl_fill_2: Option<u32>,
     /// A hopper's food level collapsed to a problem flag -- see [`Shm::hopper_empty`].
@@ -363,7 +378,7 @@ impl Snapshot {
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
-                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"hopper_level":[{},{}],"#,
+                r#""desiccant_days":{},"feeding":{},"eating":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"hopper_level":[{},{}],"#,
                 r#""event_counter":{},"timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
             ),
             self.serial.escape_debug(),
@@ -372,6 +387,7 @@ impl Snapshot {
             self.volume,
             self.desiccant_days,
             self.feeding,
+            self.eating,
             opt(self.bowl_fill_1),
             opt(self.bowl_fill_2),
             opt_bool(self.hopper_1_empty),
@@ -398,6 +414,7 @@ mod tests {
             volume: 6,
             desiccant_days: 30,
             feeding: false,
+            eating: false,
             bowl_fill_1: Some(50),
             bowl_fill_2: None,
             hopper_1_empty: Some(false),
