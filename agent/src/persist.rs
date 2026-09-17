@@ -185,6 +185,9 @@ fn wait_until_ready(shm: &Shm) {
 fn reconcile_once(shm: &Shm) {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for (key, desired_value) in desired::load() {
+        if key == crate::scheduler::SETTINGS_KEY {
+            continue; // the scheduler's own switch shares this file; it is not a device setting
+        }
         let Some(setting) = SETTINGS.iter().find(|s| s.key == key) else {
             eprintln!("kibbled: settings.json has unknown key {key:?}, skipping");
             continue;
