@@ -31,6 +31,17 @@ notify() {
   echo "<14>kibbled: $1" | nc -u -w 1 "$SYSLOG_HOST" "$SYSLOG_PORT" 2>/dev/null
 }
 
+# /tmp is a 46 MB tmpfs backed by the device's 92 MB of RAM: cap kibbled's own log so a
+# chatty failure can never eat memory. Truncating a file the process still writes with `>`
+# leaves a hole at the old offset, which tmpfs does not allocate -- so this is safe to do
+# while kibbled runs, and costs nothing when the log is small.
+(
+  while :; do
+    sleep 3600
+    [ "$(wc -c < /tmp/kibbled.log 2>/dev/null || echo 0)" -gt 4194304 ] && : > /tmp/kibbled.log
+  done
+) &
+
 (
   sleep 20
   i=0
