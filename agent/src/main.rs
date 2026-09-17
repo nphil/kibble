@@ -39,7 +39,8 @@
 //!                                   polled from /tmp, NOT a tap of ctrl's private mqueue inbox;
 //!                                   score/pet_id/box are honestly null -- see ai.rs's module doc
 //!   GET    /events/stream?since=N   long-poll for detections past sequence N (empty array on
-//!                                   timeout, ~25s)
+//!                                   timeout, ~2s -- kept for backward compatibility, not used by
+//!                                   HA/Scrypted; see ai::LONG_POLL_TIMEOUT's doc)
 //!   GET    /events/<file>           one detection's raw crop bytes (`image/jpeg`), for every
 //!                                   class (`face`/`visit`/`eat`) -- `Detection.image` names it
 //!   GET    /events/track/<ts>/image the eat (preferred) or visit crop paired with a track event at

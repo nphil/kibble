@@ -155,11 +155,22 @@ impl BleAdv {
     /// never turns it off based on anything but our own recorded `until`, so it cannot fight a
     /// pairing session someone starts by other means (e.g. the physical button).
     fn reconcile_once(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.on && now_unix() >= state.until {
+        // Send after releasing the lock, matching `set`'s own order: `bus::Sender::send` opens
+        // its mqd without O_NONBLOCK (`bus.rs`), so it can block if `ble`'s queue is ever full --
+        // holding `state` across that call would stall `set` (called synchronously from the HTTP
+        // handler for `POST /ble/advertise`) waiting on the same lock, which would stall the
+        // whole single-threaded HTTP server behind it.
+        let turned_off = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let due = state.on && now_unix() >= state.until;
+            if due {
+                state.on = false;
+                state.until = 0;
+            }
+            due
+        };
+        if turned_off {
             let _ = self.sender.send(msg::BLE_SET_ADV, &payload(false));
-            state.on = false;
-            state.until = 0;
         }
     }
 }

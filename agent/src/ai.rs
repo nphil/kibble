@@ -212,7 +212,18 @@ const WATCHED: &[Watched] = &[
 /// detection cadence (seconds, not frames), so sub-second polling would buy nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// How long `GET /events/stream` will block waiting for a new event past `?since=`.
-pub const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
+///
+/// Was 25s; cut down after the documented starvation incident (`scrypted-plugin/README.md`
+/// "The starvation incident", `33-local-push.md` §2.1): `http.rs`'s server is one thread, one
+/// connection at a time, by deliberate design, so *any* held request blocks every other client
+/// for its duration -- `GET /state` measured going from 0.19s to 10s-timeouts house-wide while
+/// one long-poll was attached. Every current consumer has since moved off this endpoint's
+/// long-poll (HA uses `push.rs`'s own listener on :8766; Scrypted short-polls the instant
+/// `GET /events` instead) -- it stays only for backward compatibility, per `33-local-push.md`
+/// §2.1, so it must not be able to reproduce that incident for whatever calls it next. 2s keeps
+/// most of the point (avoids pure busy-polling) while bounding the worst case to something an
+/// interactive request like `POST /feed` queued up behind it would not visibly notice.
+pub const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// `GET /events` returns at most this many, newest last -- matches the assignment's own cap.
 /// How far apart a `"face"` event's `ts` and its pending crop's filename `ts` may be and still
 /// be the same capture (both stamped on one poll tick, by separate `now_unix()` calls).

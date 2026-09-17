@@ -292,8 +292,10 @@ republishes a `Detection{seq, ts, class, score, pet_id, box, image}` on change. 
 replacing `ctrl` — never fabricated. `class` and `image` (a copied-out crop) are real.
 
 - `GET /events` — last 50, oldest first.
-- `GET /events/stream?since=N` — long-poll (~25 s) for anything past sequence `N`, empty array on
-  timeout — lets Scrypted/HA subscribe without hard-polling.
+- `GET /events/stream?since=N` — long-poll (~2 s, cut down 2026-09-16 from the original 25 s
+  after `scrypted-plugin/README.md`'s "starvation incident" — see `ai::LONG_POLL_TIMEOUT`'s doc)
+  for anything past sequence `N`, empty array on timeout — kept for backward compatibility;
+  Scrypted short-polls the instant `GET /events` and HA uses `push.rs`'s own listener instead.
 
 `msg::GET_PET_FACE_INFO_BY_NETWORK` (`0x101c`) / `msg::CTRL_EVENT_MSG` (`0x1002`) /
 `EVENT_TYPE_PET_TRACKING` (`0x18`) / `CtrlEventMsgHeader` (decodes the one disassembly-confirmed
