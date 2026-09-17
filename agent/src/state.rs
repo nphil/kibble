@@ -76,6 +76,15 @@ pub mod off {
     /// 2026-09-16: `pet_id` here equalled the single enrolled `petId` in
     /// `/opt/pet_name_color.json` with a `start_time` 169 s after a `visit` crop.
     pub const PET_TRACK: usize = 10368;
+    /// `ctrl`'s own cloud/IoT connection state word: `-1` never/failed, `2` connecting,
+    /// `1` connected (writers at ctrl 0x27f6c/0x27e1e/0x28080, docs/35). Read by `media` as a
+    /// gate on its "cloud" detectors: `media` 0x20750 invalidates `BOWL_FILL_1` and 0x2092c
+    /// skips the food model unless this is 1 or 2; `check_algo_status` (0x2408e) needs `> 0`.
+    /// Also `ctrl`'s own 180s Wi-Fi power-cycle gate fires only while it is `-1`. With the
+    /// cloud blackholed ctrl leaves it at `-1` forever, which is why bowl fill never refreshed
+    /// and the radio reset every 3 minutes; kibbled holds it at `2` instead
+    /// (`cloud::hold_connecting_state`).
+    pub const CLOUD_CONN_STATE: usize = 10120;
 }
 
 /// A hopper's raw food-level byte (`off::FOOD_1`/`off::FOOD_2`: 0/1/2, or `0xff` "never

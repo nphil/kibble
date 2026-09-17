@@ -419,10 +419,34 @@ fn wait_for_live_route() {
     }
 }
 
+/// The value `ctrl` itself writes to `state::off::CLOUD_CONN_STATE` while a cloud connect is in
+/// progress. Chosen over `1` ("connected") deliberately: `media`'s detector gates accept either,
+/// `ctrl`'s radio-reset gate needs only "not -1", but `ctrl`'s per-property MQTT push paths
+/// (13 sites, docs/35) fire only on `1` -- and there is no cloud to push to.
+const CLOUD_CONN_CONNECTING: u32 = 2;
+
+/// While the cloud is deliberately disabled, keep `ctrl`'s connection-state word from saying
+/// "failed": `ctrl` re-stamps `-1` on every failed connect attempt, and that single word is
+/// what turns off `media`'s bowl-fill/eat detection and turns on the 180s radio power-cycle
+/// (docs/34 Part 8, docs/35). Idempotent; no-op when the cloud is enabled (ctrl owns it then).
+fn hold_connecting_state(desired_enabled: bool) {
+    if desired_enabled {
+        return;
+    }
+    let Ok(shm) = crate::state::Shm::open() else { return };
+    if shm.u32(crate::state::off::CLOUD_CONN_STATE) == CLOUD_CONN_CONNECTING {
+        return;
+    }
+    if let Err(e) = crate::persist::write_state_u32(crate::state::off::CLOUD_CONN_STATE, CLOUD_CONN_CONNECTING) {
+        eprintln!("kibbled: cloud: could not hold the connection-state word: {e}");
+    }
+}
+
 fn reconcile_once() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut runner = RealRunner;
     let state = load();
+    hold_connecting_state(state.desired);
     let live = match runner.run(&["route", "show"]) {
         Ok(l) => l,
         Err(e) => {

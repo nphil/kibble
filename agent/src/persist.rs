@@ -128,6 +128,16 @@ pub fn write_setting(key: &str, value: u32) -> Result<WriteOutcome, WriteError> 
 
 /// The actual `config_shm` write plus live notify, under the vendor's own lock. Shared by
 /// `write_setting` (one key, from an HTTP request) and the reconciler (every recorded key, on a
+/// One raw little-endian u32 store into `config_shm`'s live `state.*` section, under the vendor's
+/// own config lock. For state words kibbled maintains on the vendor's behalf (today: the cloud
+/// connection state, `cloud::hold_connecting_state`) -- not for `usr.*` settings, which go
+/// through `Setting`/`apply_value` so they are also persisted and notified.
+pub fn write_state_u32(offset: usize, value: u32) -> io::Result<()> {
+    let _lock = ConfigLock::acquire()?;
+    let shm = OpenOptions::new().write(true).open(SHM_PATH)?;
+    shm.write_at(&value.to_le_bytes(), offset as u64).map(|_| ())
+}
+
 /// timer) so both go through identical, single-purpose logic.
 fn apply_value(setting: &'static Setting, value: u32) -> io::Result<Option<bool>> {
     let _lock = ConfigLock::acquire()?;

@@ -1190,3 +1190,34 @@ feed; no other file under `/opt` or `/tmp` was created and left behind by this s
 `kibbled` itself was deployed once (md5 `b3690a3c51ff8fe779e9329c069f2f87`) and restarted a further
 two times for the integration test above -- both ordinary, supervisor-driven restarts, not crashes
 (`kibbled_last_exit_code` stayed `null` throughout).
+
+
+## Part 8 — Solved at the source: the cloud-connection state word [HIGH]
+
+`media` gates its "cloud" detectors on `ctrl`'s own connection-state word, `config_shm+10120`
+(the same word docs/35 found gating `ctrl`'s 180 s radio power-cycle):
+
+- `media` 0x20750 (called at the top of the food-detect gate 0x2092c): unless
+  `[2960]==0 && [9937]==0 && [9963]!=0 && [9964]==0 && (word-1) <= 1` (i.e. word ∈ {1, 2}),
+  it **invalidates** `BOWL_FILL_1` (`str -1`) and logs. This is why the value "expired" on its
+  own after every cloud window closed, and why it never populated with the cloud off.
+- `media` `check_algo_status` 0x2408e: the one-shot algo-status init (msg 0x101c to ctrl) runs
+  only when the word is `> 0` and uptime > 59 s.
+
+Writers of the word (docs/35): `ctrl` stamps `-1` on a failed connect (0x27f6c), `2` while
+connecting (0x27e1e), `1` when connected (0x28080). With the cloud blackholed it stays `-1`.
+
+Live test 2026-09-17 12:28 UTC, cloud disabled: wrote `2` to `config_shm+10120`; within 3 min
+`media` ran the food model and `BOWL_FILL_1` went `0xffffffff -> 25` (kibbled's own inference on
+the same scene: 23%). The word was not re-stamped by ctrl in that window.
+
+Why `2` and not `1`: `media` accepts either; `ctrl`'s radio-reset gate needs only "not -1";
+but `ctrl`'s 13 per-property MQTT push sites (docs/35) fire only on `== 1`, and there is no
+cloud to push to. `2` ("connecting") is a state ctrl itself uses, so no consumer sees a value
+it has never seen before.
+
+kibbled now holds the word at `2` whenever the cloud is *desired* disabled
+(`cloud::hold_connecting_state`, on the 15 s cloud reconciler tick, idempotent) — so the
+vendor's bowl fill, its eat/behaviour detectors and the quiet radio all follow from one line.
+Part 7's own inference (`bowl_fill_local`) stays as an independent cross-check and as the
+fallback for the first minutes after a boot, before media's first run.
