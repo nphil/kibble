@@ -82,6 +82,9 @@ class FeederState:
     #: `GET /state`'s `hopper_empty`, `[hopper_1, hopper_2]`. `None` while the feeder has never
     #: reported a level for that hopper since its last boot (kibble docs/07-config.md).
     hopper_empty: tuple[bool | None, bool | None]
+    #: `GET /state`'s `hopper_level`: the MCU's own three-way reading per hopper, 0 empty /
+    #: 1 low / 2 ok, `None` until the MCU has reported one since boot.
+    hopper_level: tuple[int | None, int | None]
     #: Kibble's own bowl-fullness estimate, computed on-device from the camera by the same
     #: vendor vision model the feeder itself uses -- the vendor only runs that model while its
     #: cloud session is up (kibble docs/34), so this is the only reading that exists with the
@@ -101,6 +104,7 @@ class FeederState:
     def from_json(cls, data: dict[str, Any]) -> FeederState:
         fill = data.get("bowl_fill") or [None, None]
         hopper_empty = data.get("hopper_empty") or [None, None]
+        hopper_level = data.get("hopper_level") or [None, None]
         local = data.get("bowl_fill_local") or [None, None]
         local_frame = data.get("bowl_fill_local_frame_unix")
         # `kibbled_last_exit_code` is null on a first, clean start -- a real 0 means "the
@@ -119,6 +123,10 @@ class FeederState:
             hopper_empty=(
                 hopper_empty[0],
                 hopper_empty[1] if len(hopper_empty) > 1 else None,
+            ),
+            hopper_level=(
+                hopper_level[0] if len(hopper_level) > 0 else None,
+                hopper_level[1] if len(hopper_level) > 1 else None,
             ),
             bowl_fill_local=(
                 local[0],

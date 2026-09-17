@@ -48,6 +48,13 @@ class KibbleSensorDescription(SensorEntityDescription):
     attributes: Callable[[FeederState], dict[str, Any]] | None = None
 
 
+HOPPER_LEVELS = ["empty", "low", "ok"]
+
+
+def _hopper_level_name(level: int | None) -> str | None:
+    return HOPPER_LEVELS[level] if level is not None and 0 <= level < len(HOPPER_LEVELS) else None
+
+
 SENSORS: tuple[KibbleSensorDescription, ...] = (
     KibbleSensorDescription(
         # The vendor's own reading when there is one, else Kibble's own on-device estimate --
@@ -74,6 +81,22 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         value=lambda s: s.bowl_fill[1],
+    ),
+    KibbleSensorDescription(
+        # The MCU's own three-way hopper reading (docs/07-config.md §10) -- the closest thing
+        # this feeder has to a hopper gauge; the `_empty` binary sensors are its collapsed form.
+        key="hopper_1_level",
+        translation_key="hopper_1_level",
+        device_class=SensorDeviceClass.ENUM,
+        options=HOPPER_LEVELS,
+        value=lambda s: _hopper_level_name(s.hopper_level[0]),
+    ),
+    KibbleSensorDescription(
+        key="hopper_2_level",
+        translation_key="hopper_2_level",
+        device_class=SensorDeviceClass.ENUM,
+        options=HOPPER_LEVELS,
+        value=lambda s: _hopper_level_name(s.hopper_level[1]),
     ),
     KibbleSensorDescription(
         key="desiccant_days",

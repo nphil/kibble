@@ -246,6 +246,22 @@
       },
       "next_feed": {
         "default": "mdi:clock-outline"
+      },
+      "hopper_1_level": {
+        "default": "mdi:silo",
+        "state": {
+          "empty": "mdi:silo-outline",
+          "low": "mdi:silo-outline",
+          "ok": "mdi:silo"
+        }
+      },
+      "hopper_2_level": {
+        "default": "mdi:silo",
+        "state": {
+          "empty": "mdi:silo-outline",
+          "low": "mdi:silo-outline",
+          "ok": "mdi:silo"
+        }
       }
     },
     "select": {

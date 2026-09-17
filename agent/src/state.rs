@@ -242,6 +242,16 @@ impl Shm {
         hopper_empty_from_byte(self.u8(at))
     }
 
+    /// A hopper's raw MCU food level: 0 empty, 1 low, 2 ok -- `None` for the `0xff` "never
+    /// reported since boot" sentinel. The three-way reading the vendor's own alarm gate is built
+    /// on (docs/07-config.md §10); `hopper_empty` is its collapsed form.
+    pub fn hopper_level(&self, at: usize) -> Option<u8> {
+        match self.u8(at) {
+            0xff => None,
+            v => Some(v.min(2)),
+        }
+    }
+
     /// `usr.user_info.timezone_name` -- the device's real, cloud-configured IANA zone, read live
     /// rather than assumed. Empty if `config_shm` hasn't been populated yet (before the vendor's
     /// own `loaded` flag goes up) or if the field is genuinely blank.
@@ -276,6 +286,8 @@ impl Shm {
             bowl_fill_2: self.bowl_fill(off::BOWL_FILL_2),
             hopper_1_empty: self.hopper_empty(off::FOOD_1),
             hopper_2_empty: self.hopper_empty(off::FOOD_2),
+            hopper_1_level: self.hopper_level(off::FOOD_1),
+            hopper_2_level: self.hopper_level(off::FOOD_2),
             event_counter: self.u8(off::EVENT_COUNTER),
             timezone_name,
             scheduler_tz_supported,
@@ -303,6 +315,9 @@ pub struct Snapshot {
     /// A hopper's food level collapsed to a problem flag -- see [`Shm::hopper_empty`].
     pub hopper_1_empty: Option<bool>,
     pub hopper_2_empty: Option<bool>,
+    /// The raw three-level reading behind the flags -- see [`Shm::hopper_level`].
+    pub hopper_1_level: Option<u8>,
+    pub hopper_2_level: Option<u8>,
     pub event_counter: u8,
     /// `usr.user_info.timezone_name`, as read live from `config_shm` -- see
     /// `Shm::timezone_name`.
@@ -339,7 +354,7 @@ impl Snapshot {
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
-                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"#,
+                r#""desiccant_days":{},"feeding":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"hopper_level":[{},{}],"#,
                 r#""event_counter":{},"timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
             ),
             self.serial.escape_debug(),
@@ -352,6 +367,8 @@ impl Snapshot {
             opt(self.bowl_fill_2),
             opt_bool(self.hopper_1_empty),
             opt_bool(self.hopper_2_empty),
+            opt(self.hopper_1_level.map(u32::from)),
+            opt(self.hopper_2_level.map(u32::from)),
             self.event_counter,
             self.timezone_name.escape_debug(),
             self.scheduler_tz_supported,
@@ -375,6 +392,8 @@ mod tests {
             bowl_fill_1: Some(50),
             bowl_fill_2: None,
             hopper_1_empty: Some(false),
+            hopper_1_level: Some(2),
+            hopper_2_level: None,
             hopper_2_empty: Some(false),
             event_counter: 3,
             timezone_name: "America/New_York".into(),
@@ -458,5 +477,6 @@ mod tests {
         s.hopper_1_empty = Some(true);
         s.hopper_2_empty = None;
         assert!(s.to_json().contains(r#""hopper_empty":[true,null]"#));
+        assert!(s.to_json().contains(r#""hopper_level":[2,null]"#));
     }
 }

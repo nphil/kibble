@@ -156,6 +156,14 @@
       "next_feed": {
         "name": "Next feed"
       },
+      "hopper_1_level": {
+        "name": "Hopper 1 level",
+        "state": {"empty": "Empty", "low": "Low", "ok": "OK"}
+      },
+      "hopper_2_level": {
+        "name": "Hopper 2 level",
+        "state": {"empty": "Empty", "low": "Low", "ok": "OK"}
+      },
       "move_sensitivity": {
         "name": "Motion detection sensitivity"
       },
