@@ -126,9 +126,24 @@ def test_timeline_feed_before_after_are_the_bare_filenames() -> None:
 # --- timeline_items: kind split (identified/eat/visit) and track pairing ------------------------
 
 
-def test_timeline_face_events_produce_no_row() -> None:
-    """`face` crops are `kibble/faces/*` training material, never timeline activity."""
+def test_timeline_unlabelled_face_events_produce_no_row() -> None:
+    """A `face` crop nobody has named yet is `kibble/faces/*` training material, not activity."""
     assert timeline_items((_event(1, 10, "face", image="10-face.jpg"),), (), {}) == []
+
+
+def test_timeline_labelled_face_event_is_a_named_sighting_with_its_own_crop() -> None:
+    """Once the crop carries a cat (classifier or human label), it is the sighting the cats
+    tile's "last here" is measured from, so it must appear -- served through the `event` image
+    kind, unlike a track's server-side pairing."""
+    item = timeline_items((_event(1, 10, "face", cat="Pancake", image="10-face.jpg"),), (), {})[0]
+    assert item == {
+        "kind": "identified",
+        "ts": 10,
+        "cat": "Pancake",
+        "paired_class": "face",
+        "image": "10-face.jpg",
+        "image_kind": "event",
+    }
 
 
 def test_timeline_visit_is_hidden_by_default() -> None:

@@ -605,39 +605,56 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 translation_key="schedule_writes_disabled",
             )
 
-    async def async_schedule_card_add(self, entry_id: str, time: str, amount: int) -> None:
-        """One `amount` mirrored onto both `amount_l`/`amount_r` -- the same shared-bin
-        simplification the primary Feed button already makes."""
-        self._require_schedule_writes_enabled()
-        await self.async_schedule_add(time, amount, amount, True, entry_id)
+    def card_entries(self) -> list[ScheduleEntry]:
+        """Every entry, enabled or not, in the one fixed order both the packed card state and
+        the card-facing services share: the entry's position here is its card-visible id.
+        Disabled entries keep their slot (the card just does not see them) so an index the card
+        read stays valid across a toggle."""
+        return sorted(self.data.schedule.entries, key=lambda e: (e.time, e.id))
 
-    async def async_schedule_card_edit(self, entry_id: str, time: str, amount: int) -> None:
+    def resolve_card_entry_id(self, card_id: str) -> str:
+        """An id from the schedule card is either an entry's real id or -- the card's own
+        scheme -- the entry's index in `card_entries`."""
+        entries = self.card_entries()
+        if any(e.id == card_id for e in entries):
+            return card_id
+        if card_id.isdigit() and int(card_id) < len(entries):
+            return entries[int(card_id)].id
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="unknown_schedule_entry",
+            translation_placeholders={"entry_id": card_id},
+        )
+
+    async def async_schedule_card_add(self, time: str, amount: int) -> None:
+        """One `amount` mirrored onto both `amount_l`/`amount_r` -- the same shared-bin
+        simplification the primary Feed button already makes. The agent mints the id."""
+        self._require_schedule_writes_enabled()
+        await self.async_schedule_add(time, amount, amount, True, None)
+
+    async def async_schedule_card_edit(self, card_id: str, time: str, amount: int) -> None:
         """No native edit exists -- `schedule.rs`'s `add` rejects a duplicate id
         (STUDY-schedule.md) -- so this removes and re-adds under the same id. Always
         refreshes, even on a failure between the two calls, so a partial edit is reflected
         immediately rather than waiting for the next poll."""
         self._require_schedule_writes_enabled()
+        entry_id = self.resolve_card_entry_id(card_id)
         try:
             await self.client.remove_schedule_entry(entry_id)
             await self.client.add_schedule_entry(time, amount, amount, True, entry_id)
         finally:
             await self.async_request_refresh()
 
-    async def async_schedule_card_remove(self, entry_id: str) -> None:
+    async def async_schedule_card_remove(self, card_id: str) -> None:
         self._require_schedule_writes_enabled()
-        await self.async_schedule_remove(entry_id)
+        await self.async_schedule_remove(self.resolve_card_entry_id(card_id))
 
-    async def async_schedule_card_toggle(self, entry_id: str) -> None:
+    async def async_schedule_card_toggle(self, card_id: str) -> None:
         """Server-side toggle (docs/custom.md's `actions.toggle`): flips the entry's own
         current `enabled` state rather than taking one from the caller."""
         self._require_schedule_writes_enabled()
-        entry = next((e for e in self.data.schedule.entries if e.id == entry_id), None)
-        if entry is None:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="unknown_schedule_entry",
-                translation_placeholders={"entry_id": entry_id},
-            )
+        entry_id = self.resolve_card_entry_id(card_id)
+        entry = next(e for e in self.data.schedule.entries if e.id == entry_id)
         await self.async_schedule_set_enabled(entry_id, not entry.enabled)
 
     async def async_set_cloud(self, enabled: bool) -> None:

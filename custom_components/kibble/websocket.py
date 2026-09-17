@@ -112,6 +112,24 @@ def _identified_item(
         "cat": _vendor_cat(track.pet_id, pet_ids) or "Unknown cat",
         "paired_class": pair.cls if pair is not None else None,
         "image": str(track.ts) if pair is not None else None,
+        "image_kind": "track",
+    }
+
+
+def _labelled_face_item(event: DetectionEvent) -> dict[str, Any]:
+    """A `face` crop Kibble's own classifier (or a human, via `kibble/faces/label`) filed under
+    a cat -- the agent carries the name on the event itself (`ai::Feed::set_face_cat`). This is
+    the only sighting evidence there is when the vendor cloud is off and no `track` ever
+    arrives, and it is exactly what the cats tile's "last here" is measured from, so the timeline
+    must show it too or the two disagree. The image is the event's own crop, served by the HTTP
+    image view's `event` kind."""
+    return {
+        "kind": "identified",
+        "ts": event.ts,
+        "cat": event.cat,
+        "paired_class": "face",
+        "image": event.image,
+        "image_kind": "event",
     }
 
 
@@ -165,8 +183,9 @@ def timeline_items(
     An unclaimed `eat` stays its own `eat` row: a cat at the bowl the vendor never identified.
     An unclaimed `visit` stays its own `visit` row, included only when `include_visits` is true
     (default `False`): a bare "a cat came by" with no identity and no feeding is the least
-    useful row on the timeline. `face` events never produce a row -- they exist purely as
-    `kibble/faces/*` training material, not timeline activity.
+    useful row on the timeline. A `face` event produces a row only once it carries a `cat`
+    (`_labelled_face_item`); an unlabelled one is `kibble/faces/*` training material, not
+    timeline activity.
     """
     tracks = [e for e in events if e.cls == "track"]
     pairs = [_track_pair(track, events) for track in tracks]
@@ -176,7 +195,9 @@ def timeline_items(
         _identified_item(track, pair, pet_ids) for track, pair in zip(tracks, pairs, strict=True)
     ]
     for event in events:
-        if event.cls == "eat" and id(event) not in claimed_ids:
+        if event.cls == "face" and event.cat:
+            items.append(_labelled_face_item(event))
+        elif event.cls == "eat" and id(event) not in claimed_ids:
             items.append(_bare_detection_item(event, "eat"))
         elif include_visits and event.cls == "visit" and id(event) not in claimed_ids:
             items.append(_bare_detection_item(event, "visit"))

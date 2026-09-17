@@ -364,8 +364,8 @@ fn route(
         ("GET", p) if p.starts_with("/faces/pending/") => {
             faces_pending_get(&p["/faces/pending/".len()..])
         }
-        ("POST", "/faces/label") => faces_label_post(req, gallery),
-        ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery),
+        ("POST", "/faces/label") => faces_label_post(req, gallery, ai_feed),
+        ("POST", "/faces/unlabel") => faces_unlabel_post(req, gallery, ai_feed),
         ("POST", "/faces/upload") => faces_upload_post(req, query, gallery),
         ("GET", "/faces/current") => faces_current_get(),
         ("GET", "/faces/current/info") => json_response(faces_current_info_json()),
@@ -562,7 +562,7 @@ fn faces_pending_get(name: &str) -> Response {
     }
 }
 
-fn faces_label_post(req: &Request, gallery: &faces::Gallery) -> Response {
+fn faces_label_post(req: &Request, gallery: &faces::Gallery, ai_feed: &ai::Feed) -> Response {
     let body = req.body_str();
     let name = match json_field(&body, "name").filter(|s| !s.is_empty()) {
         Some(n) => n,
@@ -579,6 +579,9 @@ fn faces_label_post(req: &Request, gallery: &faces::Gallery) -> Response {
                 Ok(feat) => gallery.on_labelled(cat, &feat),
                 Err(e) => eprintln!("kibbled: faces: embed after label {}: {e}", dest.display()),
             }
+            if let Some((ts, _)) = faces::parse_pending_name(name) {
+                ai_feed.set_face_cat(ts, Some(cat));
+            }
             Response::Json(format!(
                 r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,
                 name.escape_debug(),
@@ -593,7 +596,7 @@ fn faces_label_post(req: &Request, gallery: &faces::Gallery) -> Response {
     }
 }
 
-fn faces_unlabel_post(req: &Request, gallery: &faces::Gallery) -> Response {
+fn faces_unlabel_post(req: &Request, gallery: &faces::Gallery, ai_feed: &ai::Feed) -> Response {
     let body = req.body_str();
     let name = match json_field(&body, "name").filter(|s| !s.is_empty()) {
         Some(n) => n,
@@ -611,6 +614,9 @@ fn faces_unlabel_post(req: &Request, gallery: &faces::Gallery) -> Response {
         Ok(()) => {
             if let Some(feat) = feat {
                 gallery.on_unlabelled(cat, &feat);
+            }
+            if let Some((ts, _)) = faces::parse_pending_name(name) {
+                ai_feed.set_face_cat(ts, None);
             }
             Response::Json(format!(
                 r#"{{"ok":true,"name":"{}","cat":"{}"}}"#,

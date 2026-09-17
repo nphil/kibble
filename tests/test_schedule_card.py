@@ -35,8 +35,9 @@ def _entry(
 
 def test_pack_matches_the_real_cards_status_pattern_regex() -> None:
     """Two enabled entries, differing amount_l/amount_r (mirrored to `max`), pack to a string
-    the card's own regex parses back into exactly the fields we fed it -- the worked example:
-    `sched-1,7,30,5,2;sched-2,18,0,10,2`."""
+    the card's own regex parses back into exactly the fields we fed it. The id field is the
+    entry's index, because the card `parseInt`s ids and mints the next free integer on add --
+    the agent's string ids came back as `null` and broke every write."""
     entries = [
         _entry("sched-1", "07:30", amount_l=5, amount_r=5),
         _entry("sched-2", "18:00", amount_l=8, amount_r=10),
@@ -44,11 +45,11 @@ def test_pack_matches_the_real_cards_status_pattern_regex() -> None:
 
     packed, packed_count, eligible = pack_schedule_card_state(entries)
 
-    assert packed == "sched-1,7,30,5,2;sched-2,18,0,10,2"
+    assert packed == "0,7,30,5,2;1,18,0,10,2"
     assert packed_count == 2
     assert eligible == 2
     matches = list(_CARD_STATUS_PATTERN.finditer(packed))
-    assert [m.group("id") for m in matches] == ["sched-1", "sched-2"]
+    assert [m.group("id") for m in matches] == ["0", "1"]
     assert [m.group("hour") for m in matches] == ["7", "18"]
     assert [m.group("minute") for m in matches] == ["30", "0"]
     assert [m.group("amount") for m in matches] == ["5", "10"]
@@ -60,13 +61,40 @@ def test_pack_handles_an_entry_at_midnight() -> None:
     and round-trips through it -- the entry that "crosses" into a new day at 00:00."""
     packed, packed_count, eligible = pack_schedule_card_state([_entry("sched-mid", "00:00")])
 
-    assert packed == "sched-mid,0,0,5,2"
+    assert packed == "0,0,0,5,2"
     assert packed_count == 1
     assert eligible == 1
     match = _CARD_STATUS_PATTERN.fullmatch(packed + ";")
     assert match is not None
     assert match.group("hour") == "0"
     assert match.group("minute") == "0"
+
+
+def test_pack_keeps_a_disabled_entrys_index_so_card_ids_stay_stable() -> None:
+    """The index is positional over *all* entries, so a disabled entry still holds its slot:
+    the id the card read for the entry after it stays valid across a toggle."""
+    entries = [_entry("a", "08:00", enabled=False), _entry("b", "20:00")]
+
+    packed, packed_count, eligible = pack_schedule_card_state(entries)
+
+    assert packed == "1,20,0,5,2"
+    assert (packed_count, eligible) == (1, 1)
+
+
+def test_resolve_card_entry_id_accepts_index_or_real_id() -> None:
+    data = SimpleNamespace(
+        schedule=SimpleNamespace(entries=[_entry("late", "20:00"), _entry("early", "08:00")])
+    )
+    fake_self = SimpleNamespace(data=data, card_entries=lambda: KibbleCoordinator.card_entries(fake_self))
+
+    resolve = lambda card_id: KibbleCoordinator.resolve_card_entry_id(fake_self, card_id)
+    assert [e.id for e in fake_self.card_entries()] == ["early", "late"]
+    assert resolve("0") == "early"
+    assert resolve("1") == "late"
+    assert resolve("late") == "late"
+    with pytest.raises(ServiceValidationError) as excinfo:
+        resolve("2")
+    assert excinfo.value.translation_key == "unknown_schedule_entry"
 
 
 def test_pack_omits_disabled_entries_so_an_all_disabled_table_is_empty() -> None:

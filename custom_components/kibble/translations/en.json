@@ -377,7 +377,7 @@
         },
         "id": {
           "name": "Entry ID",
-          "description": "The id the card assigned this entry."
+          "description": "Ignored: the feeder assigns the id. Accepted so the schedule card's add action validates."
         },
         "hour": {
           "name": "Hour",
@@ -636,6 +636,9 @@
     },
     "unknown_device": {
       "message": "{device_id} is not a Kibble feeder."
+    },
+    "device_required": {
+      "message": "Say which feeder: {count} are set up, so device_id is required."
     },
     "schedule_writes_disabled": {
       "message": "Schedule writing is disabled until the time encoding is confirmed — see docs/schedule."

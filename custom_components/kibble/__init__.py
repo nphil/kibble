@@ -8,6 +8,7 @@ import re
 
 import voluptuous as vol
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
@@ -160,20 +161,36 @@ _SCHEDULE_CARD_HOUR = vol.All(vol.Coerce(int), vol.Range(min=0, max=23))
 _SCHEDULE_CARD_MINUTE = vol.All(vol.Coerce(int), vol.Range(min=0, max=59))
 _SCHEDULE_CARD_AMOUNT = vol.All(vol.Coerce(int), vol.Range(min=MIN_AMOUNT, max=MAX_AMOUNT))
 
+# `dispenser-schedule-card`'s custom adapter sends exactly `{id, hour, minute, amount}`: no
+# `device_id` (resolved to the only feeder when there is one), an `id` it minted itself as the
+# smallest free *integer* among the ids it read back from the packed state (`null` on add when
+# none parse), and integers again on edit/remove/toggle. The agent's own ids are strings
+# ("daily-1725"), so the packed state exposes each entry's index instead and these services map
+# an integer back to the entry at that index -- see `coordinator.resolve_card_entry_id`.
+_SCHEDULE_CARD_ID = vol.Any(None, vol.Coerce(str))
+
 SCHEDULE_CARD_ADD_SCHEMA = vol.Schema(
     {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_ID): cv.string,
+        vol.Optional("device_id"): cv.string,
+        vol.Optional(ATTR_ID): _SCHEDULE_CARD_ID,
         vol.Required(ATTR_HOUR): _SCHEDULE_CARD_HOUR,
         vol.Required(ATTR_MINUTE): _SCHEDULE_CARD_MINUTE,
         vol.Required(ATTR_AMOUNT): _SCHEDULE_CARD_AMOUNT,
     }
 )
 
-SCHEDULE_CARD_EDIT_SCHEMA = SCHEDULE_CARD_ADD_SCHEMA
+SCHEDULE_CARD_EDIT_SCHEMA = vol.Schema(
+    {
+        vol.Optional("device_id"): cv.string,
+        vol.Required(ATTR_ID): vol.Coerce(str),
+        vol.Required(ATTR_HOUR): _SCHEDULE_CARD_HOUR,
+        vol.Required(ATTR_MINUTE): _SCHEDULE_CARD_MINUTE,
+        vol.Required(ATTR_AMOUNT): _SCHEDULE_CARD_AMOUNT,
+    }
+)
 
 SCHEDULE_CARD_REMOVE_SCHEMA = vol.Schema(
-    {vol.Required("device_id"): cv.string, vol.Required(ATTR_ID): cv.string}
+    {vol.Optional("device_id"): cv.string, vol.Required(ATTR_ID): vol.Coerce(str)}
 )
 
 SCHEDULE_CARD_TOGGLE_SCHEMA = SCHEDULE_CARD_REMOVE_SCHEMA
@@ -362,8 +379,23 @@ async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> b
     )
 
 
-def _coordinator_for_device(hass: HomeAssistant, device_id: str) -> KibbleCoordinator:
-    """Resolve a service call's target device to its coordinator."""
+def _coordinator_for_device(hass: HomeAssistant, device_id: str | None) -> KibbleCoordinator:
+    """Resolve a service call's target device to its coordinator. No `device_id` (the schedule
+    card's adapter never sends one) resolves to the only loaded feeder; with several set up the
+    caller has to say which."""
+    loaded = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if device_id is None:
+        if len(loaded) == 1:
+            return loaded[0].runtime_data
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="device_required",
+            translation_placeholders={"count": str(len(loaded))},
+        )
     registry = er.async_get(hass)
     for entry in hass.config_entries.async_entries(DOMAIN):
         entries = er.async_entries_for_config_entry(registry, entry.entry_id)
@@ -437,17 +469,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
             raise_agent_action_failed("Schedule set-enabled", err)
 
     async def handle_schedule_card_add(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
         time_str = f"{call.data[ATTR_HOUR]:02d}:{call.data[ATTR_MINUTE]:02d}"
         try:
-            await coordinator.async_schedule_card_add(
-                call.data[ATTR_ID], time_str, call.data[ATTR_AMOUNT]
-            )
+            await coordinator.async_schedule_card_add(time_str, call.data[ATTR_AMOUNT])
         except KibbleError as err:
             raise_agent_action_failed("Schedule card add", err)
 
     async def handle_schedule_card_edit(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
         time_str = f"{call.data[ATTR_HOUR]:02d}:{call.data[ATTR_MINUTE]:02d}"
         try:
             await coordinator.async_schedule_card_edit(
@@ -457,14 +487,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
             raise_agent_action_failed("Schedule card edit", err)
 
     async def handle_schedule_card_remove(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
         try:
             await coordinator.async_schedule_card_remove(call.data[ATTR_ID])
         except KibbleError as err:
             raise_agent_action_failed("Schedule card remove", err)
 
     async def handle_schedule_card_toggle(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
         try:
             await coordinator.async_schedule_card_toggle(call.data[ATTR_ID])
         except KibbleError as err:

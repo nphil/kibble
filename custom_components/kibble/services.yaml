@@ -111,12 +111,12 @@ schedule_set_enabled:
 schedule_card_add:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
     id:
-      required: true
+      required: false
       selector:
         text:
     hour:
@@ -147,7 +147,7 @@ schedule_card_add:
 schedule_card_edit:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -183,7 +183,7 @@ schedule_card_edit:
 schedule_card_remove:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -195,7 +195,7 @@ schedule_card_remove:
 schedule_card_toggle:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -207,7 +207,7 @@ schedule_card_toggle:
 wifi_connect:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -223,7 +223,7 @@ wifi_connect:
 label_face:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -239,7 +239,7 @@ label_face:
 unlabel_face:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -255,7 +255,7 @@ unlabel_face:
 upload_face_sample:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -271,7 +271,7 @@ upload_face_sample:
 add_cat:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -283,7 +283,7 @@ add_cat:
 delete_cat:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -295,7 +295,7 @@ delete_cat:
 identify:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -303,7 +303,7 @@ identify:
 save_clip:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -319,7 +319,7 @@ save_clip:
 record_clip:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble
@@ -340,7 +340,7 @@ record_clip:
 play_clip:
   fields:
     device_id:
-      required: true
+      required: false
       selector:
         device:
           integration: kibble

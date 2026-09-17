@@ -214,6 +214,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// How long `GET /events/stream` will block waiting for a new event past `?since=`.
 pub const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
 /// `GET /events` returns at most this many, newest last -- matches the assignment's own cap.
+/// How far apart a `"face"` event's `ts` and its pending crop's filename `ts` may be and still
+/// be the same capture (both stamped on one poll tick, by separate `now_unix()` calls).
+const FACE_CROP_MATCH_SECS: u64 = 2;
+
+/// The cat a labelled crop captured within [`FACE_CROP_MATCH_SECS`] of `ts` was filed under.
+fn labelled_cat_for(labelled: &[(u64, String)], ts: u64) -> Option<String> {
+    labelled
+        .iter()
+        .filter(|(crop_ts, _)| crop_ts.abs_diff(ts) <= FACE_CROP_MATCH_SECS)
+        .min_by_key(|(crop_ts, _)| crop_ts.abs_diff(ts))
+        .map(|(_, cat)| cat.clone())
+}
+
 const MAX_EVENTS: usize = 50;
 /// Where a watched crop is copied before the vendor's own pipeline can overwrite it in place
 /// (all three watched files are fixed, reused filenames -- the vendor does not rotate them).
@@ -367,10 +380,14 @@ impl Feed {
         }
         found.sort_by_key(|(ts, _, _)| *ts);
         let skip = found.len().saturating_sub(MAX_EVENTS);
+        // A face crop a human already filed under a cat keeps that name across restarts --
+        // the same lookup `set_face_cat` applies live when the labelling happens.
+        let labelled = faces::labelled_cats_by_ts();
         let mut inner = self.inner.lock().unwrap();
         for (ts, class, name) in found.into_iter().skip(skip) {
             let seq = inner.next_seq;
             inner.next_seq += 1;
+            let cat = if class == "face" { labelled_cat_for(&labelled, ts) } else { None };
             inner.events.push_back(Detection {
                 seq,
                 ts,
@@ -379,9 +396,30 @@ impl Feed {
                 pet_id: None,
                 b0x: None,
                 image: Some(name),
-                cat: None,
+                cat,
                 total_score: None,
             });
+        }
+    }
+
+    /// A human labelled (`Some`) or un-labelled (`None`) the pending crop captured at `crop_ts`:
+    /// the `"face"` detection from that same capture now names -- or no longer names -- that
+    /// cat, so the timeline shows "Pancake was here" for a sighting the classifier missed. The
+    /// crop and the event are written on the same poll tick but stamped separately, hence the
+    /// [`FACE_CROP_MATCH_SECS`] tolerance.
+    pub fn set_face_cat(&self, crop_ts: u64, cat: Option<&str>) {
+        let mut inner = self.inner.lock().unwrap();
+        let mut changed = false;
+        for d in inner.events.iter_mut() {
+            if d.class == "face" && d.ts.abs_diff(crop_ts) <= FACE_CROP_MATCH_SECS {
+                d.cat = cat.map(str::to_string);
+                changed = true;
+            }
+        }
+        drop(inner);
+        if changed {
+            self.changed.notify_all();
+            crate::push::mark(crate::push::Field::Events);
         }
     }
 
@@ -747,6 +785,23 @@ mod tests {
         feed.push("face", Some("1-Rashy.jpg".to_string()), Some("Rashy".to_string()));
         let inner = feed.inner.lock().unwrap();
         assert_eq!(inner.events.back().unwrap().cat.as_deref(), Some("Rashy"));
+    }
+
+    #[test]
+    fn set_face_cat_names_the_matching_face_event_only() {
+        let feed = Feed::new();
+        feed.push_detection(1_000, "visit", None, None, None, None);
+        feed.push_detection(1_001, "face", Some("1001-face.jpg".into()), None, None, None);
+        feed.set_face_cat(1_000, Some("Pancake"));
+        {
+            let inner = feed.inner.lock().unwrap();
+            assert_eq!(inner.events[0].cat, None, "a visit is never named");
+            assert_eq!(inner.events[1].cat.as_deref(), Some("Pancake"));
+        }
+        feed.set_face_cat(1_001, None);
+        assert_eq!(feed.inner.lock().unwrap().events[1].cat, None);
+        feed.set_face_cat(2_000, Some("Kitty"));
+        assert_eq!(feed.inner.lock().unwrap().events[1].cat, None, "outside the match window");
     }
 
     #[test]

@@ -673,9 +673,35 @@ fn identify_target_in(pending_dir: &Path, faces_root: &Path) -> io::Result<Optio
     Ok(newest_labelled(faces_root).map(|c| FaceTarget::Labelled { cat: c.cat, name: c.name }))
 }
 
+/// Prefix of a reference photo a human uploaded ([`Gallery::upload_sample`]) -- the one kind of
+/// labelled crop that is *not* evidence the cat was at the feeder.
+pub const UPLOAD_PREFIX: &str = "upload-";
+
+/// Every feeder-captured labelled crop as `(capture ts, cat)` -- uploads excluded, they are
+/// not sightings. What `ai::Feed` uses to name `"face"` events after a restart.
+pub fn labelled_cats_by_ts() -> Vec<(u64, String)> {
+    list_labelled()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| !c.name.starts_with(UPLOAD_PREFIX))
+        .filter_map(|c| parse_pending_name(&c.name).map(|(ts, _)| (ts, c.cat)))
+        .collect()
+}
+
 fn last_seen_by_cat() -> HashMap<String, u64> {
+    last_seen_from(list_labelled().unwrap_or_default())
+}
+
+/// "Last here" per cat: the newest crop the *feeder captured* and a human (or the classifier)
+/// put in that cat's folder. Uploaded reference photos are skipped -- their mtime is when the
+/// photo was added, not a sighting, and counting them made a cat "last here 2 min ago" right
+/// after someone uploaded its picture.
+fn last_seen_from(crops: Vec<LabelledCrop>) -> HashMap<String, u64> {
     let mut out = HashMap::new();
-    for crop in list_labelled().unwrap_or_default() {
+    for crop in crops {
+        if crop.name.starts_with(UPLOAD_PREFIX) {
+            continue;
+        }
         let ts = crop.mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let entry = out.entry(crop.cat).or_insert(0);
         if ts > *entry {
@@ -984,7 +1010,7 @@ impl Gallery {
         if is_reserved_bucket(cat) || cat == pending_dir_name() || !dir.is_dir() {
             return Err(FaceError::NotFound);
         }
-        let name = format!("upload-{}.jpg", now_unix_millis());
+        let name = format!("{UPLOAD_PREFIX}{}.jpg", now_unix_millis());
         let dest = dir.join(&name);
         fs::write(&dest, bytes).map_err(FaceError::Io)?;
         let low_quality = match embed::extract(&dest) {
@@ -1244,6 +1270,24 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].cat, "Rashy");
         assert_eq!(found[0].name, "z.jpg");
+    }
+
+    #[test]
+    fn last_seen_ignores_uploaded_reference_photos() {
+        let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let crop = |cat: &str, name: &str, secs: u64| LabelledCrop {
+            cat: cat.to_string(),
+            name: name.to_string(),
+            jpg_path: PathBuf::from(name),
+            mtime: at(secs),
+        };
+        let seen = last_seen_from(vec![
+            crop("Pancake", "1789600000-101321488.jpg", 1_789_600_000),
+            crop("Pancake", "upload-1789609534401.jpg", 1_789_609_534),
+            crop("Kitty", "upload-1789609470108.jpg", 1_789_609_470),
+        ]);
+        assert_eq!(seen.get("Pancake"), Some(&1_789_600_000));
+        assert_eq!(seen.get("Kitty"), None, "an upload alone is not a sighting");
     }
 
     #[test]

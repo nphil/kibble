@@ -312,8 +312,10 @@ def pack_schedule_card_state(entries: Sequence[ScheduleEntry]) -> tuple[str, int
     simplification `kibble.feed`'s `hopper="both"` path already makes now the physical divider
     is removed -- on every write path through this adapter the two are mirrored equal anyway.
 
-    An id containing `,` or `;` would corrupt the packed grammar; such an entry is skipped
-    (logged, not raised) rather than emitted broken.
+    The packed id is the entry's *index* in `KibbleCoordinator.card_entries` (all entries, by
+    time), not the agent's string id: the card parses ids as integers, mints the next free one
+    for a new entry, and sends them back on edit/remove/toggle; the card-facing services map an
+    index back to the entry. `entries` must be that same full, ordered list.
 
     Entries are packed soonest-first (ascending `time`, matching the plain fallback list) until
     the next one would push the packed string past HA's 255-character state limit; anything
@@ -322,10 +324,10 @@ def pack_schedule_card_state(entries: Sequence[ScheduleEntry]) -> tuple[str, int
 
     Returns `(packed_state, entries_packed, entries_eligible)`.
     """
-    eligible = sorted((e for e in entries if e.enabled), key=lambda e: e.time)
+    eligible = [(index, e) for index, e in enumerate(entries) if e.enabled]
     parts: list[str] = []
     packed = ""
-    for entry in eligible:
+    for index, entry in eligible:
         try:
             hour_str, minute_str = entry.time.split(":", 1)
             hour, minute = int(hour_str), int(minute_str)
@@ -336,14 +338,8 @@ def pack_schedule_card_state(entries: Sequence[ScheduleEntry]) -> tuple[str, int
                 entry.time,
             )
             continue
-        if "," in entry.id or ";" in entry.id:
-            _LOGGER.warning(
-                "schedule entry id %r contains ',' or ';'; omitting from the card state",
-                entry.id,
-            )
-            continue
         amount = max(entry.amount_l, entry.amount_r)
-        piece = f"{entry.id},{hour},{minute},{amount},{STATUS_PENDING}"
+        piece = f"{index},{hour},{minute},{amount},{STATUS_PENDING}"
         candidate = ";".join([*parts, piece])
         if len(candidate) > MAX_STATE_LENGTH:
             break
@@ -370,16 +366,12 @@ class KibbleScheduleCardStateSensor(KibbleEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        packed, _packed_count, _eligible = pack_schedule_card_state(
-            self.coordinator.data.schedule.entries
-        )
+        packed, _packed_count, _eligible = pack_schedule_card_state(self.coordinator.card_entries())
         return packed
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        _packed, packed_count, eligible = pack_schedule_card_state(
-            self.coordinator.data.schedule.entries
-        )
+        _packed, packed_count, eligible = pack_schedule_card_state(self.coordinator.card_entries())
         return {
             "entries_packed": packed_count,
             "entries_eligible": eligible,
