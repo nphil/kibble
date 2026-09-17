@@ -1,11 +1,13 @@
 # STUDY-bowl-fill.md — Refreshing the hopper-fill reading without the cloud (2026-09-17)
 
-**Status: definitively NOT wired into `kibbled` this session. The real vendor `CMD 0x19` payload
-is now fully decoded and its only two senders are proven to be internal to `ble` (no `ctrl`→`ble`
-bus message reaches them); the write that actually lands a real value in `BOWL_FILL_1` was not
-found in `ble`, `ctrl`, or `cloud` despite disassembling all three in full. No message was
-"positively identified as safe" per this project's own bar, so nothing was sent and nothing was
-wired. See "What remains" for the one concrete next step.**
+**Status: not wired as an unconditional feature this session, but one genuine, disassembly-proven-
+safe lever exists and was live-tested: `surplus_control` (`config_shm` offset 3880), writable
+through `kibbled`'s own settings path (Part 4). It cannot bootstrap `BOWL_FILL_1` from the invalid
+state (proven, and confirmed live) but may be able to keep an already-real reading fresh locally —
+untested this session, held for cross-agent device-sharing coordination; see "What remains" item 3.
+The real vendor `CMD 0x19` payload is fully decoded and its only two senders are proven internal to
+`ble` (Part 1); the write that actually lands a real value in `BOWL_FILL_1` in the first place was
+not found in `ble`, `ctrl`, or `cloud` despite disassembling all three in full (Parts 1-3).**
 
 ## The bug, restated precisely
 
@@ -293,33 +295,106 @@ re-test live. No `surplus.rs` module, rate limiter, or bus send was written: doi
 message that could ever actually reach the vendor's real sender would be dead code with a
 misleading name, not a working feature.
 
+## Part 4 — `surplusControl` via `kibbled`'s own settings path: safe, but a confirmed no-op while invalid [HIGH]
+
+`agent/src/settings.rs` already mapped `surplus_control` (`config_shm` offset 3880) from an
+earlier, independent settings-write study (`docs/15-settings-write.md`), which fully disassembled
+`ctrl`'s cloud/local `property/set` handler. That study's own table already names this exact field
+as ble's `usr.app_conf.surplusControl` (§1b) — but shipped `writable: false`, with a documented
+reason: Localkit's own app schema calls it **read-only** ("Leftover food detection state"), unlike
+its sibling `surplusStandard` (0–100, the real user-facing "Leftover food threshold", also
+`writable: false` but for no stated reason). `ctrl`'s own write site for `surplusControl` (this
+session independently re-disassembled it at vaddr `0x3f4c6`, exact match to that study's own
+finding) is byte-for-byte the same shape as every other benign `usr.app_conf.*` setting: `read
+cJSON valueint → compare to current → str.w the new value → dead self-message (msg_id 2, dst=1,
+no registered handler)`. Nothing else. `ctrl`'s cloud backend evidently *can* push a value here
+(the write site is real, reachable code) even though the phone app's own UI doesn't expose it —
+consistent with it being firmware/cloud-computed derived state day to day, not a literal user input,
+which is presumably why a previous session left it non-writable rather than a safety finding.
+
+**Exhaustive safety re-check before touching it, per the assignment's own bar:** every
+`dispatch_send_msg` call site in `ctrl` was enumerated (93 total) and its `msg_id` immediate read
+directly. **Exactly two** ever send `0x6004` (`BLE_FEED_CTRL`, the only ctrl→ble feed trigger that
+exists): `dispatch_handler_feed` itself (`0x44fb4` — confirmed **zero direct callers anywhere in
+ctrl**, i.e. only reachable via an *externally*-arriving msg `0x100f`, never internally) and the
+`"feed_realtime"` cloud action command (`0x4414c`). Neither call site is anywhere near
+`surplusControl`'s write (`0x3f4c6`), the surplus-report read (`0x3187e`, Part 2), or `ble`'s
+resulting `CMD 0x19` send (Part 1). **No path from a nonzero `surplusControl`, through anything
+this session could find, reaches feed, motor, OTA, or reset.**
+
+### The live test
+
+Flipped `surplus_control` to `writable: true` (with the rationale above recorded in its
+`description`), deployed (`feeder_deploy_kibbled`, built md5 == running md5), confirmed cloud still
+`enabled:false` post-restart. `POST /config {"key":"surplus_control","value":30}` with the device
+at rest (`feeding:false`, `bowl_fill:[null,null]`) — then polled `GET /state` every 2s for 51s
+(watching `feeding` for an immediate-abort trigger that never fired) and captured a full
+`config_shm` diff across the window. Result: **`feeding` stayed `false` for the entire window**;
+**`bowl_fill` never changed** (stayed `[null, null]`); the *only* offset-3880-adjacent change in
+the diff was the write itself (`00 -> 1e` at 3880). Every other changed byte in the diff (a handful
+of watchdog-toggle and detection-telemetry offsets already known to drift on their own, per the
+earlier baseline-noise diff in Part "Empirical confirmation") is unrelated background device
+activity, not a consequence of this write.
+
+**This is a safe, but *predicted and confirmed* no-op, not an inconclusive result** — it follows
+directly from a fact this session verified down to the raw instruction bytes, not just the
+`movle`/`movgt` mnemonic text: `ble`'s comparison (`0x14e70`–`0x14e78`) is a **signed** `cmp`+`ite
+le` (condition codes `14`=LE, `13`=GT — genuinely signed, not `ls`/`hi`). `BOWL_FILL_1`'s invalid
+sentinel `0xffffffff` reads as **`-1`** under that comparison, so `surplus_control(K) > -1` is true
+for any realistic non-negative `K` — the exact same result `ble`'s ticker already settles on
+forever while `surplusControl == 0` (Part 1b). With no prior real `BOWL_FILL_1` value to compare
+against, there is no signed threshold write that creates an edge without going deliberately
+out-of-domain (a value that reads negative when reinterpreted signed, e.g. `0xfffffff0`) — which
+this session chose not to attempt, since it exercises the field for a shape nothing in this
+firmware would ever produce, on a field this session cannot fully vouch for beyond the one `ble`
+consumer traced. `surplus_control` was restored to `0` immediately after the test
+(`POST /config {"key":"surplus_control","value":0}`, confirmed via `GET /config` readback).
+
+**The one still-open, more promising variant** (not attempted this session, deferred for a device-
+sharing conflict with a concurrent capture from a sibling session): with a *real* `BOWL_FILL_1`
+value already in place (seeded the usual way, via the cloud-toggle trick), set `surplus_control` to
+something *below* that real value *before* it expires. That is a genuine signed transition
+(positive vs. a lower positive threshold, no sentinel involved) and, unlike this test, could
+plausibly flip `ble`'s persisted ticker state and fire a real `CMD 0x19` send independent of the
+cloud — testing whether `surplus_control` can *keep* an already-seeded reading fresh locally, not
+whether it can bootstrap one from nothing (the disassembly in Part 1b already answers that: it
+cannot, the comparison needs a real prior value to be meaningful).
+
 ## What remains — the concrete next step
 
-The write that lands a real value in `BOWL_FILL_1` is in one of: (a) `ctrl` or `cloud`, behind an
-intermediate-pointer addressing pattern this session's xref tooling cannot see (both binaries are
-now fully pulled and disassembled locally — `/tmp/ctrl_full.bin`, `/tmp/cloud_full.bin`, matching
-live md5s — so a future pass needs *better tooling*, not another pull: a real decompiler
-(`radare2`/Ghidra) with proper data-flow tracking would resolve every base-pointer chain
-`STUDY-config.md` §6.2 already flagged this codebase needs one for); or (b) `media`, not inspected
-this session at all. Check `media` first — it is a single, cheap disassembly pass with the same
-tooling already proven on the other three binaries, and would either find the write directly (if
-`media` uses the same "small `movw`-immediate against a directly-loaded `g_config`" pattern the
-*rest* of this codebase mostly uses) or narrow the remaining search to `ctrl`/`cloud` with more
-confidence than this session had. A live packet capture (`strace`/pulling a static build onto the
-device to watch `mq_send`, or a UART tap) remains the fallback if static analysis stalls again —
-unlike the prior session's assessment, this is no longer the *only* path forward, since the ble-side
-mechanism is now fully mapped; it's specifically the `ctrl`/`cloud`/`media`-side "who actually
-writes the number" question that would benefit from it.
+1. The write that lands a real value in `BOWL_FILL_1` in the first place is in one of: (a) `ctrl`
+   or `cloud`, behind an intermediate-pointer addressing pattern this session's xref tooling cannot
+   see (both binaries are now fully pulled and disassembled locally — `/tmp/ctrl_full.bin`,
+   `/tmp/cloud_full.bin`, matching live md5s — so a future pass needs *better tooling*, not another
+   pull: a real decompiler (`radare2`/Ghidra) with proper data-flow tracking would resolve every
+   base-pointer chain `STUDY-config.md` §6.2 already flagged this codebase needs one for); or (b)
+   `media`, not inspected this session at all. Check `media` first — a single, cheap disassembly
+   pass with the same tooling already proven on the other three binaries.
+2. A live packet capture (`strace`/pulling a static build onto the device to watch `mq_send`, or a
+   UART tap) remains the fallback if static analysis stalls again — unlike the prior session's
+   assessment, this is no longer the *only* path forward, since the ble-side mechanism is now fully
+   mapped; it's specifically the `ctrl`/`cloud`/`media`-side "who actually writes the number"
+   question that would benefit from it.
+3. **Finish Part 4's deferred experiment**: with a real `BOWL_FILL_1` value in place (seed it via
+   the cloud-toggle trick), set `surplus_control` to a value below it, before it expires, and watch
+   for an independent (cloud-off) `CMD 0x19` send / value change. This is a five-minute experiment
+   with all the tooling already built this session — it was deferred only because a sibling agent
+   was mid-capture on the same physical device when this session ran out of time, not for any
+   unresolved safety or technical concern.
 
 **Do not send `CMD 0x19` (in any shape) to `ble` through `subchip_req_data`/`0x601b` — this remains
 independently re-confirmed, twice now, to invalidate `BOWL_FILL_1` without ever completing a
 measurement**, and this session additionally confirmed *why*: that path can only ever reach the
 bare/`flag_bit6=1` variant, never the real 5-byte/`flag_bit6=0` one `0x180ac` builds. Do not attempt
 to reach `0x180ac`/`0x13468`/`0x14e88` by any other locally-available bus message either — none
-exists in this build. Do not poke `config_shm` bytes directly (`surplusControl`/`surplusStandard`
-at offsets 3880/3884, or `BOWL_FILL_1` itself) from `kibbled` to try to force the `ble`-side ticker's
-edge condition — this project's own established convention (`state.rs`'s module doc) is writes only
-ever go through the owning process via the bus, never by poking shared-memory bytes directly, and
-`surplusControl`/`surplusStandard` are user-facing app settings other processes (and the cloud
-UI) also read — an uncoordinated write risks corrupting state well beyond this one sensor reading,
-for a mechanism (§1b) already shown to only ever fire once per `ble` process lifetime regardless.
+exists in this build. **Writing `surplusControl`/`surplusStandard` (offsets 3880/3884) through
+`kibbled`'s own `settings.rs`/`persist.rs` path is safe and was live-tested this session** (Part 4)
+— that is not the "poking shared-memory bytes directly" this document previously warned against:
+it is the exact same `flock(/tmp/config.lock, LOCK_EX)`-guarded, single `str.w`-at-a-time write
+`ctrl`'s own settings handler performs for this field, going through `kibbled`'s already-proven
+write+reconcile machinery, not a bypass of it. What remains genuinely unproven is only whether it
+*helps*: with `BOWL_FILL_1` invalid, it provably cannot (Part 4's signed-sentinel finding); with a
+real value already in place, it might (Part 4's untested variant). Do not, however, write a
+deliberately out-of-domain (negative-when-signed) value to `surplus_control` to force an edge from
+the invalid state — that exercises a shape nothing in this firmware would ever legitimately
+produce, on a field this document cannot fully vouch for beyond the one `ble` consumer traced.
