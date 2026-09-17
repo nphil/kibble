@@ -581,12 +581,22 @@ fn list_samples_in(faces_root: &Path, pending_dir: &Path, cat: &str) -> Result<V
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            let (ts, _) = parse_pending_name(&name)?;
+            let ts = sample_ts(&name)?;
             Some(Sample { name, ts })
         })
         .collect();
     samples.sort_by_key(|s| s.ts);
     Ok(samples)
+}
+
+/// A labelled sample's timestamp from its own name: a feeder capture's `{ts}-…jpg`, or an
+/// uploaded reference photo's `upload-{unix_ms}.jpg` (whole seconds). Sidecars and anything
+/// else in the folder are `None`.
+fn sample_ts(name: &str) -> Option<u64> {
+    if let Some(ms) = name.strip_prefix(UPLOAD_PREFIX).and_then(|rest| rest.strip_suffix(".jpg")) {
+        return ms.parse::<u64>().ok().map(|ms| ms / 1000);
+    }
+    parse_pending_name(name).map(|(ts, _)| ts)
 }
 
 /// `GET /faces/samples/<cat>/<name>`: the raw JPEG bytes. Same path-safety rules as
@@ -1553,6 +1563,25 @@ mod tests {
         let samples = list_samples_in(&root, &pending, "Rashy").unwrap();
         let names: Vec<String> = samples.into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["100-unknown.jpg".to_string(), "200-unknown.jpg".to_string()]);
+    }
+
+    #[test]
+    fn list_samples_includes_uploaded_reference_photos() {
+        let root = temp_dir("samples-uploads-root");
+        let pending = temp_dir("samples-uploads-pending");
+        fs::create_dir_all(root.join("Kitty")).unwrap();
+        fs::write(root.join("Kitty").join("upload-1789609470108.jpg"), b"x").unwrap();
+        fs::write(root.join("Kitty").join("upload-1789609470108.emb"), b"x").unwrap();
+        fs::write(root.join("Kitty").join("1789595577-unknown.jpg"), b"x").unwrap();
+        let names: Vec<(String, u64)> = list_samples_in(&root, &pending, "Kitty")
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.ts))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("1789595577-unknown.jpg".to_string(), 1789595577), ("upload-1789609470108.jpg".to_string(), 1789609470)]
+        );
     }
 
     #[test]
