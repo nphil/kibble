@@ -135,8 +135,8 @@
       }
     },
     "sensor": {
-      "bowl_fill_1": {
-        "name": "Bowl fill hopper 1"
+      "bowl_fill": {
+        "name": "Bowl fill"
       },
       "desiccant_days": {
         "name": "Desiccant left"

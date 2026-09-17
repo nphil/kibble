@@ -125,7 +125,7 @@
       }
     },
     "sensor": {
-      "bowl_fill_1": {
+      "bowl_fill": {
         "default": "mdi:gauge"
       },
       "desiccant_days": {

@@ -61,8 +61,8 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
         # with the Petkit cloud disabled the vendor never refreshes its copy (kibble docs/34),
         # so this entity would otherwise be permanently unknown. `source`/`measured_at`
         # attributes say which reading is showing and when the camera saw it.
-        key="bowl_fill_1",
-        translation_key="bowl_fill_1",
+        key="bowl_fill",
+        translation_key="bowl_fill",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         value=lambda s: s.bowl_fill if s.bowl_fill is not None else s.bowl_fill_local[0],
