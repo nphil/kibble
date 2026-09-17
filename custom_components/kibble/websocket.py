@@ -56,7 +56,7 @@ ERR_AGENT_REJECTED = "agent_rejected"
 # came from, for the card's "ate"/"was at the bowl" verb). The agent's own endpoint is still the
 # one that actually resolves and serves the bytes; this only decides whether to point a row at
 # it.
-TRACK_PAIR_LOOKBACK_SECONDS = 5
+TRACK_PAIR_LOOKBACK_SECONDS = 300
 TRACK_PAIR_LOOKAHEAD_SECONDS = 120
 
 

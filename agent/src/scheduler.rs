@@ -185,6 +185,11 @@ fn evaluate(schedule: &Schedule, dispenser: &dyn Dispenser, entry: &Entry, tz: &
     if now < due_utc {
         return;
     }
+    // Due before this entry (as it now stands) existed: not a missed fire, just history. A
+    // "21:45" entry added at 22:09 waits for tomorrow's 21:45 rather than feeding right away.
+    if due_utc < entry.since_utc as i64 {
+        return;
+    }
     let date_str = date.to_iso();
     let late_by = now - due_utc;
     let outcome = if late_by <= GRACE_WINDOW_SECS { Outcome::Dispensed } else { Outcome::Missed };
@@ -227,7 +232,7 @@ mod tests {
     }
 
     fn entry(id: &str, minute_of_day: u16) -> Entry {
-        Entry { id: id.into(), minute_of_day, amount_l: 1, amount_r: 1, enabled: true }
+        Entry { id: id.into(), minute_of_day, amount_l: 1, amount_r: 1, enabled: true, since_utc: 0 }
     }
 
     /// Records every dispense call; never touches the bus. This is what makes every test below
@@ -301,6 +306,24 @@ mod tests {
     }
 
     // --- requirement 1: bounded missed-fire catch-up ("10 seconds late" vs "10 hours late") --
+
+    #[test]
+    fn an_occurrence_due_before_the_entry_existed_is_never_caught_up() {
+        let tz = localtime::EASTERN;
+        let path = tmp_path("since");
+        let due = tz.local_to_utc(Civil { year: 2026, month: 1, day: 15 }, 21 * 3600 + 45 * 60);
+        let added_at = due + 24 * 60; // added at 22:09, 24 min after today's 21:45
+        let mut e = entry("late", 21 * 60 + 45);
+        e.since_utc = added_at as u64;
+        let schedule = Schedule::seed_for_test(path.clone(), vec![e]);
+        let dispenser = StubDispenser::new();
+        tick(&schedule, &dispenser, &tz, added_at);
+        tick(&schedule, &dispenser, &tz, added_at + 60);
+        assert_eq!(dispenser.calls().len(), 0, "today's 21:45 predates the entry: not a missed fire");
+        tick(&schedule, &dispenser, &tz, due + 86_400 + 5);
+        assert_eq!(dispenser.calls().len(), 1, "tomorrow's 21:45 fires normally");
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn missed_by_10_seconds_still_dispenses() {

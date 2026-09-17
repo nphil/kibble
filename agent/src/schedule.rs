@@ -157,17 +157,27 @@ pub struct Entry {
     pub amount_r: u8,
     /// A disabled entry stays in the cache but is omitted from the wire table.
     pub enabled: bool,
+    /// When this entry, as it stands now, came into force (UTC): set on add and on every
+    /// edit/re-enable. `scheduler.rs` never catches up an occurrence due before this -- adding
+    /// a "21:45" entry at 22:09 must not feed the cat at 22:09 (it did, once; that is why this
+    /// field exists). `0` for entries persisted before the field existed.
+    pub since_utc: u64,
 }
 
 impl Entry {
+    fn with_since(self, since_utc: u64) -> Entry {
+        Entry { since_utc, ..self }
+    }
+
     fn to_json(&self) -> String {
         format!(
-            r#"{{"id":"{}","time":"{}","amount_l":{},"amount_r":{},"enabled":{}}}"#,
+            r#"{{"id":"{}","time":"{}","amount_l":{},"amount_r":{},"enabled":{},"since_utc":{}}}"#,
             self.id.escape_debug(),
             format_time_of_day(self.minute_of_day),
             self.amount_l,
             self.amount_r,
             self.enabled,
+            self.since_utc,
         )
     }
 
@@ -185,7 +195,8 @@ impl Entry {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("sched-{}", now_unix()));
-        Ok(Entry { id, minute_of_day, amount_l, amount_r, enabled })
+        let since_utc = json_field(obj, "since_utc").and_then(|v| v.parse().ok()).unwrap_or(0);
+        Ok(Entry { id, minute_of_day, amount_l, amount_r, enabled, since_utc })
     }
 }
 
@@ -552,6 +563,18 @@ impl Schedule {
         if entries.len() > MAX_ENTRIES {
             return Err(Error::Invalid(cap_error(entries.len())));
         }
+        // An entry that is new, or whose time/amounts/enabled changed, comes into force now; an
+        // untouched one keeps its stamp so a full-table PUT never re-arms what already ran.
+        let entries = {
+            let guard = self.cache.lock().unwrap();
+            entries
+                .into_iter()
+                .map(|e| match guard.entries.iter().find(|old| old.id == e.id) {
+                    Some(old) if Entry { since_utc: old.since_utc, ..e.clone() } == *old => e.with_since(old.since_utc),
+                    _ => e.with_since(now),
+                })
+                .collect()
+        };
         self.persist_then_push(entries, ble, now)
     }
 
@@ -566,7 +589,7 @@ impl Schedule {
                 return Err(Error::Invalid(cap_error(guard.entries.len() + 1)));
             }
             let mut entries = guard.entries.clone();
-            entries.push(entry);
+            entries.push(Entry { since_utc: now, ..entry });
             entries
         };
         self.persist_then_push(entries, ble, now)
@@ -595,6 +618,9 @@ impl Schedule {
             let mut entries = guard.entries.clone();
             for e in entries.iter_mut() {
                 if e.id == id {
+                    if enabled && !e.enabled {
+                        e.since_utc = now;
+                    }
                     e.enabled = enabled;
                 }
             }
@@ -863,6 +889,7 @@ mod tests {
             amount_l: 10,
             amount_r: 10,
             enabled: true,
+                since_utc: 0,
         };
         let body = format!(r#"{{"entries":[{}]}}"#, e.to_json());
         let parsed = parse_entries(&body).unwrap();
@@ -880,6 +907,7 @@ mod tests {
                 amount_l: 3,
                 amount_r: 4,
                 enabled: false,
+                since_utc: 0,
             }],
             last_modified: 1_700_000_000,
             fired: HashMap::new(),
@@ -907,6 +935,7 @@ mod tests {
                 amount_l: 1,
                 amount_r: 1,
                 enabled: true,
+                since_utc: 0,
             }],
             last_modified: 42,
             fired: HashMap::new(),
@@ -1088,7 +1117,7 @@ mod tests {
     fn entries_snapshot_reflects_current_entries() {
         let path = std::env::temp_dir().join(format!("kibble-sched-test-snapshot-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
-        let entries = vec![Entry { id: "a".into(), minute_of_day: 90, amount_l: 1, amount_r: 1, enabled: true }];
+        let entries = vec![Entry { id: "a".into(), minute_of_day: 90, amount_l: 1, amount_r: 1, enabled: true, since_utc: 0 }];
         let schedule = Schedule::seed_for_test(path.clone(), entries.clone());
         assert_eq!(schedule.entries_snapshot(), entries);
         let _ = fs::remove_file(&path);
@@ -1099,8 +1128,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kibble-sched-test-snapjson-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
         let entries = vec![
-            Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true },
-            Entry { id: "off".into(), minute_of_day: 8 * 60, amount_l: 1, amount_r: 1, enabled: false },
+            Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true, since_utc: 0 },
+            Entry { id: "off".into(), minute_of_day: 8 * 60, amount_l: 1, amount_r: 1, enabled: false, since_utc: 0 },
         ];
         let schedule = Schedule::seed_for_test(path.clone(), entries);
         let tz = localtime::EASTERN;
@@ -1120,7 +1149,7 @@ mod tests {
     fn snapshot_json_with_no_supported_timezone_shows_no_next_fire_for_anyone() {
         let path = std::env::temp_dir().join(format!("kibble-sched-test-notz-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
-        let entries = vec![Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true }];
+        let entries = vec![Entry { id: "morning".into(), minute_of_day: 7 * 60, amount_l: 1, amount_r: 1, enabled: true, since_utc: 0 }];
         let schedule = Schedule::seed_for_test(path.clone(), entries);
         let json = schedule.snapshot_json(None, 1_700_000_000, false);
         assert!(json.contains(r#""id":"morning""#));

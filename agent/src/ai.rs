@@ -499,11 +499,12 @@ impl Feed {
     }
 }
 
-/// Seconds *before* a track's own vendor `start_time` its paired eat/visit crop may have landed
-/// -- `ai.rs`'s poll loop ticks once a second and the vendor's crop file and the track block
-/// don't necessarily update on the exact same tick, so the crop can predate the track by a
-/// couple of seconds and still be the same visit.
-pub const TRACK_IMAGE_LOOKBACK_SECS: u64 = 5;
+/// Seconds *before* a track's own vendor `start_time` its paired eat/visit crop may have landed.
+/// The vendor writes the visit snapshot when motion starts and only publishes the track once it
+/// has identified the cat -- observed up to minutes later (the same window
+/// [`faces::TRACK_ASSOCIATION_WINDOW_SECS`] uses); a 5 s window left "Kitty was at the bowl"
+/// rows with no picture 7 s after a perfectly good visit crop.
+pub const TRACK_IMAGE_LOOKBACK_SECS: u64 = 300;
 /// Seconds *after* `start_time` the paired crop may still land -- generous, since an `eat`
 /// detection (the stronger signal [`select_track_image`] prefers) commonly fires well into a
 /// visit that started up to a couple of minutes earlier.
