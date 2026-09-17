@@ -20,9 +20,11 @@
 //! immediately restores the vendor's own script, since the bind mount is the only thing shadowing
 //! it and nothing on flash was ever modified. A real device reboot also reverts it on its own --
 //! a bind mount never survives one -- so [`install`] simply re-establishes it, idempotently, on
-//! every Kibble startup.
+//! every Kibble startup (checked via [`already_mounted`], not `/proc/mounts` -- see its own doc
+//! comment for why).
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -37,27 +39,29 @@ const REPLACEMENT_SCRIPT: &str = "#!/bin/sh\n\
 echo \"$(date +%s) ctrl requested reset_wifi.sh $*\" >> /opt/kibble/reset_wifi_suppressed.log\n\
 exit 0\n";
 
-/// Whether `target` is already bind-mounted from `replacement`, read from a `/proc/mounts`-style
-/// listing (`<source> <target> <fstype> <options> <freq> <passno>` per line). Checked so a Kibble
-/// restart never stacks a second bind mount on top of the first -- each would shadow the last
-/// harmlessly, but `/proc/mounts` would grow one entry longer per restart forever -- and so an
-/// unrelated mount that happens to already sit on `target` (from something else entirely) is
-/// never mistaken for this one.
-fn already_mounted_in(mounts: &str, replacement: &str, target: &str) -> bool {
-    mounts.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next() == Some(replacement) && fields.next() == Some(target)
-    })
+/// Whether `a` and `b` currently resolve to the exact same underlying inode -- true for two
+/// paths connected by a bind mount (or a hard link), false otherwise, including when either path
+/// is missing.
+fn same_file(a: &str, b: &str) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
 }
 
+/// Whether [`TARGET`] is already bind-mounted from [`REPLACEMENT`] -- checked so a Kibble restart
+/// never stacks a second bind mount on top of the first. Deliberately does **not** parse
+/// `/proc/mounts` for a `<source> <target>` pair, the way an initial version of this module did:
+/// confirmed live on this device, a *file* bind mount's `/proc/mounts` line names the underlying
+/// block device (`/dev/ubi1_2`, the `ubifs` volume `/opt` lives on) as its source field, not the
+/// bind-mount source path (`/opt/kibble/reset_wifi_noop.sh`) -- matching against the expected
+/// source string there never matches, which would have silently re-`mount --bind`ed on every
+/// single Kibble restart forever. Comparing `(device, inode)` numbers instead is exactly what
+/// identifies "these two paths are the same file", regardless of which kernel mechanism (bind
+/// mount here; a hard link would look identical) made them so, and regardless of how any given
+/// kernel/filesystem chooses to render it in `/proc/mounts`.
 fn already_mounted() -> bool {
-    match fs::read_to_string("/proc/mounts") {
-        Ok(mounts) => already_mounted_in(&mounts, REPLACEMENT, TARGET),
-        Err(e) => {
-            eprintln!("kibbled: resetguard: could not read /proc/mounts: {e} (assuming not mounted)");
-            false
-        }
-    }
+    same_file(TARGET, REPLACEMENT)
 }
 
 /// Writes the no-op replacement script to `path` and marks it executable. A plain
@@ -101,30 +105,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn already_mounted_true_when_proc_mounts_has_the_exact_pair() {
-        let mounts = "/dev/root / ext4 rw,relatime 0 0\n\
-                       /opt/kibble/reset_wifi_noop.sh /app/script/reset_wifi.sh none rw,bind 0 0\n";
-        assert!(already_mounted_in(mounts, REPLACEMENT, TARGET));
+    fn same_file_true_for_a_hard_link_to_the_same_inode() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("kibble-resetguard-same-a-{:?}", std::thread::current().id()));
+        let b = dir.join(format!("kibble-resetguard-same-b-{:?}", std::thread::current().id()));
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
+        fs::write(&a, b"x").unwrap();
+        // A hard link is a different, independent path resolving to the identical inode -- the
+        // same relationship a bind mount creates between the replacement and the vendor's path.
+        fs::hard_link(&a, &b).unwrap();
+        assert!(same_file(a.to_str().unwrap(), b.to_str().unwrap()));
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
     }
 
     #[test]
-    fn already_mounted_false_when_absent_entirely() {
-        let mounts = "/dev/root / ext4 rw,relatime 0 0\n";
-        assert!(!already_mounted_in(mounts, REPLACEMENT, TARGET));
+    fn same_file_false_for_two_distinct_files_with_identical_content() {
+        // The whole reason this isn't a content/hash comparison: two independent files that
+        // happen to read identically (e.g. before a `mount --bind` was ever run) must not be
+        // mistaken for an established mount.
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("kibble-resetguard-distinct-a-{:?}", std::thread::current().id()));
+        let b = dir.join(format!("kibble-resetguard-distinct-b-{:?}", std::thread::current().id()));
+        fs::write(&a, b"identical content").unwrap();
+        fs::write(&b, b"identical content").unwrap();
+        assert!(!same_file(a.to_str().unwrap(), b.to_str().unwrap()));
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
     }
 
     #[test]
-    fn already_mounted_false_for_a_different_source_on_the_same_target() {
-        // Something else entirely happens to have a bind mount sitting on the same path -- must
-        // not be mistaken for this module's own mount.
-        let mounts = "/some/unrelated/file /app/script/reset_wifi.sh none rw,bind 0 0\n";
-        assert!(!already_mounted_in(mounts, REPLACEMENT, TARGET));
-    }
-
-    #[test]
-    fn already_mounted_false_for_the_replacement_mounted_somewhere_else() {
-        let mounts = "/opt/kibble/reset_wifi_noop.sh /app/script/wifi_connect.sh none rw,bind 0 0\n";
-        assert!(!already_mounted_in(mounts, REPLACEMENT, TARGET));
+    fn same_file_false_when_either_path_is_missing() {
+        assert!(!same_file("/nonexistent/kibble-resetguard-a", "/nonexistent/kibble-resetguard-b"));
+        let real = std::env::temp_dir()
+            .join(format!("kibble-resetguard-half-{:?}", std::thread::current().id()));
+        fs::write(&real, b"x").unwrap();
+        assert!(!same_file(real.to_str().unwrap(), "/nonexistent/kibble-resetguard-other"));
+        let _ = fs::remove_file(&real);
     }
 
     #[test]
