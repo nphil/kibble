@@ -6,7 +6,7 @@
 //! ## Why this exists
 //!
 //! `docs/34-bowl-fill-surplus.md` Part 6 disassembly-proved that `config_shm`'s `BOWL_FILL_1`
-//! (`state::Snapshot::bowl_fill_1`, the vendor's own reading) is `(int)(score * 100.0f)`, where
+//! (`state::Snapshot::bowl_fill`, the vendor's own reading) is `(int)(score * 100.0f)`, where
 //! `score` is a 0.0-1.0 bowl-fullness estimate from a vision model that only `media`'s own
 //! cloud-gated pipeline was ever observed to run -- with the cloud blackholed (this project's
 //! whole point), that field just stays invalid forever. Part 7 disassembled the model's real
@@ -50,11 +50,7 @@
 //!
 //! A new field, `bowl_fill_local: [percent, computed_unix]` (both `null` until the first
 //! successful reading), alongside the existing, untouched `bowl_fill` (the vendor's own
-//! `config_shm` value, hopper 1/hopper 2). Deliberately a new field rather than repurposing
-//! `bowl_fill`'s own second slot: that slot is hopper 2's *own* reading (never populated by the
-//! vendor on this device, per `docs/34` Part "Empirical confirmation"), not a spare timestamp
-//! slot -- writing Kibble's own hopper-1 estimate there would misrepresent hopper 2 on any
-//! two-hopper device. Both fields stay independently readable so an operator (or a future HA
+//! `config_shm` value). Both fields stay independently readable so an operator (or a future HA
 //! integration update) can compare Kibble's own estimate against the vendor's, when the vendor's
 //! happens to be available too.
 

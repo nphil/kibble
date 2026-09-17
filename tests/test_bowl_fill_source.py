@@ -22,7 +22,7 @@ def _state(**overrides) -> FeederState:
         "volume": 9,
         "desiccant_days": 100,
         "feeding": False,
-        "bowl_fill": [None, None],
+        "bowl_fill": None,
         "event_counter": 0,
     }
     payload.update(overrides)
@@ -30,7 +30,7 @@ def _state(**overrides) -> FeederState:
 
 
 def test_the_vendors_own_reading_wins_when_it_exists() -> None:
-    state = _state(bowl_fill=[46, None], bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
+    state = _state(bowl_fill=46, bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
 
     assert BOWL_FILL_1.value(state) == 46
     assert BOWL_FILL_1.attributes(state) == {"source": "feeder"}
@@ -38,7 +38,7 @@ def test_the_vendors_own_reading_wins_when_it_exists() -> None:
 
 def test_kibbles_own_estimate_fills_in_when_the_vendor_has_none() -> None:
     """The cloud-disabled steady state: without this fallback the entity is permanently unknown."""
-    state = _state(bowl_fill=[None, None], bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
+    state = _state(bowl_fill=None, bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
 
     assert BOWL_FILL_1.value(state) == 23
     attrs = BOWL_FILL_1.attributes(state)

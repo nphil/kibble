@@ -128,9 +128,6 @@
       "bowl_fill_1": {
         "default": "mdi:gauge"
       },
-      "bowl_fill_2": {
-        "default": "mdi:gauge"
-      },
       "desiccant_days": {
         "default": "mdi:air-filter"
       },

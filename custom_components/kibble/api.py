@@ -80,7 +80,9 @@ class FeederState:
     #: `GET /state`'s `eating`: `media`'s own eat-in-progress flag (kibble docs/34 Part 9) --
     #: set the moment its detector decides a pet is eating, cleared when the meal ends.
     eating: bool
-    bowl_fill: tuple[int | None, int | None]
+    #: `GET /state`'s `bowl_fill`: the feeder's own vision estimate of how full the bowl is
+    #: (0-100), None while it has none. One reading for the whole bowl (kibble docs/34 Part 10).
+    bowl_fill: int | None
     #: Per-hopper "is the food level at or below the vendor's own low-food threshold" flag --
     #: `GET /state`'s `hopper_empty`, `[hopper_1, hopper_2]`. `None` while the feeder has never
     #: reported a level for that hopper since its last boot (kibble docs/07-config.md).
@@ -105,7 +107,6 @@ class FeederState:
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> FeederState:
-        fill = data.get("bowl_fill") or [None, None]
         hopper_empty = data.get("hopper_empty") or [None, None]
         hopper_level = data.get("hopper_level") or [None, None]
         local = data.get("bowl_fill_local") or [None, None]
@@ -123,7 +124,7 @@ class FeederState:
             desiccant_days=int(data.get("desiccant_days") or 0),
             feeding=bool(data.get("feeding")),
             eating=bool(data.get("eating")),
-            bowl_fill=(fill[0], fill[1] if len(fill) > 1 else None),
+            bowl_fill=data.get("bowl_fill"),
             hopper_empty=(
                 hopper_empty[0],
                 hopper_empty[1] if len(hopper_empty) > 1 else None,

@@ -36,7 +36,7 @@ from kibble.push import (
 
 STATE_JSON = {
     "serial": "SN1", "firmware": "895", "ble_firmware": 159, "volume": 20, "desiccant_days": 3,
-    "feeding": False, "bowl_fill": [10, None], "event_counter": 4, "timezone_name": "UTC",
+    "feeding": False, "bowl_fill": 10, "event_counter": 4, "timezone_name": "UTC",
     "scheduler_tz_supported": True, "track": None,
     "kibbled_start_count": 1, "kibbled_last_start_unix": 1, "kibbled_last_exit_code": None,
 }

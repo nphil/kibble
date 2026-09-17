@@ -30,7 +30,11 @@ pub mod off {
     pub const BLE_FIRMWARE: usize = 4876;
     /// state section
     pub const BOWL_FILL_1: usize = 9916; // u32; 0xffffffff while a feed is in flight
-    pub const BOWL_FILL_2: usize = 9920; // u32
+    /// NOT a second side of the bowl. `media`'s `eat_event_start_signal` copies `BOWL_FILL_1`
+    /// here the moment a meal begins (0x1de6a-0x1de76), so it reads "bowl fill when the last
+    /// meal started" -- the vision model produces exactly one number per run (docs/34 Part 10).
+    /// Mapped for completeness; kibbled does not report it.
+    pub const BOWL_FILL_AT_MEAL_START: usize = 9920; // u32
     /// Named "event counter" when first mapped; now known to be `ble`'s count of MCU feed-log
     /// records still awaiting `ctrl`'s `0x600f` ack (`ble` increments it at 0x146f2/0x14b66 on
     /// a FEED_LOG report, decrements it in `dispatch_handler_ble_res_feed_log` at 0x174b4).
@@ -304,8 +308,7 @@ impl Shm {
             desiccant_days: self.u8(off::DESICCANT_DAYS),
             feeding: self.u8(off::FEEDING) != 0,
             eating: self.eating(),
-            bowl_fill_1: self.bowl_fill(off::BOWL_FILL_1),
-            bowl_fill_2: self.bowl_fill(off::BOWL_FILL_2),
+            bowl_fill: self.bowl_fill(off::BOWL_FILL_1),
             hopper_1_empty: self.hopper_empty(off::FOOD_1),
             hopper_2_empty: self.hopper_empty(off::FOOD_2),
             hopper_1_level: self.hopper_level(off::FOOD_1),
@@ -334,8 +337,9 @@ pub struct Snapshot {
     pub feeding: bool,
     /// `media`'s eat-in-progress flag -- see [`off::EATING`].
     pub eating: bool,
-    pub bowl_fill_1: Option<u32>,
-    pub bowl_fill_2: Option<u32>,
+    /// The feeder's own vision estimate of bowl fullness, 0-100 -- `None` while invalid
+    /// (`0xffffffff`: during a feed, or before `media`'s first run after boot).
+    pub bowl_fill: Option<u32>,
     /// A hopper's food level collapsed to a problem flag -- see [`Shm::hopper_empty`].
     pub hopper_1_empty: Option<bool>,
     pub hopper_2_empty: Option<bool>,
@@ -378,7 +382,7 @@ impl Snapshot {
         format!(
             concat!(
                 r#"{{"serial":"{}","firmware":"{}","ble_firmware":{},"volume":{},"#,
-                r#""desiccant_days":{},"feeding":{},"eating":{},"bowl_fill":[{},{}],"hopper_empty":[{},{}],"hopper_level":[{},{}],"#,
+                r#""desiccant_days":{},"feeding":{},"eating":{},"bowl_fill":{},"hopper_empty":[{},{}],"hopper_level":[{},{}],"#,
                 r#""event_counter":{},"timezone_name":"{}","scheduler_tz_supported":{},"track":{}}}"#
             ),
             self.serial.escape_debug(),
@@ -388,8 +392,7 @@ impl Snapshot {
             self.desiccant_days,
             self.feeding,
             self.eating,
-            opt(self.bowl_fill_1),
-            opt(self.bowl_fill_2),
+            opt(self.bowl_fill),
             opt_bool(self.hopper_1_empty),
             opt_bool(self.hopper_2_empty),
             opt(self.hopper_1_level.map(u32::from)),
@@ -415,8 +418,7 @@ mod tests {
             desiccant_days: 30,
             feeding: false,
             eating: false,
-            bowl_fill_1: Some(50),
-            bowl_fill_2: None,
+            bowl_fill: Some(50),
             hopper_1_empty: Some(false),
             hopper_1_level: Some(2),
             hopper_2_level: None,
@@ -473,7 +475,7 @@ mod tests {
         let json = sample().to_json();
         assert!(json.contains(r#""timezone_name":"America/New_York""#));
         assert!(json.contains(r#""scheduler_tz_supported":true"#));
-        assert!(json.contains(r#""bowl_fill":[50,null]"#));
+        assert!(json.contains(r#""bowl_fill":50"#));
     }
 
     #[test]

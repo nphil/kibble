@@ -29,7 +29,7 @@ def _state(**overrides) -> FeederState:
         "volume": 9,
         "desiccant_days": 100,
         "feeding": False,
-        "bowl_fill": [None, None],
+        "bowl_fill": None,
         "event_counter": 0,
     }
     payload.update(overrides)

@@ -1264,3 +1264,23 @@ frame from ≤ 15 s earlier (same cat, same bowl, 3 s before), persisted as `<ts
 `GET /state` gains `"eating"`; the integration exposes `binary_sensor.*_eating`; the card's hero
 reads "<Cat> is eating" while it is up. The `"eat"` → track pairing in `websocket.py` (the
 "X ate" timeline row) is unchanged and now has events to pair.
+
+
+## Part 10 — There is one bowl-fill number, not two [HIGH]
+
+`petkit_food_detect_callback` (media 0x1c088) receives **one** float from the food model
+(`petkit_pp_fooddet_416_128_segreg_0509_u16.axmodel`, a 416x128 segmentation+regression net run on
+the bowl crop every 120 s), logs it as `food detect leftover: 0.161440`, multiplies by 100 and
+stores the single result at `config_shm+9916`. There is no per-side output.
+
+`config_shm+9920` -- carried since docs/14 as "second hopper's counterpart" and exposed as
+`sensor.*_bowl_fill_hopper_2` -- is written at exactly one place in `media`:
+`eat_event_start_signal` (0x1de6a-0x1de76, `ldr r1,[r7,#9916]; str r1,[r7+#9920]`) copies the
+current fill into it when a meal begins. It is "bowl fill when the last meal started"; the two
+values were invalidated together on a feed only because ctrl's feed-time invalidator clears the
+whole block. Live 2026-09-17 after Pancake's meal: `[16, 15]` = now 16 %, at meal start 15 %.
+
+Consequences, all shipped: `GET /state`'s `bowl_fill` is a scalar; the `hopper_2` percentage
+entity is gone (registry entry removed, its statistics cleared, Spook reloaded); the card draws
+one cavity (v0.7.5). `state::off::BOWL_FILL_AT_MEAL_START` keeps the offset mapped under its
+real meaning.

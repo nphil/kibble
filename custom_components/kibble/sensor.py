@@ -65,22 +65,15 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
         translation_key="bowl_fill_1",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value=lambda s: s.bowl_fill[0] if s.bowl_fill[0] is not None else s.bowl_fill_local[0],
+        value=lambda s: s.bowl_fill if s.bowl_fill is not None else s.bowl_fill_local[0],
         attributes=lambda s: (
             {"source": "feeder"}
-            if s.bowl_fill[0] is not None
+            if s.bowl_fill is not None
             else {
                 "source": "kibble",
                 "measured_at": _iso_or_none(s.bowl_fill_local[1]),
             }
         ),
-    ),
-    KibbleSensorDescription(
-        key="bowl_fill_2",
-        translation_key="bowl_fill_2",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        value=lambda s: s.bowl_fill[1],
     ),
     KibbleSensorDescription(
         # The MCU's own three-way hopper reading (docs/07-config.md §10) -- the closest thing
