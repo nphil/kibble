@@ -1221,3 +1221,46 @@ kibbled now holds the word at `2` whenever the cloud is *desired* disabled
 vendor's bowl fill, its eat/behaviour detectors and the quiet radio all follow from one line.
 Part 7's own inference (`bowl_fill_local`) stays as an independent cross-check and as the
 fallback for the first minutes after a boot, before media's first run.
+
+
+## Part 9 — The eat detector was never broken; the picture is a 35 ms race [HIGH]
+
+**How to read the vendor's own logs.** Every vendor process logs through `AX_SYS_LogPrint`
+(`libax_sys`) to `axsyslogd`, which writes `/tmp/data/AXSyslog/syslog/<timestamp>.log` and
+rotates every 5 min (`logUpload` deletes old files). Each call site is gated on
+`*p_log_level > N` (N = 3/4/5 by severity), where `p_log_level` (media `.data` 0x76b5c) points at
+`config_shm+4564` = `usr.log_level` (persisted, default 5), so at the default only errors reach
+the file. `p_logcat_save` (0x76b60 → `config_shm+4568`, `usr.logSaveFlag` = 1) selects the syslog
+path over a `printf` to `/dev/console`. Writing `6` to `config_shm+4564` turns on every process's
+full DBG/INF stream at once, live, no restart — this session's whole finding came from that.
+(Restore to 5 afterwards; a `config_save` in the window persists whatever is there.)
+
+**What a real meal looks like** (Pancake, 2026-09-17 16:22 UTC, uptime 57705–57812):
+
+| t (s) | media | ctrl |
+|---|---|---|
+| 57705.80 | `pet_event_start_signal_ready`: writes `/tmp/fPre_pet.jpeg` (88 846 B), then "pet report waiting…(5→1)" countdown | — |
+| 57708.36 | `petkit_body_callback` `[>>pet-move-around-the-plate<<]` → `eat_event_start_signal`: writes `/tmp/fPre_eat.jpeg` (77 828 B), **stores 1 to `config_shm+2960`** (0x1df10), sends `0x1002` `E_EVT_RPT_TYPE_PET_EAT_START` (`event_type:5`) 35 ms after the write | `dispatch_handler_ctrl_event_msg` T31→T31 event_type:5 → `PACK_EVENT_5_MSG SUCCESS` → `DEVICE_INFO_OFFLINE … NOT KEEP_ALIVE` (nowhere to send it; cloud off) |
+| 57708.44 | "have eat event clear pet event" (the pending visit report is dropped in favour of the eat) | |
+| 57812.10 | `eat_event_over_signal` "eat end", **stores 0 to +2960** (0x1e110), `0x1002` `event_type:6` | `PACK_EVENT_EAT_OVER_MSG SUCCESS` |
+
+The decision itself: `pet_exit_judge` "usefulCount(N) score(93)>score_level(35)" on the body
+detector, then `eat_exit_judge` "eat score(80), usefulCount(20)>(5), eatFlag(1)". Gates that
+matter and their live values: `usr.eatDetection` (+3576) = 1, `usr.eatSensitivity` (+3580) = 3,
+the cloud-state word (+10120) held at 2 by Part 8. `usr.eatVideo` (+3736) = 0 only disables the
+*compare pictures* (`make_eat_compare_pic`/`update_eat_compare_pic` log "camera not enable")
+and ctrl's "eatVideo(0) close"; it does not gate the event.
+
+**Why kibbled never saw an eat.** `ai.rs` polled `/tmp/fPre_eat.jpeg`'s mtime once a second.
+The visit picture survives its 5 s report countdown, so the poll catches it; the eat picture is
+handed to ctrl 35 ms after it is written and ctrl consumes it on receipt ("eat pic(0) close"),
+so across every meal observed the poll caught it zero times. Round 3's single capture was the
+tracer's luck, not the poll's.
+
+**What kibbled does now.** `config_shm+2960` (`off::EATING`, ctrl's outbound `"eating"`) is a
+level that stays up for the whole meal, so `ai.rs` reads it on the same 1 s tick and publishes
+one `"eat"` on the rising edge — with the eat frame if it is still on disk, otherwise the visit
+frame from ≤ 15 s earlier (same cat, same bowl, 3 s before), persisted as `<ts>-eat.json`.
+`GET /state` gains `"eating"`; the integration exposes `binary_sensor.*_eating`; the card's hero
+reads "<Cat> is eating" while it is up. The `"eat"` → track pairing in `websocket.py` (the
+"X ate" timeline row) is unchanged and now has events to pair.
