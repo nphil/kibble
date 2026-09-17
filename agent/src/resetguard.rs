@@ -36,7 +36,9 @@ const REPLACEMENT_SCRIPT: &str = "#!/bin/sh\n\
 # reset_wifi.sh power-cycles the Wi-Fi radio's GPIO and fully restarts wpa_supplicant/udhcpc;\n\
 # ctrl calls it roughly every 180s on its own *healthy* code path, not in response to an actual\n\
 # fault. This records every time it was requested without touching the radio or the link.\n\
-echo \"$(date +%s) ctrl requested reset_wifi.sh $*\" >> /opt/kibble/reset_wifi_suppressed.log\n\
+# tmpfs, not flash: this fires every ~180s for the life of the device. Not a *.log name either --\n\
+# the vendor's syslog stack periodically truncates every /tmp/*.log (docs/34 Part 5).\n\
+echo \"$(date +%s) ctrl requested reset_wifi.sh $*\" >> /tmp/reset_wifi_suppressed.dat\n\
 exit 0\n";
 
 /// Whether `a` and `b` currently resolve to the exact same underlying inode -- true for two

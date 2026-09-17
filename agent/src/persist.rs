@@ -182,6 +182,10 @@ fn wait_until_ready(shm: &Shm) {
     }
 }
 
+/// Keys already warned about as stale/invalid in `settings.json`, so the reconciler does not
+/// repeat the same line every 30 s for the rest of the process's life.
+static STALE_WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn reconcile_once(shm: &Shm) {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for (key, desired_value) in desired::load() {
@@ -193,9 +197,14 @@ fn reconcile_once(shm: &Shm) {
             continue;
         };
         if !setting.writable || !setting.kind.accepts(desired_value) {
-            eprintln!(
-                "kibbled: settings.json has a stale or invalid entry for {key:?} ({desired_value}), skipping"
-            );
+            // Once per process, not every tick: a stale entry is a fact about the file, not news.
+            let mut warned = STALE_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+            if !warned.contains(&key) {
+                eprintln!(
+                    "kibbled: settings.json has a stale or invalid entry for {key:?} ({desired_value}), skipping"
+                );
+                warned.push(key.clone());
+            }
             continue;
         }
         let live = setting.read(shm);
