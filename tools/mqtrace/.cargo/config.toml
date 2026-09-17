@@ -1,0 +1,4 @@
+[target.armv7-unknown-linux-musleabihf]
+# Same reasoning as agent/.cargo/config.toml: Rust's musl target supplies its own musl
+# crt/libc; this cross gcc is only used as the final link driver.
+linker = "arm-linux-gnueabihf-gcc"

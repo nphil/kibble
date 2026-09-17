@@ -1,0 +1,16 @@
+[package]
+name = "mqtrace"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal ptrace(2) syscall tracer for the feeder's mqueue bus and UART traffic (diagnostic-only, never deployed alongside kibbled)"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

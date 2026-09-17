@@ -419,3 +419,156 @@ real value already in place, it might (Part 4's untested variant). Do not, howev
 deliberately out-of-domain (negative-when-signed) value to `surplus_control` to force an edge from
 the invalid state — that exercises a shape nothing in this firmware would ever legitimately
 produce, on a field this document cannot fully vouch for beyond the one `ble` consumer traced.
+
+
+## Part 5 — `mqtrace`: a ptrace(2) syscall tracer, built and validated, capture not yet run [HIGH]
+
+Static analysis (Parts 1-4) proved no bus message or local `config_shm`/settings write reaches
+the real `CMD 0x19` sender (`ble` vaddr `0x180ac`); the only way forward is observing the vendor
+stack during a cloud-triggered refresh. This session built that observation tool, deployed it,
+and proved it correct against real vendor traffic — but ran out of session budget immediately
+before running the actual cloud-enable capture. **The capture itself (assignment step 2) is the
+concrete next step for a future session; everything needed to run it is now in place.**
+
+### The tool: `tools/mqtrace`
+
+`tools/mqtrace/src/main.rs` is a self-contained `PTRACE_SEIZE`-based syscall tracer, `libc`-only
+dependency (kept out of `agent/`'s zero-dependency tree). Design, independently verified against
+the real headers at `/usr/arm-linux-gnueabihf/include/asm/{ptrace,unistd-eabi}.h` on the build
+host (not assumed from memory):
+
+- Attaches to a target pid **and every thread** in `/proc/<pid>/task` via `PTRACE_SEIZE` (a
+  two-pass scan catches threads spawned between the initial listing and the seize loop), with
+  `PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE` — deliberately **not** `TRACEFORK`/`TRACEVFORK`,
+  so a `system()`-spawned child (e.g. `ctrl`'s `reset_wifi.sh`) is never auto-attached or put at
+  risk of being left stopped.
+- Decodes only at syscall **exit** (one `PTRACE_GETREGS` per event; ARM's syscall-return path
+  preserves all registers except `r0`, so `orig_r0`/`r1`/`r2` plus the returned `r0` are all
+  available in one call): `read`=3, `write`=4, `mq_timedsend`=276, `mq_timedreceive`=277.
+- For `mq_timedsend`/`mq_timedreceive`: resolves the queue name via `/proc/<pid>/fd/<fd>`
+  (POSIX mqueue fds resolve to a name like `/msg_dispatch_8`) and hex-dumps the full envelope,
+  read out of the tracee's address space through `/proc/<pid>/mem` (`pread` at `addr as u64`,
+  confirmed no sign-extension hazard since musl's `off_t` is always 64-bit on this target).
+- For `read`/`write`: logs the byte payload **only** when the fd resolves to `--uart-path`
+  (default `/dev/ttyS3`); every other fd is decoded (for its mq_* role, if any) but never
+  hex-dumped, keeping the log free of unrelated I/O noise.
+- Shutdown is unconditional and glitch-free by construction: `SIGINT`/`SIGTERM` (and a
+  `--timeout`, default 240s) trigger `begin_shutdown()`, which sends `PTRACE_INTERRUPT` to every
+  tracked tid and detaches each one on its next stop of *any* kind — this only works because the
+  tracees were `SEIZE`d, not `ATTACH`ed; it guarantees no tracee is ever left stopped regardless
+  of what it was doing when shutdown was requested.
+- CLI: `mqtrace --pid <pid> [--timeout 240] [--uart-path /dev/ttyS3] [--log /tmp/mqtrace.log]`.
+
+**Build:** the committed source builds with a plain, stable-toolchain
+`cargo build --release --target armv7-unknown-linux-musleabihf` (`.cargo/config.toml` mirrors
+`agent/`'s linker override) — no unstable flags, so the assignment's literal build invocation
+works unmodified. That build is 359,152 bytes. A separate, **not committed**, throwaway
+nightly `-Z build-std=std` + `panic=immediate-abort` build (359,152 → 87,352 bytes) was used
+*only* to shrink the one-time manual transfer payload; it lives outside the repo
+(`/tmp/mqtrace_deploybuild/` on the sandbox, not the device) and has no bearing on how the tool
+is meant to be built normally.
+
+**Deployment:** there is no scp/tftp path from the sandbox to the feeder (Tailscale-only DNS, no
+direct LAN route; only `feeder_http`/`feeder_shell`/`feeder_deploy_kibbled` may touch the device).
+The 87,352-byte binary was gzip'd (56,101 bytes), base64'd (74,888 chars), and transferred as 9
+chunked heredocs over the shared `feeder_shell` telnet session, with a full `wc -c` + `md5sum`
+check after every chunk and a bisect-then-`dd`-patch recovery for any mismatch. **xz was tried
+first and abandoned**: busybox's `xz` applet cannot decompress liblzma's default CRC64-checked
+stream (`xz: corrupted data` on `-t`/`-d`) even after recompressing with `--check=crc32` and
+smaller dictionaries; gzip round-trips reliably and busybox has full `gzip`/`gunzip`. Final
+on-device binary: `/tmp/mqtrace`, 87,352 bytes, md5 `955e44e96264fb85a53cb3eb5ebeef84` — byte-
+identical to the local nightly-shrunk build, confirmed after `base64 -d | gunzip`.
+
+### Validation (all three required derisking steps, all clean)
+
+**1. `kibbled` self-test** — attached to pid 12105 (13 threads: main + 12 workers), 15-25s
+windows, triggered `GET /state`/`GET /cloud` during the attach. Log showed correctly-attributed
+`SIGNAL sig=17` (SIGCHLD) forwarding on multiple threads (proving genuine signals are passed
+through, not swallowed) and a clean `SHUTDOWN` → 13×`DETACH` → `DONE` sequence exactly at the
+configured timeout. `kibbled` kept serving `GET /state` correctly throughout and after every run
+(confirmed via repeated live queries); no crash, no hang, no restart triggered by the attach.
+
+**2. `ble` idle test** — attached to pid 203 (3 threads: 203/206/207), 30s, zero messages sent.
+Captured 83 lines of **real, correctly-decoded** UART + bus traffic, e.g.:
+
+```
+23322.271517 ATTACH pid=203 tids=[203, 206, 207] uart_path=/dev/ttyS3 log=/tmp/mqcap_ble_idle.dat
+23322.519504 UART_READ  tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b000141c06e001ec2
+23322.732656 UART_READ  tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004dc0010508
+23322.732868 MQSEND     tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004e10b0de
+23322.733026 MQRECV     tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004e10b0de
+23322.733153 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9  bytes=5aa50900004e10b0de
+```
+repeating on a steady ~2s cadence for the full 30s window (SEQ byte incrementing `0x4e, 0x4f,
+0x50, …, 0x5c` with no gaps). Findings this independently confirms or adds:
+- **The bus envelope format is empirically confirmed on live traffic**, not just static analysis:
+  `len=13` = 4-byte header (`msg_id=0x601a` + `src=8`, both LE u16) + 9-byte payload, matching
+  `bus.rs`/`docs/14-feed-test.md` exactly.
+- **New:** `ble` uses the *same* bus/mqueue mechanism internally between its own threads, not
+  just for cross-process IPC — thread 207 (UART reader) posts every decoded frame to `ble`'s own
+  `/msg_dispatch_8` queue (`msg_id=0x601a`, previously unattributed — adjacent to the known
+  `0x601b`/`subchip_req_data`), which `ble`'s main thread (203) consumes and acts on.
+- **New:** the idle ~2s heartbeat is MCU CMD `0x01` (status report, growing SEQ) answered by
+  `ble` with a CMD `0x00` frame (bare ack/heartbeat, no payload, SEQ copied/incremented) — this
+  is routine keepalive chatter, not the surplus mechanism, and now has a documented fingerprint
+  so a future capture can filter it out when isolating the cloud-triggered sequence.
+- `config_shm+10304` (`ALIVE_BLE`) was read before/after: still cycling normally (not stalled),
+  and the SEQ counter inside the captured frames never skipped a beat across the whole attach —
+  i.e. the ptrace attach has no observable effect on `ble`'s real-time behavior.
+
+**3. `ctrl` idle test** — attached to pid 217 (6 threads: 217/229/230/231/232/432), 25s, zero
+messages sent. Clean attach, `SIGNAL sig=17` forwarding observed (thread 231 reaping children —
+consistent with `ctrl`'s periodic `system()` calls), clean `SHUTDOWN`/6×`DETACH`/`DONE` at
+timeout. `pidof ctrl` unchanged (217) and CPU time still accumulating after detach.
+
+No bus message or UART frame was ever sent by this tool or this session — every capture above is
+purely passive (`PTRACE_SYSCALL` observation only; nothing was injected).
+
+### Device quirk discovered in the process: `/tmp/*.log` is not durable [HIGH]
+
+The first self-test's log (`/tmp/mqtrace.log`) was found silently zeroed a few minutes after a
+clean run (confirmed via `wc -l`/`md5sum` at 19 valid lines, then 0 bytes minutes later, binary
+untouched). Ruled out: a bug in `mqtrace` itself (grep-confirmed exactly one `OpenOptions::new()
+.create(true).append(true)` call site in the whole source, never reopened/truncated); a collision
+with sibling agent `BowlFillPart2` (confirmed zero device activity at the time). Root cause:
+`ps` shows both a standard busybox `syslogd`/`klogd` *and* a vendor `axsyslogd`/`axklogd` running;
+`/tmp` is `tmpfs`; a directory listing showed **every** `*.log` file in `/tmp` — including
+unrelated ones like `daemon.log`, `syslog.log`, and an old `cpu_sample_live.log` scratch file from
+a different investigation — zeroed at the exact same mtime, while every non-`.log` file (`.txt`,
+`.out`, `.json`) in the same directory from the same timeframe was untouched. **Any file under
+`/tmp` named `*.log` is at risk of periodic truncation by the vendor's own logging stack,
+independent of who created it.** Mitigation used from that point on (and required for any future
+long-running capture, including the real bowl-fill one): pass `--log /tmp/<name>.dat` (or any
+non-`.log` extension), never `.log`, under `/tmp`.
+
+### What remains — the actual capture (assignment step 2) [next session]
+
+The tracer is built, deployed (`/tmp/mqtrace` on the device, 87,352 bytes, md5
+`955e44e96264fb85a53cb3eb5ebeef84` — verify this still matches before reuse; redeploy via the
+gzip+base64 chunked-heredoc method above if missing, since there is still no scp/tftp path), and
+proven correct and safe against all three real processes it will need to watch. The capture
+itself was not run this session (out of budget). Concrete next step:
+
+1. Confirm cloud is disabled and `BOWL_FILL_1` (`config_shm+9916`) is currently invalid
+   (`0xFFFFFFFF`).
+2. Start `mqtrace` against `ble` (203) **and** `ctrl` (217) simultaneously, distinct non-`.log`
+   log paths, `--timeout` ≥ 360s (the observed value-landing window is 11s-6min per Parts 1-4;
+   widen further if a `ctrl` Wi-Fi-reset cycle — power-cycles the USB adapter roughly every 190s
+   while cloud is blackholed — straddles the window, per live guidance from this session).
+3. Start a background poll of `config_shm+9916` (2s interval, to `/tmp`, non-`.log` path).
+4. `POST /cloud {"enabled":true}`; wait for `BOWL_FILL_1` to leave `0xFFFFFFFF` or the timeout.
+5. `POST /cloud {"enabled":false}` immediately, stop both tracers, pull both logs.
+6. Diff against this session's idle baselines (the CMD `0x01`/`0x00` heartbeat fingerprint above)
+   to isolate the surplus-specific sequence: a bus message reaching `0x180ac` (real 5-byte `CMD
+   0x19`) would appear as a new, non-heartbeat `msg_id` into `ble` immediately followed by a
+   `UART_WRITE` with `CMD=0x19` and a 5-byte payload; the corresponding `ctrl`-side trace shows
+   what triggers it (which bus message, or whether it's driven by `cloud`/`media` instead, per
+   Part 4's open question).
+7. Only once that trigger is identified and shown *not* to be feed/OTA/reset-shaped: reproduce it
+   from `kibbled` locally with cloud off, verify with `ble`-side `mqtrace` watching for the same
+   frame and `BOWL_FILL_1` landing, then wire it in properly (rate-limited, never during a feed,
+   unit-tested) per the original contract.
+
+Session state left safe: cloud confirmed `enabled:false, desired:false`, blackhole route present;
+`ble`/`ctrl`/`kibbled`/`watchdog` all confirmed alive and healthy after every attach; no bus/UART
+message was sent at any point this session.
