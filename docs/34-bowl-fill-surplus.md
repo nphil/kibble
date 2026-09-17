@@ -1,97 +1,325 @@
-# STUDY-bowl-fill.md — Refreshing the hopper-fill reading without the cloud (2026-09-16)
+# STUDY-bowl-fill.md — Refreshing the hopper-fill reading without the cloud (2026-09-17)
 
-**Status: one specific attempt ruled out live, with reasons; the actual trigger still open.**
+**Status: definitively NOT wired into `kibbled` this session. The real vendor `CMD 0x19` payload
+is now fully decoded and its only two senders are proven to be internal to `ble` (no `ctrl`→`ble`
+bus message reaches them); the write that actually lands a real value in `BOWL_FILL_1` was not
+found in `ble`, `ctrl`, or `cloud` despite disassembling all three in full. No message was
+"positively identified as safe" per this project's own bar, so nothing was sent and nothing was
+wired. See "What remains" for the one concrete next step.**
 
-## The bug
+## The bug, restated precisely
 
-`state.rs::off::BOWL_FILL_1/2` (`config_shm` offsets 9916/9920) mirror the T31 MCU's own
-"Food Surplus Ctrl" sensor report (`08-mcu.md` UART CMD `0x19`). The vendor invalidates both to
-`0xffffffff` at the start of every feed (`14-feed-test.md`) and — confirmed live this session, see
-below — only refreshes them when a genuine Petkit-cloud round-trip reaches `ctrl`. With the cloud
-blackholed by design, nothing ever asks again: the reading is stuck until something else prods the
-MCU.
+`state.rs::off::BOWL_FILL_1/2` (`config_shm` offsets 9916/9920) mirror the T31 MCU's own "Food
+Surplus Ctrl" sensor report (`08-mcu.md` UART CMD `0x19`). The vendor invalidates both to
+`0xffffffff` at the start of every feed (`14-feed-test.md`) and only refreshes `BOWL_FILL_1` when a
+genuine, actively-connected Petkit-cloud session is present — confirmed twice more this session,
+byte-exact (see "Empirical confirmation" below). With the cloud blackholed by design, nothing ever
+refreshes it locally.
 
-## What was tried
+## Part 1 — `ble`: the real `CMD 0x19` sender, fully decoded [HIGH]
 
-`ble`'s inbox message `0x601b` (`subchip_req_data` in `16-schedule.md`'s 30-entry table) is a
-generic "forward this byte to the T31 MCU as a bare UART CMD" passthrough. Its handler was pulled
-directly off the *live, currently-deployed* `ble` binary (`/app/bin/ble`, md5
-`133ee0b50aecf9419ac64d0c150c8de5`) — read in small chunks over the feeder's telnet shell
-(`dd bs=1 skip=N count=M | base64`, no local copy of the binary survives from earlier studies) and
-disassembled locally with `capstone` (Thumb-2). Method and findings, in order of how they were
-established:
+Pulled the full, currently-running `/app/bin/ble` this session (198,732 bytes over the feeder's
+telnet shell, chunked `dd`+`base64`, md5 `133ee0b50aecf9419ac64d0c150c8de5` — byte-identical to the
+copy `09-ble.md`/`16-schedule.md` analysed and to the previous session's live pull, so every address
+below lines up with those docs without re-deriving anything already trusted). Disassembled the
+entire 119,768-byte `.text` section with `capstone` (Thumb-2, `skipdata` enabled to step over
+inline literal pools) — 50,732 instructions, matching the scale of prior passes.
 
-1. **GOT base resolved to `0x50000`** — byte-for-byte the same value `26-ble-advertising.md` found
-   independently (`ldr r4,[pc,#0x4b0]; add r4,pc` at `ble` vaddr `0x12496`/`0x124a6`). Exact match
-   on a value nothing in this session assumed in advance — the strongest available cross-check that
-   the resolution method (walk the registration block, backtrack `ldr rX,[pc,#imm]`+`add rX,pc` to
-   a GOT slot, read the slot) is correct on this binary.
-2. **Cross-validated the method against two already-documented addresses** before trusting it for
-   anything new: `msg 0x6004` resolved to handler `0x16ecd` (`0x16ecc` + Thumb bit — exact match to
-   `16-schedule.md`'s `dispatch_handler_ble_feed_ctrl@0x16ecc`), and `msg 0x600d` resolved to
-   `0x16d79` (exact match to `26-ble-advertising.md`'s `dispatch_handler_ble_set_food_added`).
-3. **`msg 0x601b` resolved to handler `ble` vaddr `0x176dc`.** Disassembled in full: reads its own
-   4th argument (payload length) and, if nonzero, tail-calls a small wrapper at `0x1791c` with
-   `r0 = payload[0]`. That wrapper (also disassembled in full, alongside its twin at `0x17930`)
-   calls `build_and_send_uart_frame(cmd=r0, flag_bit6=1, subaddr=0, payload=NULL, len=0)` — **every
-   byte of the bus message's payload past `[0]` is dropped**, and the wrapper hardcodes a
-   NULL/zero-length UART payload regardless of what the caller had. So `subchip_req_data` can only
-   ever send a *bare* command, never the MCU's normal payload for one.
-4. **`build_and_send_uart_frame` itself (vaddr `0x16970`) was read directly**, not just inferred
-   from `09-ble.md`'s pseudocode. Confirms that doc's structure byte for byte (sync `A55A`, `frame
-   [4]=cmd` with **no translation**, `frame[6] = subaddr | 0x10 | (flag_bit6<<6)`, CRC16 trailer),
-   and adds one new fact: **it special-cases `cmd == 0x19`** — an extra hex-dump-the-frame-to-log
-   step before enqueueing, not present for any other `cmd` value except a similar special case for
-   `cmd == 4`. The vendor singling out `0x19` here is corroborating (not proof) that this is the
-   "Food Surplus Ctrl" command path.
-5. **Resolved what first looked like a contradiction.** The feed handler's own call into this same
-   function (through a *different* dedicated wrapper, `0x1795a`, which — unlike `0x1791c`/`0x17930`
-   — does carry the real 67-byte `feed_ctrl` payload) uses `cmd = 5`, not the `0x0A` UART code
-   `08-mcu.md`'s RX-side table names "Motor Run Config Cmd". These are not the same number: `0x0A`
-   is what the *MCU* echoes back in its own acknowledgment frame (`ble`'s RX dispatch, a completely
-   separate direction/table from the host's outbound `cmd` parameter here), not what the host sends
-   to ask for a feed. `09-ble.md` §2.4 already flagged this exact link as untraced ("CMD 0x0A...
-   its send call goes through one of two small CMD-parametrized wrapper stubs... not individually
-   re-traced"); this session traced it, and the two numbers are independent. Practically: `cmd = 5`
-   is confirmed *not* `0x19`, so sending `0x19` through `subchip_req_data` cannot be mistaken for a
-   feed at this layer.
+**Method cross-check (required before trusting anything new):** re-derived `ble`'s GOT base
+(`0x50000`, same PC-relative-pair idiom as `16-schedule.md`) and its 30-entry inbound dispatch
+table by tallying every `bl` targeting the registration function (`0x25510`, called exactly 30
+times) — this reproduced `16-schedule.md`'s exact 30-entry `(msg_id, handler)` table byte for byte,
+including `0x6004`→`ble_feed_ctrl`@`0x16ecc` and `0x600d`→`ble_set_food_added`@`0x16d79`, the two
+already-known addresses this task asked to validate against. Separately, decoded the T31→host UART
+`TBH` (table-branch-halfword) RX dispatch table at `ble` vaddr `0x15b20` end to end (28 entries) and
+got `CMD 0x04`→`0x15caa` and `CMD 0x0A`→`0x15f22`, both **exact** matches to `16-schedule.md`'s and
+`09-ble.md`'s independently-obtained values. Four independent known-good values, four exact matches
+— the two resolution methods (GOT-relative call-site scan, TBH table decode) are both trustworthy
+on this binary.
 
-**Live test, twice, ~10 minutes apart with a full `kibbled` restart between them:** sent
-`msg_id=0x601b, payload=[0x19]` to `ble`. Both times, `BOWL_FILL_1/2` went to `0xffffffff`
-immediately (the same invalidate-at-start behavior the vendor's own feed path causes) and **never**
-resolved to a real reading — not after 30s, not after a cumulative ~15 minutes of waiting. Net
-effect: this reliably reproduces the bug's own symptom (invalidation) without ever completing the
-measurement, and on the live device it actively regressed hopper 1 from a real, cloud-refreshed
-reading to permanently invalid. **Reverted (`kibble` commit reverting the wiring); not shipped.**
+### 1a. The 21 direct calls into `build_and_send_uart_frame` (`0x16970`), CMD `0x19` located
 
-## Why it most likely fails: the missing payload
+Scanned every `bl #0x16970` in `.text`: **21 call sites**, matching `09-ble.md` §2.4's count exactly.
+The `cmd == 0x19` one is at `ble` vaddr `0x1812e`, inside a small dedicated function starting at
+`0x180ac` — **this function, not `subchip_req_data`, is the vendor's real "Food Surplus Ctrl"
+sender.** Full disassembly, `0x180ac`–`0x18135`:
 
-`09-ble.md` §2.4's own scan of `ble`'s 21 direct calls into `build_and_send_uart_frame` lists
-`0x19` with a **5-byte** payload — a real, non-bare request. `subchip_req_data` cannot carry that
-payload (see point 3 above); whatever bare, 5-bytes-short frame it sends is not the shape the T31
-firmware expects for a real surplus query, and the most likely explanation for the observed
-behavior is that the MCU accepts the bare `0x19` far enough to reset its own surplus-tracking state
-(hence the invalidation) but then has nothing to act on, and never reports back.
+```
+build_ble_food_surplus_ctrl(u32 case /* r0 */, u32 control /* r1 */, u32 unused /* r3, passthrough */):
+    if case == 0:                                  # 0x180c2
+        buf[0]   = (u8)control                     # strb.w r1, [sp,#0x18]   @0x180c8
+        buf[1:5] = clock_gettime(CLOCK_REALTIME) - 43200   # 4 bytes, LE, UNALIGNED store @0x180d8
+                    # (0x24e0e: push;movs r0,#0;mov r1,sp;blx clock_gettime-PLT(0x12468);
+                    #  ldr r0,[sp] -- i.e. time(NULL)-equivalent. 43200 = 0xa8c0 = 12h, subtracted
+                    #  by "sub.w r0,r0,#0xa800; subs r0,#0xc0" @0x180d2/0x180d6)
+        if log_level > 5: <hex-dump-the-request to the log>   # gated, cosmetic only
+        build_and_send_uart_frame(cmd=0x19, flag_bit6=0, subaddr=0, payload=&buf, len=5)  # @0x1812e
+        return result
+    elif case == 1:                                 # 0x1815e
+        build_and_send_uart_frame(cmd=0x19, flag_bit6=0, subaddr=0, payload=NULL, len=0)  # bare
+        return result
+    else:                                            # 0x180bc
+        return control    # no-op passthrough, nothing sent
+```
 
-## What remains
+**The real, 5-byte, non-bare `CMD 0x19` payload is therefore:**
 
-The vendor's own dedicated 5-byte-payload `CMD 0x19` call site exists somewhere in `ble`'s `.text`
-(confirmed by `09-ble.md`'s scan) but was not located this session — finding it needs either pulling
-and disassembling much more of `ble`'s ~190 KB `.text` section over the telnet shell than this
-session's transfer method (small `dd`+`base64` chunks, individually verified) covered in the
-available time, or a way to capture the real bus message live. The latter *is* available and safe:
-`ctrl`, `cloud`, and `watchdog` are all still running unmodified alongside `kibbled` (confirmed live,
-`ps -ef`), so a real, briefly-enabled cloud round-trip (`POST /cloud {"enabled":true}`, confirmed
-this session to actually refresh `bowl_fill` in ~5-6 minutes, then `{"enabled":false}` again) is the
-device's own proven-working path — the missing piece is `strace` or equivalent on-device to capture
-`ctrl`'s `mq_send` during that window, and the device's own busybox has no `strace` binary. Pulling
-one over (statically-linked, matching the device's armv7 musl target) and running it read-only
-during a deliberately-triggered cloud window is the next concrete step, not another disassembly
-pass with the same tooling this session already pushed as far as it reasonably goes.
+| Byte | Meaning | Source |
+|---|---|---|
+| 0 | "control" byte — `0` or `1` observed as the only values any caller ever passes (see 1b/1c) | caller's own 2nd argument, truncated to u8 |
+| 1–4 | `(unix_time_now − 43200)`, u32 **little-endian** | `clock_gettime(CLOCK_REALTIME)` at send time, minus a fixed 12 h |
 
-**Do not guess a 5-byte payload for `CMD 0x19` and send it bare through any mechanism that reaches
-`build_and_send_uart_frame`** — it is a live, real MCU command on a feeder in service; nothing in
-this session's disassembly rules out a payload-shape-dependent side effect worse than "no reading",
-and the one thing *confirmed* safe here is that `subchip_req_data`'s bare (5-bytes-short) form does
-not dispense and does not touch the feed/OTA/reset commands, not that every possible payload for
-`0x19` is safe.
+`flag_bit6=0` here (vs. `flag_bit6=1` for `subchip_req_data`'s bare send, §2 below) — a real,
+observable difference in frame byte 6 between the vendor's native send and the one bus-reachable
+path, on top of the payload-length difference already known.
+
+### 1b. Both call sites into `0x180ac` — and why they can never fire under this device's settings
+
+Only **one** direct caller (`bl #0x180ac` ×2, at `0x1347e`/`0x1349c`) plus one tail-call from a
+sibling function (§1c). The caller is `ble`'s own periodic housekeeping task at `0x13468`,
+registered — confirmed by decoding the call to `ble`'s internal task-scheduler `0x2657c` — as
+**task id `0xb`, period `1000 ms`** (i.e. runs once a second, for the life of the `ble` process):
+
+```
+every 1000ms:
+    state = surplus_state()                       # 0x14e54, see below
+    if state != persisted_byte:
+        build_ble_food_surplus_ctrl(case=0, control=state)   # REAL 5-byte send
+        persisted_byte = state
+    else:
+        tick_count += 1
+        if tick_count >= 600:                       # 600 * 1s = 10 minutes
+            build_ble_food_surplus_ctrl(case=1, control=0)    # BARE send, no payload
+            tick_count = 0
+```
+
+`surplus_state()` (`0x14e54`) reads two `config_shm` fields via `g_config`'s own GOT slot (the
+same 2-level PC-relative→GOT→pointer idiom used everywhere else in this codebase):
+
+```c
+u32 surplus_control  = *(g_config + 0xf28);   // = config_shm offset 3880 — usr.app_conf.surplusControl
+u32 surplus_standard = *(g_config + 0xf2c);   // = config_shm offset 3884 — usr.app_conf.surplusStandard
+u32 bowl_fill_1       = *(g_config + 0x26bc); // = config_shm offset 9916 — state.off::BOWL_FILL_1 itself
+if (surplus_control == 0 || surplus_standard == 0) return 1;   // unconditional short-circuit
+return (surplus_control > bowl_fill_1) ? 1 : 0;
+```
+
+The offsets `0xf28`/`0xf2c` were resolved to the literal cJSON keys **`"surplusControl"`** and
+**`"surplusStandard"`** by tracing the one function in `ble` that writes them (`0x28680`, a loader
+for a JSON `"app_conf"` sub-object out of **`/opt/user.conf`** — confirmed by the string `access()`
+call on that exact path at the loader's entry, `0x292ac`/`0x292b2`). **Both fields were captured
+live this session, from a real `config_shm` dump, at `surplusControl = 0`, `surplusStandard = 2`**
+— matching the identical values found independently in a `ctrl` process heap dump pulled earlier
+this session. Because `surplusControl == 0`, `surplus_state()` **unconditionally returns `1`,
+every single tick, regardless of `bowl_fill_1`** — the ticker's persisted byte settles to `1` after
+its first tick and can then never "change" again, so its real-payload branch is, under the device's
+current settings, reachable **at most once per `ble` process lifetime** (right after `ble` starts).
+The rest of the time it only ever sends the bare/empty variant every 10 minutes — the same shape
+already proven (by the prior session and independently confirmed by this session's own
+disassembly of `subchip_req_data`'s wrapper) to *not* produce a real MCU reply.
+
+**This ticker is not gated by, or connected to, any bus message or the cloud at all.** It runs
+identically whether `ctrl`/`cloud` are chatty or silent. It is not the explanation for the
+cloud-correlated refresh.
+
+### 1c. The second path: `ble`'s own UART-RX handler for an *incoming* `CMD 0x19` frame
+
+The `TBH` table (§ above, `CMD 0x19` → handler `0x167d4`) decodes to:
+
+```
+on receiving a CMD=0x19 frame from the T31 MCU:
+    if log_level > 4: <log the frame's byte[7]>
+    mode = <the frame's own flags/subaddr nibble>       # r7, set by the shared RX prologue
+    record = frame_payload + 7                          # r5 += 7
+    if mode == 1: <copy (frame_len-9) bytes from record onward via 0x19958>   # not further traced
+    build_ble_food_surplus_ctrl_general(mode, record)     # tail-call, see below
+```
+
+...which tail-calls a second, parameterised twin of §1b's ticker body, `0x14e88` (confirmed to be
+the *only* caller: one `bl #0x14e88` in the whole binary, at `0x1682e`, exactly this RX handler):
+
+```c
+u32 surplus_ble_food_surplus_ctrl_general(u32 mode, u8 *record /* [state:u8][ts_adj:u32] */) {
+    u32 state = surplus_state();                 // 0x14e54, same as §1b
+    if (mode == 0) {
+        build_ble_food_surplus_ctrl(case=0, control=state);   // unconditional real send
+    } else if (mode == 1) {
+        record->ts_adj += 43200;                              // undo the -43200, in place
+        if (record->state_byte != state)
+            build_ble_food_surplus_ctrl(case=0, control=state);  // send only if changed
+    }
+    // any other mode: no-op
+}
+```
+
+So **receiving a `CMD 0x19` frame from the MCU can itself trigger `ble` to send another `CMD 0x19`
+request** — a self-contained request/ack loop between `ble` and the T31, with no `ctrl` or `cloud`
+participation at this layer. This still does not explain what makes the *very first* `CMD 0x19`
+frame in such a chain appear — that is opaque TC32 MCU firmware (`ble.img`), not disassemblable by
+the tooling available this session (`08-mcu.md` §2 item 6 already flags this limitation). **[MED]**:
+the call graph above is disassembly-proven; *why* the MCU emits an unsolicited/first `CMD 0x19` at
+all, and whether it is influenced by unrelated UART traffic ctrl sends on cloud-connect (e.g. an
+RTC refresh, `16-schedule.md` §3.2), is not established either way this session.
+
+### 1d. No bus message reaches either path — confirmed, not assumed
+
+`ble`'s own 30-entry inbound dispatch table (`0x6001`–`0x601e`, re-derived fresh this session, §
+above) was checked entry-by-entry against both `0x13468` and `0x14e88`/`0x180ac`: **no entry calls
+either.** The one message that *does* reach the frame-builder for an arbitrary `cmd` value,
+`subchip_req_data` (`0x601b`), was re-disassembled fresh this session end to end and matches the
+prior session's finding exactly: its wrapper (`0x1791c`) hardcodes `flag_bit6=1, payload=NULL,
+len=0` — the bare, wrong-flag, already-tested-unsafe variant, not `0x180ac`'s real 5-byte one.
+**There is no `ctrl`→`ble` bus message, in this build, that reaches the real payload path.**
+
+## Part 2 — `ctrl`: reads and invalidates `BOWL_FILL_1`, a real setter not located [MED]
+
+Pulled the full, currently-running `/app/bin/ctrl` (742,148 bytes, md5
+`c645c0665da2cf73db93ffa8d9d0ea68` — matches live `/app/bin/ctrl`) and disassembled all of `.text`:
+**211,108 instructions**, matching `STUDY-config.md`'s independent count over the same binary
+exactly (`ctrl`'s `.text`/`.rodata`/`.got` section boundaries also matched `16-schedule.md`'s
+figures byte for byte) — strong confirmation this is the identical build every prior study used.
+
+Searched `.text` for every reference to `config_shm` offset `9916` (`0x26bc`, `BOWL_FILL_1`) and
+`9920` (`0x26c0`, `BOWL_FILL_2`), by both the 16-bit `movw` immediate form and any instruction whose
+own memory-operand displacement equals that value. **Exactly two hits, both at the same site
+shape, neither a "set to a real value":**
+
+1. **Read**, `ctrl` vaddr `0x3187e` — copies `BOWL_FILL_1` into a local "current device state"
+   struct (alongside ~10 other `config_shm` fields — MAC-ish bytes, MCU-status bytes, the `FEEDING`
+   flag, a `usr.app_conf`-derived bool, `dev.mac_info`...). That struct feeds a **delta-JSON**
+   builder a few dozen bytes later (`0x31c66`–`0x31d38`) which only emits a field into a `"sta"`
+   status object when it differs from a shadow/previous copy — and the key it emits `BOWL_FILL_1`
+   under, confirmed by a direct string cross-reference, is **`"bowl"`** (cast **signed**, so
+   `0xffffffff` prints as `-1` — exact match to the literal `"bowl":-1` seen in an early `ctrl` heap
+   dump this session). This is outbound reporting (`ctrl` telling the cloud the current value), the
+   opposite direction from what this task needs.
+2. **Write**, `ctrl` vaddr `0x395be`/`0x395c4` — stores `0xffffffff` into **both** `BOWL_FILL_1` and
+   `BOWL_FILL_2` unconditionally, gated by "are we within ~59 seconds of a stored timestamp"
+   (`subs r0,#0x3b; cmp r0,r3; bgt <skip>`) — this is the feed-triggered **invalidation**
+   (`14-feed-test.md`'s already-documented behaviour), not a setter.
+
+**No third reference — a genuine "set `BOWL_FILL_1` to a measured value" write — was found in
+`ctrl` by this method.** This is explicitly **not proof `ctrl` never does it**: the search can only
+see writes through the *raw* `g_config`-relative absolute offset (`movw #0x26bc` or an equivalent
+direct displacement). `ctrl`'s own report-builder (item 1 above) demonstrably uses an
+*intermediate* base-pointer pattern for its neighbouring fields (`str r2,[r4,#0xNN]` against a
+`r4` established once, far away) — the exact shape that would make a real setter invisible to a
+search for the literal `0x26bc`. Chased two named candidates from `ctrl`'s `(dispatch_call_func)`
+name table — `net_dev_get_device_info`, `net_dev_state_report` (both very plausible names for "the
+cloud asked for our state") — but could not resolve either string's own call site with this
+session's PC-relative xref method (unlike every other string resolved this session, a wide
+window did not find it either — this name table is evidently walked by a different, table-driven
+mechanism this pass didn't reverse). **[MED confidence]** that `ctrl` is not the setter; **[HIGH
+confidence]** on everything it *was* shown to do (the two hits above, both fully disassembled).
+
+## Part 3 — `cloud`: maps the shared memory, no reference found either [MED/INFERENCE]
+
+Pulled the full, currently-running `/app/bin/cloud` (202,980 bytes, md5
+`7bfe15e907927c121704fac933658b3f`) and disassembled `.text` (50,271 instructions). `cloud` does
+import `shm_open`/`mmap`/`g_config` and references the literal string `"config_shm"`, so it can and
+almost certainly does map the same shared memory as every other process. Searched it the same way
+as `ctrl`: **zero references to offset `9916`/`9920`**, by any of the three methods used (16-bit
+`movw` immediate, direct memory-operand displacement, or a raw 32-bit literal-pool word matching
+either value anywhere in `.text`). `cloud`'s own `(dispatch_call_func)` name table is entirely
+about **video/event cloud storage** (`cloud_uploader_main_task`, `cloud_cvr_indate_timer`,
+`upload_cvr_stop`, `event_queue_detect`, `check_update_token_by_indate`...) — nothing
+property/state/surplus-shaped. **[MED/INFERENCE]** `cloud` is not the setter either, same blind-spot
+caveat as `ctrl` above (an intermediate-pointer write would be invisible to this search).
+
+**Not checked this session, for lack of remaining time budget:** `media` (also confirmed by
+`STUDY-config.md` to map `config_shm`). It is the one of the four non-`watchdog` processes this
+document has never actually disassembled. Flagged as the single most promising next static-analysis
+step — see "What remains".
+
+## Empirical confirmation (byte-exact `config_shm` diff across a real refresh) [HIGH]
+
+Captured full 11,952-byte `/dev/shm/config_shm` dumps (`dd`+`base64` over the feeder's telnet shell,
+saved locally, byte-diffed) across two independently-triggered cloud-enable windows this session.
+
+**Run 2 (the tight one, snapshotting every ~10 s):** cloud enabled at `t=0`; polled `GET /state`
+and dumped `config_shm` on every poll. `bowl_fill` stayed `[null, null]` through `t=125.5s`; at
+`t=136.4s` it read `[49, null]` — a transition inside an **11-second bracket**. The full
+byte-for-byte diff between the `t=125` and `t=136` dumps, over the *entire* 11,952-byte structure:
+
+```
+[9916:9920) len=4   before=ffffffff  after=31000000     <- BOWL_FILL_1: 0xffffffff -> 49, LE u32
+```
+
+...and nothing else, once the already-known-and-unrelated watchdog liveness toggles
+(`10284`/`10288`/`10296`/`10300`, `state.off::ALIVE_*`, confirmed fluctuating identically in a
+cloud-disabled control diff taken minutes earlier) are excluded. Two more dumps 8–9 s apart
+afterward (`t=145`, `t=154`) show `BOWL_FILL_1` **stable at `49`**, no drift.
+
+**This directly answers every question the assignment posed about the write:**
+
+- **No measurement timestamp.** Nothing in the 11,952-byte structure changes alongside
+  `BOWL_FILL_1` except itself. `EVENT_COUNTER` (10184), `FEEDING` (10238), and every other
+  documented "status word" were unchanged across this exact transition.
+- **No validity/freshness flag.** Same evidence — there is nothing to check *except* the value's
+  own distance from the `0xffffffff` sentinel. `kibbled`'s existing "is it `0xffffffff`" check is
+  already the only signal that exists on the wire.
+- **`BOWL_FILL_2` (hopper 2) never changes.** Confirmed `0xffffffff` at every single sample across
+  both full runs (`before`, 13 intermediate polls, the transition, and both follow-ups) — this
+  device's own behaviour is that hopper 2 is never populated by this mechanism, full stop, not a
+  gap in this study's observation window.
+- **The value does not expire on a short fixed timer.** It was still `49` at the *end* of this
+  session's active work (many minutes after the capture), but — consistent with the assignment's
+  own prior-session note and this session's *first* (accidentally long-running) capture, in which
+  `bowl_fill` had reverted to `null` again after an extended gap with no feed in between — it does
+  eventually go stale on its own. No exact TTL was measured either session.
+- **Genuine cloud connectivity is required, confirmed live**, not just the local route flag: `GET
+  /cloud`'s `connections` list showed real `ESTABLISHED`/`TIME_WAIT` TCP sessions to
+  `47.88.20.79:443`/`47.88.52.254:443` (Alibaba-Cloud-hosted, consistent with the already-documented
+  Alink/Alibaba IoT backend) and DNS lookups to `8.8.8.8`/`199.85.126.10` throughout the window
+  before the transition — this is a real network round trip, not a local timer.
+
+A first, accidental long-running capture this session (kept enabled far longer than intended due to
+a tooling issue, corrected mid-session — cloud was disabled the moment it was noticed and re-verified
+disabled at the end) also produced a refresh, to the identical value `49`, in a comparable window —
+two independent, reproducible observations.
+
+## What was NOT done, and why
+
+**Nothing was wired into `kibbled`.** The assignment's own bar — "If (and only if) you have
+positively identified the message AND can argue from the disassembly that it cannot actuate a
+motor/OTA/reset" — was not met, for a more fundamental reason than safety: **no message reaches the
+real sender at all.** `0x180ac` (the only function that ever builds a real 5-byte `CMD 0x19`
+payload) has exactly two callers, both internal to `ble`'s own timer/UART-RX plumbing (§1b/§1c),
+neither reachable from any of `ble`'s 30 registered inbound bus messages. The one bus message that
+*is* reachable (`subchip_req_data`) was independently re-confirmed this session, by fresh
+disassembly, to reproduce exactly the prior session's already-recorded unsafe result (bare payload,
+wrong `flag_bit6`, invalidates without ever refreshing) — so there was also nothing new to
+re-test live. No `surplus.rs` module, rate limiter, or bus send was written: doing so with no
+message that could ever actually reach the vendor's real sender would be dead code with a
+misleading name, not a working feature.
+
+## What remains — the concrete next step
+
+The write that lands a real value in `BOWL_FILL_1` is in one of: (a) `ctrl` or `cloud`, behind an
+intermediate-pointer addressing pattern this session's xref tooling cannot see (both binaries are
+now fully pulled and disassembled locally — `/tmp/ctrl_full.bin`, `/tmp/cloud_full.bin`, matching
+live md5s — so a future pass needs *better tooling*, not another pull: a real decompiler
+(`radare2`/Ghidra) with proper data-flow tracking would resolve every base-pointer chain
+`STUDY-config.md` §6.2 already flagged this codebase needs one for); or (b) `media`, not inspected
+this session at all. Check `media` first — it is a single, cheap disassembly pass with the same
+tooling already proven on the other three binaries, and would either find the write directly (if
+`media` uses the same "small `movw`-immediate against a directly-loaded `g_config`" pattern the
+*rest* of this codebase mostly uses) or narrow the remaining search to `ctrl`/`cloud` with more
+confidence than this session had. A live packet capture (`strace`/pulling a static build onto the
+device to watch `mq_send`, or a UART tap) remains the fallback if static analysis stalls again —
+unlike the prior session's assessment, this is no longer the *only* path forward, since the ble-side
+mechanism is now fully mapped; it's specifically the `ctrl`/`cloud`/`media`-side "who actually
+writes the number" question that would benefit from it.
+
+**Do not send `CMD 0x19` (in any shape) to `ble` through `subchip_req_data`/`0x601b` — this remains
+independently re-confirmed, twice now, to invalidate `BOWL_FILL_1` without ever completing a
+measurement**, and this session additionally confirmed *why*: that path can only ever reach the
+bare/`flag_bit6=1` variant, never the real 5-byte/`flag_bit6=0` one `0x180ac` builds. Do not attempt
+to reach `0x180ac`/`0x13468`/`0x14e88` by any other locally-available bus message either — none
+exists in this build. Do not poke `config_shm` bytes directly (`surplusControl`/`surplusStandard`
+at offsets 3880/3884, or `BOWL_FILL_1` itself) from `kibbled` to try to force the `ble`-side ticker's
+edge condition — this project's own established convention (`state.rs`'s module doc) is writes only
+ever go through the owning process via the bus, never by poking shared-memory bytes directly, and
+`surplusControl`/`surplusStandard` are user-facing app settings other processes (and the cloud
+UI) also read — an uncoordinated write risks corrupting state well beyond this one sensor reading,
+for a mechanism (§1b) already shown to only ever fire once per `ble` process lifetime regardless.
