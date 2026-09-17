@@ -1,13 +1,14 @@
 # STUDY-bowl-fill.md — Refreshing the hopper-fill reading without the cloud (2026-09-17)
 
-**Status: not wired as an unconditional feature this session, but one genuine, disassembly-proven-
-safe lever exists and was live-tested: `surplus_control` (`config_shm` offset 3880), writable
-through `kibbled`'s own settings path (Part 4). It cannot bootstrap `BOWL_FILL_1` from the invalid
-state (proven, and confirmed live) but may be able to keep an already-real reading fresh locally —
-untested this session, held for cross-agent device-sharing coordination; see "What remains" item 3.
-The real vendor `CMD 0x19` payload is fully decoded and its only two senders are proven internal to
-`ble` (Part 1); the write that actually lands a real value in `BOWL_FILL_1` in the first place was
-not found in `ble`, `ctrl`, or `cloud` despite disassembling all three in full (Parts 1-3).**
+**Status: not wired as a live feature. One genuine, disassembly-proven-safe lever was found and
+live-tested twice this session — `surplus_control` (`config_shm` offset 3880) — and both tests
+came back negative: it cannot bootstrap `BOWL_FILL_1` from the invalid state (proven statically
+and confirmed live), and it does not keep an already-real reading fresh either (tested live against
+a real value of `44`, no effect over 42s). It shipped `writable: false` again, same as before this
+session, with the full evidence trail kept in its `settings.rs` description. The real vendor
+`CMD 0x19` payload is fully decoded and its only two senders are proven internal to `ble` (Part 1);
+the write that actually lands a real value in `BOWL_FILL_1` in the first place was not found in
+`ble`, `ctrl`, or `cloud` despite disassembling all three in full (Parts 1-3). See "What remains".**
 
 ## The bug, restated precisely
 
@@ -350,15 +351,35 @@ firmware would ever produce, on a field this session cannot fully vouch for beyo
 consumer traced. `surplus_control` was restored to `0` immediately after the test
 (`POST /config {"key":"surplus_control","value":0}`, confirmed via `GET /config` readback).
 
-**The one still-open, more promising variant** (not attempted this session, deferred for a device-
-sharing conflict with a concurrent capture from a sibling session): with a *real* `BOWL_FILL_1`
-value already in place (seeded the usual way, via the cloud-toggle trick), set `surplus_control` to
-something *below* that real value *before* it expires. That is a genuine signed transition
-(positive vs. a lower positive threshold, no sentinel involved) and, unlike this test, could
-plausibly flip `ble`'s persisted ticker state and fire a real `CMD 0x19` send independent of the
-cloud — testing whether `surplus_control` can *keep* an already-seeded reading fresh locally, not
-whether it can bootstrap one from nothing (the disassembly in Part 1b already answers that: it
-cannot, the comparison needs a real prior value to be meaningful).
+**The more promising variant was also run, later the same session, once device-sharing with a
+concurrent sibling capture cleared: negative.** Seeded a real `BOWL_FILL_1` via the cloud-toggle
+trick (enabled at unix `1789621179`, a real value — `44` — appeared at `t=322.6s`, disabled
+immediately at unix `1789621502`, a ~5.4-minute window, within the task's own "1-6 minutes"). With
+`BOWL_FILL_1=44` confirmed live and cloud back off, wrote `surplus_control=20` (below `44` — a
+genuine signed transition, `20 > 44` is false, no sentinel involved, exactly the shape that should
+flip `ble`'s persisted ticker state per the Part 1b model) and watched `GET /state` plus a fresh
+`config_shm` diff every ~2-3s for 42 seconds. **No effect of any kind**: `BOWL_FILL_1` stayed
+exactly `44` the entire window (not even a transient invalidate-then-reset), `feeding` never went
+true, and the full-structure diff between the pre-write and final snapshot shows nothing changed
+except the write itself (offset 3880) plus the same already-catalogued watchdog-toggle noise.
+Restored `surplus_control` to `0` immediately after (confirmed via `GET /config` readback), and
+reverted the `writable: true` flip in `settings.rs` back to `false` — two independent live tests
+now agree this lever does not move `BOWL_FILL_1`, so this document no longer recommends shipping
+it writable; the field's disassembly-proven safety and the full evidence trail stay recorded in
+`settings.rs`'s own description for whoever revisits this.
+
+**What this means for the Part 1b model:** the ticker's edge condition, as read from static
+analysis, predicted a state flip here. It didn't produce an observable effect. Rather than
+overclaim the static model is simply wrong, the honest gap this leaves open: (a) the edge may have
+fired and `ble` may have sent a real `CMD 0x19` request that the T31 answered with the *same*
+value (`44`) it already had cached, which would be indistinguishable from "nothing happened" at
+the `config_shm` level without a UART tap; (b) `ble`'s actual persisted-ticker-byte value at the
+moment of the write is not independently observable from outside the process, so this session's
+assumption that it had long since settled to `1` (Part 1b) is plausible but not proven; or (c)
+there is a gating condition on the edge send this session's static pass did not find. None of these
+change the safety conclusion (still nothing reaches feed/motor/OTA/reset either way) — only the
+"is this useful" one, which is now a confirmed no, twice, live.
+
 
 ## What remains — the concrete next step
 
@@ -375,12 +396,12 @@ cannot, the comparison needs a real prior value to be meaningful).
    assessment, this is no longer the *only* path forward, since the ble-side mechanism is now fully
    mapped; it's specifically the `ctrl`/`cloud`/`media`-side "who actually writes the number"
    question that would benefit from it.
-3. **Finish Part 4's deferred experiment**: with a real `BOWL_FILL_1` value in place (seed it via
-   the cloud-toggle trick), set `surplus_control` to a value below it, before it expires, and watch
-   for an independent (cloud-off) `CMD 0x19` send / value change. This is a five-minute experiment
-   with all the tooling already built this session — it was deferred only because a sibling agent
-   was mid-capture on the same physical device when this session ran out of time, not for any
-   unresolved safety or technical concern.
+3. **Part 4's `surplus_control`-as-local-keepalive idea was fully tested this session and came
+   back negative both ways** — do not re-attempt it without new evidence beyond what Part 4
+   already covers (its own "what this means" paragraph lists the three honest possibilities left
+   open, none of them safety-relevant). If revisited, a UART tap would be the only way to tell
+   "no edge fired" apart from "an edge fired and the T31 just re-confirmed the same value" —
+   `config_shm` alone cannot distinguish the two.
 
 **Do not send `CMD 0x19` (in any shape) to `ble` through `subchip_req_data`/`0x601b` — this remains
 independently re-confirmed, twice now, to invalidate `BOWL_FILL_1` without ever completing a

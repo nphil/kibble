@@ -483,20 +483,21 @@ pub const SETTINGS: &[Setting] = &[
         width: Width::U32,
         kind: Kind::Int { min: 0, max: u32::MAX },
         notify: None,
-        writable: true,
+        writable: false,
         description: "Leftover-food detection threshold (Localkit's own app docs call this \
-            read-only, and ctrl's cloud parser only ever writes it verbatim from a cloud-pushed \
-            value -- but docs/34-bowl-fill-surplus.md's disassembly of ble's 1Hz surplus ticker \
+            read-only). docs/34-bowl-fill-surplus.md's disassembly of ble's 1Hz surplus ticker \
             (ble vaddr 0x13468/0x14e54) shows it is the live comparison operand against \
-            BOWL_FILL_1 (`state == surplus_control > bowl_fill_1`, signed), and a live value of \
-            0 unconditionally suppresses that comparison. ctrl's own write site for this key \
-            (0x3f4c6) does nothing but the config_shm write plus an already-proven-dead self- \
-            message (STUDY-settings-write.md 2.1) -- exhaustively cross-checked this session \
-            against every dispatch_send_msg call site in ctrl (93 total): none reachable from \
-            here, or from ble's resulting CMD-0x19 send, ever reaches feed/motor/OTA/reset. \
-            Writable so kibbled can hold this at a nonzero value the way the reconciler already \
-            holds every other setting, matching the field's real behaviour rather than the \
-            app's oversimplified 'read-only' label.",
+            BOWL_FILL_1 (`state == surplus_control > bowl_fill_1`, signed) and, exhaustively \
+            cross-checked against every dispatch_send_msg call site in ctrl (93 total), no path \
+            from writing it ever reaches feed/motor/OTA/reset -- confirmed safe to write. Shipped \
+            non-writable anyway: live-tested twice this session (writable:true, deployed, \
+            POST-then-restored both times) and neither run moved BOWL_FILL_1 -- once with it \
+            invalid (predicted: the comparison is signed, so any realistic threshold reads as \
+            greater than the invalid sentinel's -1, a no-op matching the ticker's already-settled \
+            state) and once with a real value already in place, set to a threshold below it \
+            (unpredicted: no effect observed over 42s, config_shm unchanged beyond the write \
+            itself -- the persisted-ticker-byte model this session built from static analysis is \
+            evidently incomplete). Re-flip writable only alongside a live test proving it helps.",
     },
     Setting {
         key: "surplus_standard",
