@@ -1,0 +1,288 @@
+# mqtrace capture, round 2 (2026-09-17), trimmed to mono 25280-25390 (~90s before the
+# landing bracket through 10s after). Full run: mqtrace --pid <ble=203|ctrl=217> --timeout 300
+# --uart-path /dev/ttyS3, started at device uptime 25192.22s / unix 1789629589.
+# Reference pair (unix, uptime) = (1789629589, 25192.22); mono->epoch: epoch = 1789629589 + (mono-25192.22).
+# Cloud POST /cloud {enabled:true} at unix 1789629602. BOWL_FILL_1 landing bracket (from fill2.dat):
+# unix [1789629773,1789629775), 0xffffffff -> 44. -> mono landing bracket: [25376.22, 25378.22).
+# ctrl's LAST bus send of any kind before the landing was msg_id=0x6013 at mono 25259.531511 --
+# ctrl is then completely silent on the bus for the ~117s leading up to and through the landing.
+# Same two non-heartbeat messages as round 1 (0x6017 at mono 25258.497931, 0x6013 at 25259.531511)
+# recur here too, ~10-238s before their respective landings -- an inconsistent gap across the two
+# runs that rules out a causal link (see docs/34-bowl-fill-surplus.md Part 6).
+25280.588053 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001c7c06e00bf38
+25280.744598 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00001bc0016be4
+25280.745282 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001c106db6
+25280.745537 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001c106db6
+25280.746468 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900001c106db6
+25280.859511 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002c5c004005818000000000000a52e
+25282.759959 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00001cc001fb61
+25282.760449 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001d105c85
+25282.760656 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001d105c85
+25282.760789 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900001d105c85
+25284.772541 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00001dc001cb56
+25284.772759 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001e100fd0
+25284.772934 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001e100fd0
+25284.773070 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900001e100fd0
+25285.593331 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001c8c06e0051ec
+25285.877077 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002c6c005005218030000000000e31b
+25286.767148 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00001ec0019b0f
+25286.767342 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001f103ee3
+25286.767489 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900001f103ee3
+25286.767604 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900001f103ee3
+25288.782875 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00001fc001ab38
+25288.783770 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa5090000201095f6
+25288.784010 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa5090000201095f6
+25288.784247 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa5090000201095f6
+25290.621654 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001c9c06e00e59a
+25290.786896 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000020c0013fd1
+25290.787214 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002110a4c5
+25290.787413 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002110a4c5
+25290.787537 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002110a4c5
+25290.901392 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002c7c00600561803000000000034a6
+25292.794156 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000021c0010fe6
+25292.794545 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002210f790
+25292.795805 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002210f790
+25292.796139 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002210f790
+25294.800592 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000022c0015fbf
+25294.800805 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002310c6a3
+25294.800973 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002310c6a3
+25294.801086 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002310c6a3
+25295.636634 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001cac06e003901
+25295.934901 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002c8c005005a18030000000000af15
+25296.804487 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000023c0016f88
+25296.804790 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002410513a
+25296.805194 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002410513a
+25296.805419 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002410513a
+25298.812303 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000024c001ff0d
+25298.812721 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000025106009
+25298.812934 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000025106009
+25298.813078 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000025106009
+25300.662904 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001cbc06e008d77
+25300.827037 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000025c001cf3a
+25300.827262 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002610335c
+25300.827467 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002610335c
+25300.827595 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002610335c
+25300.956102 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002c9c006004e18060000000000cdd6
+25302.833129 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000026c0019f63
+25302.833404 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002710026f
+25302.833629 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002710026f
+25302.833791 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002710026f
+25304.844955 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000027c001af54
+25304.845271 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000028103c7f
+25304.845464 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000028103c7f
+25304.845604 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000028103c7f
+25305.686585 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001ccc06e00a026
+25305.976534 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002cac005005418030000000000548d
+25306.857885 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000028c0019e78
+25306.858219 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000029100d4c
+25306.858443 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000029100d4c
+25306.858634 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000029100d4c
+25308.871617 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000029c001ae4f
+25308.871878 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002a105e19
+25308.872116 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002a105e19
+25308.872262 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002a105e19
+25310.701455 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001cdc06e001450
+25310.874641 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002ac001fe16
+25310.874849 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002b106f2a
+25310.875049 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002b106f2a
+25310.875247 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002b106f2a
+25311.003016 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002cbc0050056180300000000008701
+25312.890999 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002bc001ce21
+25312.891556 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002c10f8b3
+25312.891955 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002c10f8b3
+25312.892211 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002c10f8b3
+25314.893062 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002cc0015ea4
+25314.893362 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002d10c980
+25314.893602 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002d10c980
+25314.893788 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002d10c980
+25315.739007 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001cec06e00c8cb
+25316.013677 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002ccc0060058180600000000001365
+25316.903026 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002dc0016e93
+25316.903351 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002e109ad5
+25316.903567 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002e109ad5
+25316.903711 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002e109ad5
+25318.914073 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002ec0013eca
+25318.914297 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002f10abe6
+25318.914476 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900002f10abe6
+25318.914610 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900002f10abe6
+25320.761900 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001cfc06e007cbd
+25320.928795 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00002fc0010efd
+25320.929232 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003010e6f5
+25320.929568 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003010e6f5
+25320.929768 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003010e6f5
+25321.035562 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002cdc0050054180300000000001f85
+25321.191270 MQSEND tid=203 mqd=4 q=/msg_dispatch_8 len=10 msg_id=0x600b src=8 payload=000200000000
+25321.192001 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=10 msg_id=0x600b src=8 payload=000200000000
+25321.192123 MQSEND tid=203 mqd=4 q=/msg_dispatch_8 len=19 msg_id=0x601a src=8 payload=5aa50f0009fe130002000000005d1e
+25321.192428 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=19 msg_id=0x601a src=8 payload=5aa50f0009fe130002000000005d1e
+25321.192583 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=15 bytes=5aa50f0009fe130002000000005d1e
+25322.935626 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000030c0015c92
+25322.935862 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003110d7c6
+25322.936066 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003110d7c6
+25322.936183 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003110d7c6
+25324.957854 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000031c0016ca5
+25324.958062 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000032108493
+25324.958227 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000032108493
+25324.958339 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000032108493
+25325.778097 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d0c06e003572
+25326.045432 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002cec0050058180300000000003791
+25326.960402 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000032c0013cfc
+25326.960890 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003310b5a0
+25326.961251 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003310b5a0
+25326.961435 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003310b5a0
+25328.972512 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000033c0010ccb
+25328.972785 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000034102239
+25328.972973 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000034102239
+25328.973117 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000034102239
+25330.801856 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d1c06e008104
+25330.983711 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000034c0019c4e
+25330.983991 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003510130a
+25330.984191 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003510130a
+25330.984316 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003510130a
+25331.069532 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002cfc0060054180600000000003b71
+25332.992841 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000035c001ac79
+25332.993089 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003610405f
+25332.993283 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003610405f
+25332.993423 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003610405f
+25334.251643 MQSEND tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900192f51bc63
+25334.251917 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900192f51bc63
+25334.252308 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900192f51bc63
+25334.994537 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000036c001fc20
+25334.994738 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003710716c
+25334.994884 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003710716c
+25334.995848 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003710716c
+25335.809041 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d2c06e005d9f
+25336.082558 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d0c005005818060000000000f0f5
+25337.013306 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000037c001cc17
+25337.013547 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000038104f7c
+25337.013730 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000038104f7c
+25337.013865 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000038104f7c
+25339.024558 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000038c001fd3b
+25339.024786 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000039107e4f
+25339.024960 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000039107e4f
+25339.025140 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000039107e4f
+25340.828754 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d3c06e00e9e9
+25341.038051 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000039c001cd0c
+25341.038261 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003a102d1a
+25341.038425 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003a102d1a
+25341.038550 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003a102d1a
+25341.099990 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d1c006005418060000000000fd56
+25343.062918 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003ac0019d55
+25343.063159 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003b101c29
+25343.063339 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003b101c29
+25343.063471 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003b101c29
+25345.075766 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003bc001ad62
+25345.076058 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003c108bb0
+25345.076281 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003c108bb0
+25345.076473 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003c108bb0
+25345.858998 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d4c06e00c4b8
+25346.127555 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d2c0050056180300000000000a2e
+25347.067284 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003cc0013de7
+25347.067503 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003d10ba83
+25347.067676 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003d10ba83
+25347.067797 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003d10ba83
+25349.081350 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003dc0010dd0
+25349.081597 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003e10e9d6
+25349.081738 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003e10e9d6
+25349.081854 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003e10e9d6
+25350.871345 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d5c06e0070ce
+25351.092817 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003ec0015d89
+25351.093039 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003f10d8e5
+25351.093215 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900003f10d8e5
+25351.093347 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900003f10d8e5
+25351.135749 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d3c005005a18030000000000c83c
+25353.108520 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00003fc0016dbe
+25353.108732 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004010bffd
+25353.108902 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004010bffd
+25353.109016 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004010bffd
+25355.122796 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000040c001544a
+25355.123145 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000041108ece
+25355.124015 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000041108ece
+25355.124205 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000041108ece
+25355.894218 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d6c06e00ac55
+25356.156598 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d4c0060054180300000000005d1b
+25357.135201 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000041c001647d
+25357.135433 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004210dd9b
+25357.135589 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004210dd9b
+25357.135716 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004210dd9b
+25359.154245 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000042c0013424
+25359.154517 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004310eca8
+25359.154726 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004310eca8
+25359.154909 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004310eca8
+25360.907359 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d7c06e001823
+25361.162590 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000043c0010413
+25361.162805 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000044107b31
+25361.162987 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000044107b31
+25361.163122 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000044107b31
+25361.174186 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d5c005005418030000000000e7a9
+25363.164948 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000044c0019496
+25363.165387 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000045104a02
+25363.165601 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000045104a02
+25363.165746 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000045104a02
+25365.171356 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000045c001a4a1
+25365.172581 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000046101957
+25365.172870 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000046101957
+25365.173039 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000046101957
+25365.936085 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d8c06e00f6f7
+25366.187946 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d6c006005418060000000000b65e
+25367.186949 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000046c001f4f8
+25367.187180 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000047102864
+25367.187319 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000047102864
+25367.187432 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000047102864
+25369.201531 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000047c001c4cf
+25369.201871 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000048101674
+25369.202328 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000048101674
+25369.202648 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000048101674
+25370.949410 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001d9c06e004281
+25371.199650 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000048c001f5e3
+25371.199905 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000049102747
+25371.201688 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa509000049102747
+25371.202094 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa509000049102747
+25371.217691 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d7c005005618060000000000aa63
+25373.207759 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000049c001c5d4
+25373.208193 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004a107412
+25373.208492 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004a107412
+25373.208640 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004a107412
+25375.216657 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004ac001958d
+25375.216863 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004b104521
+25375.217057 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004b104521
+25375.217180 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004b104521
+25375.971824 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001dac06e009e1a
+25376.233507 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d8c00500581803000000000059ad
+25377.232494 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004bc001a5ba
+25377.232879 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004c10d2b8
+25377.233134 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004c10d2b8
+25377.233261 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004c10d2b8
+25379.255332 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004cc001353f
+25379.255637 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004d10e38b
+25379.255817 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004d10e38b
+25379.255949 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004d10e38b
+25380.990236 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001dbc06e002a6c
+25381.257866 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004dc0010508
+25381.258077 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004e10b0de
+25381.258248 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004e10b0de
+25381.258374 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004e10b0de
+25381.263627 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002d9c0050056180300000000003d30
+25382.490573 MQSEND tid=203 mqd=4 q=/msg_dispatch_8 len=10 msg_id=0x600b src=8 payload=000200000000
+25382.491228 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=10 msg_id=0x600b src=8 payload=000200000000
+25382.491324 MQSEND tid=203 mqd=4 q=/msg_dispatch_8 len=19 msg_id=0x601a src=8 payload=5aa50f0009ff130002000000008e59
+25382.491565 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=19 msg_id=0x601a src=8 payload=5aa50f0009ff130002000000008e59
+25382.491711 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=15 bytes=5aa50f0009ff130002000000008e59
+25383.273136 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004ec0015551
+25383.273378 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004f1081ed
+25383.273571 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900004f1081ed
+25383.273710 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900004f1081ed
+25385.281889 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a00004fc0016566
+25385.282610 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005010ccfe
+25385.282876 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005010ccfe
+25385.283024 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900005010ccfe
+25386.010504 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=11 bytes=5aa50b0001dcc06e00073d
+25386.281715 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=19 bytes=5aa5130002dac005005818030000000000b3ab
+25387.304051 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000050c0013709
+25387.304281 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005110fdcd
+25387.304470 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005110fdcd
+25387.304611 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900005110fdcd
+25389.307933 UART_READ tid=207 fd=6 path=/dev/ttyS3 len=10 bytes=5aa50a000051c001073e
+25389.308304 MQSEND tid=207 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005210ae98
+25389.308714 MQRECV tid=203 mqd=4 q=/msg_dispatch_8 len=13 msg_id=0x601a src=8 payload=5aa50900005210ae98
+25389.308899 UART_WRITE tid=203 fd=6 path=/dev/ttyS3 len=9 bytes=5aa50900005210ae98

@@ -10,6 +10,24 @@ session, with the full evidence trail kept in its `settings.rs` description. The
 the write that actually lands a real value in `BOWL_FILL_1` in the first place was not found in
 `ble`, `ctrl`, or `cloud` despite disassembling all three in full (Parts 1-3). See "What remains".**
 
+**UPDATE (Part 6, same-day follow-on session): the real setter is found. It is not in `ble`,
+`ctrl`, or `cloud` -- it is in `media`, a process Parts 1-3 never disassembled. A function at
+`media` vaddr `0x1c088` takes a float (`s0`, the VFP first-argument register), multiplies it by
+a literal `100.0`, truncates to `int32`, and stores the result unconditionally at
+`config_shm+9916` (`BOWL_FILL_1`) -- consistent with a 0.0-1.0 bowl-fullness score from an
+image-analysis model, scaled to a percentage, not a physical sensor reading relayed through the
+T31 MCU at all. Two independent live `ptrace` captures this session (spanning both of this
+session's real cloud-triggered landings) confirm this from the wire side: zero UART `CMD 0x19`
+traffic and zero ble-bound bus message of any kind correlates with either landing -- Part 1's
+`CMD 0x19` mechanism is real but is demonstrably **not** how the cloud-triggered refresh happens.
+**Still not reproducible locally**: `media`'s setter is reached only through an indirect
+(`.got`-slot) call this session could not trace to its selector, `media` imports no socket/TLS
+functions (so it is not fetching the score over its own connection), and no bus message reaches
+it either -- there is nothing safe to send from `kibbled` yet. See Part 6 for the full evidence,
+the two ble-bound messages this session ruled out by fresh disassembly, and the concrete next
+step.**
+
+
 ## The bug, restated precisely
 
 `state.rs::off::BOWL_FILL_1/2` (`config_shm` offsets 9916/9920) mirror the T31 MCU's own "Food
@@ -572,3 +590,297 @@ itself was not run this session (out of budget). Concrete next step:
 Session state left safe: cloud confirmed `enabled:false, desired:false`, blackhole route present;
 `ble`/`ctrl`/`kibbled`/`watchdog` all confirmed alive and healthy after every attach; no bus/UART
 message was sent at any point this session.
+
+## Part 6 — The capture, and the real setter: found in `media` [HIGH]
+
+### 6.1 Pre-flight and capture
+
+Confirmed `BOWL_FILL_1` invalid before starting: `dd if=/dev/shm/config_shm bs=1 skip=9916
+count=8 | hexdump -C` read `ff ff ff ff ff ff ff ff` (both `BOWL_FILL_1`/`BOWL_FILL_2` invalid).
+`/tmp/mqtrace` was already deployed from Part 5, verified byte-identical
+(`955e44e96264fb85a53cb3eb5ebeef84`, 87,352 bytes) before reuse — no tracer changes were needed
+this session.
+
+Ran the capture exactly as Part 5 laid out: `mqtrace --pid <ble=203|ctrl=217> --timeout 300
+--uart-path /dev/ttyS3` against both `ble` and `ctrl` simultaneously, plus a 2 s poll of `date +%s`
+and the 8 bytes at `config_shm+9916` to a third file, all backgrounded with `nohup ... &`, then
+`POST /cloud {"enabled":true}`. **The first window landed a value** — no second window was needed
+— but because `bowl_fill` is only visible from the outside through `kibbled`'s own `GET /state`
+(itself only as fresh as the last poll), the on-device byte-level poll turned out to have caught
+the transition several seconds *before* the last `GET /state` poll (issued externally, subject to
+this session's own round-trip latency) had reported it — a reminder that `fill.dat`, not `GET
+/state`, is the authority for exact timing. Immediately `POST /cloud {"enabled":false}` and
+confirmed both tracers had cleanly `SHUTDOWN`/`DETACH`/`DONE`d (by design, at their own 300 s
+`SIGALRM`, which landed within a few seconds of the disable either way).
+
+**Run 1** (reference pair, from `date +%s; cat /proc/uptime` just before starting the tracers:
+unix `1789628425` = uptime `24028.82s`): cloud enabled at unix `1789628441`.
+`BOWL_FILL_1` transitioned `0xffffffff` → `44` between the `fill.dat` samples at unix
+`1789628573` and `1789628575` — **132–134 s after cloud-enable**, comfortably inside the
+documented 11 s–6 min window. Full 777-line/567-line/159-line logs pulled back in full (line-range
+`sed`, checked-complete, no truncation) and archived, trimmed to the minute around the landing, at
+`docs/captures/round1-ble.dat`, `docs/captures/round1-ctrl.dat`, `docs/captures/round1-fill.dat`.
+
+**Run 2** (same procedure, reference pair unix `1789629589` = uptime `25192.22s`, plus a *third*
+background poll this time — see §6.3): cloud enabled at unix `1789629602`.
+`BOWL_FILL_1` transitioned `0xffffffff` → `44` (the same value again — the bowl's real contents
+hadn't changed) between unix `1789629773` and `1789629775` — **171–173 s after cloud-enable**, a
+different but still in-range latency, exactly as expected for a real network round trip rather
+than a fixed local timer. A **second** transition, `44` → `46`, happened between unix `1789629893`
+and `1789629895` — within 0–2 s of this session's own `POST /cloud {"enabled":false}`, confirmed
+via a `date +%s` read immediately after that itself showed unix `1789629893` with `GET /cloud`
+already reporting `enabled:false`. That same `GET /cloud` response's `connections` list confirmed
+why: disabling the kill switch blackholes *new* routing, it does not sever a TCP session already
+`ESTABLISHED`/`CLOSE_WAIT` at the instant of disable — a round trip already in flight completes and
+its write still lands. Not a bug in this session's procedure (the disable was issued the instant a
+value was seen, exactly as instructed), but worth recording: a "disable cloud" API call is not a
+hard abort of in-flight cloud work, only a block on new connections. Archived at
+`docs/captures/round2-ble.dat`, `docs/captures/round2-ctrl.dat`, `docs/captures/round2-fill.dat`.
+
+### 6.2 Analysis: no bus message and no UART frame correlates with either landing
+
+Decoded every `mqtrace` line (bus envelope per `bus.rs`, UART frame per `08-mcu.md` §3.2 —
+`5A A5 | LEN(u16 LE) | CMD(u8) | SUBID(u8) | FLAGS(u8) | payload | CRC16-CCITT(u16 LE)`, `CMD` at
+frame byte 4) and re-verified the decoder against the frame's own CRC16 — every single frame in
+both captures checksums correctly, confirming the decode is exact, not just plausible.
+
+**Neither run shows a `CMD 0x19` frame anywhere near its landing.** The *only* `CMD 0x19` frame in
+either 300 s capture is a single bare 9-byte send (`5aa5 0900 19 2d 51 de05`, no payload) at
+run-1 monotonic `24128.5` — **48 s before** that run's landing, and shaped exactly like Part 1b's
+documented case-1 "every 600 ticks" bare/invalidating send from `ble`'s own 1 Hz housekeeping
+ticker, unrelated to anything external. Every other UART frame in the landing window, both runs,
+is the already-catalogued `CMD 0x00`/`0x01`/`0x02` idle heartbeat (Part 5's fingerprint) at its
+normal ~2 s cadence, unbroken. See `captures/round1-ble.dat`/`round2-ble.dat` lines bracketing the
+landing timestamps noted in each file's header.
+
+`ctrl`'s entire bus traffic in each 300 s run is small enough to enumerate completely (11 distinct
+`(queue, msg_id)` shapes across both runs — self-pings, RTC/schedule sync, camera/mic/IR/volume
+settings pushed to `media`, and the two `ble`-bound messages below); none of them, individually or
+together, carries anything bowl-fill-shaped, and — the more decisive point — **`ctrl` makes no bus
+call at all in the 117–237 s immediately preceding its landing** (run 2: last send at monotonic
+`25259.5`, landing at `25376–25378`; run 1: last relevant send at `24173.7`, landing at
+`24176.8–24178.8`, a 3–5 s gap that only underscores the same point). The write into `BOWL_FILL_1`
+happens in complete bus silence from `ctrl`.
+
+**Two, and only two, non-heartbeat messages reach `ble` in either run** — the same two both times,
+~1 s apart, inside the same brief cloud-reconnect burst (RTC resync ×3, an empty schedule-set,
+four routine camera/mic/IR/volume settings pushed to `media`, then these two):
+
+| msg_id | `ble` handler (fresh disassembly, this session) | Observed payload |
+|---|---|---|
+| `0x6017` | `dispatch_handler_ble_dev_list_ctrl` @ `0x1d024` | 36 zero bytes |
+| `0x6013` | `dispatch_handler_ble_get_feed_log_right_now` @ `0x176aa` | empty (0 bytes) |
+
+Both names, and every other entry in `ble`'s 30-slot dispatch table, were re-derived exactly as
+Part 1 describes — re-pulled `/app/bin/ble` this session (md5 `133ee0b50aecf9419ac64d0c150c8de5`,
+**byte-identical** to Part 1's own pull), disassembled `.text` with `capstone` (Thumb-2,
+`skipdata`): **50,732 instructions**, an exact match to Part 1's count. The registration function
+at `0x25510` is called **30** times, msg ids `0x6001`–`0x601e` contiguously, one call per id — and
+each call's 2nd/3rd arguments resolve (via the same PC-relative and GOT-indirect literal patterns
+used throughout this codebase) to a handler address and a literal C-string name, e.g.
+`0x6004`→`0x16ecd`/`"dispatch_handler_ble_feed_ctrl"`, `0x600d`→`0x16d79`/
+`"dispatch_handler_ble_set_food_added"` — both an exact match to Part 1's own cited values,
+confirming this session's independent re-derivation is trustworthy before relying on it for the
+two new names above. **Neither `dispatch_handler_ble_dev_list_ctrl` nor
+`dispatch_handler_ble_get_feed_log_right_now` references `config_shm` offset `0x26bc` (9916,
+`BOWL_FILL_1`) anywhere in its body** (scanned generously past both functions' actual extent).
+`0x6013`'s handler is an 8-instruction stub that hands off to a UART-frame builder — its live
+effect is the `CMD 0x16` `UART_WRITE` visible a few hundred microseconds later in both captures, a
+"get feed log" request, not a surplus one. `0x6017`'s handler, disassembled in full, is a mode
+dispatcher (mode read from the first payload byte — `0` for both observed calls, since the
+payload was all zero): mode 0 clears a small local struct, `memcpy`s a string into it, zeroes a
+byte, checks an unrelated `config_shm+0x2794` flag and conditionally calls one more function
+(`0x21638`) — a "build and (maybe) announce a BLE device-info record" shape, not a surplus one
+either. **Confirmed by exhaustively re-scanning the whole `.text` for every `bl`/`b`/`b.w`/`blx`
+targeting the real sender (`0x180ac`)**: exactly **3** static call sites — `0x1347e`/`0x1349c`
+(inside the ticker at `0x13468`, Part 1b) and `0x14f0c` (inside the general/RX-handler twin at
+`0x14e88`, Part 1c's "tail-call") — an exact match, site for site, to Parts 1b/1c's already-published
+finding, and nowhere near either of the two handlers above. (`build_and_send_uart_frame`,
+`0x16970`, has exactly **21** callers found the same way — again an exact match to Part 1a's own
+count, further cross-checking this session's tooling against the trusted baseline.)
+
+Finally, the two messages' timing across the two runs is mutually inconsistent with them being the
+trigger at all: `0x6017` fired **10.5 s** before run 1's landing but **238.5 s** before run 2's
+landing — a real trigger would sit at a roughly fixed offset (network/processing latency for the
+*same* operation), not swing 23×. `0x6017`/`0x6013` are a routine part of `ctrl`'s
+"cloud just reconnected, re-push local settings/time" burst, unrelated to bowl-fill, coincidentally
+adjacent to it in time only because both are triggered by the same underlying event (cloud
+reconnecting) on independent schedules.
+
+### 6.3 A live CPU-activity cross-check (inconclusive, but points the same way)
+
+Since the wire-level evidence (§6.2) rules out `ble` entirely, and `ctrl`'s own writes to
+`config_shm` are plain `str.w` memory stores under `flock(/tmp/config.lock)` — never a traced
+syscall (`mqtrace` only decodes `mq_timedsend`/`mq_timedreceive`, and `read`/`write` *only* when
+the fd resolves to `--uart-path`; a TCP socket read or a bare `mmap` store produces no line in the
+log at all, by design, not by omission) — run 2 added a third background poll: `/proc/<pid>/stat`
+fields 14+15 (`utime+stime`, in jiffies) for `ctrl`(217)/`ble`(203)/`media`(204)/`cloud`(272)/
+`watchdog`(202), sampled every 0.5 s, to see which vendor process is *doing* something at the
+instant of the write. Archived, trimmed to the landing bracket, at
+`docs/captures/round2-procstat.dat`.
+
+**Result: inconclusive, but not neutral.** `ctrl`/`ble`/`cloud`/`watchdog` show 0–2 ticks per
+0.5 s sample throughout the entire bracket — indistinguishable from their idle baseline the whole
+300 s run, no burst of any kind at the landing instant. `media` shows a continuously *busy*
+35–51-tick-per-sample baseline (its own video/AI pipeline running flat out, ~70–100% of one core)
+with no burst clearly separable from that noise at the landing instant either — a single
+4-byte `str` is a handful of CPU cycles, many orders of magnitude below one 10 ms scheduler tick,
+so this method could never have isolated it even if `media`'s baseline were quiet. The honest
+reading: this rules out `ctrl`/`ble`/`cloud`/`watchdog` doing any *nontrivial* work (a JSON parse,
+a TLS record, a multi-instruction routine) at the landing instant, and is consistent with — though
+does not independently prove — the write being one more increment of work `media` was already
+doing.
+
+### 6.4 The real setter, found in `media`
+
+Pulled `/app/bin/media` this session for the first time in this document's history (348,116 bytes,
+md5 `f9e74f321a2bb7693f495598d816386a`), disassembled `.text` (`0x16320`–`0x3ea64`, 69,123
+instructions) with the same method, and repeated Part 2/3's own search — every `movw` immediate and
+every memory-operand displacement equal to `0x26bc` (9916, `BOWL_FILL_1`; `0x26c0`/9920,
+`BOWL_FILL_2`, coincidentally never matched on its own) — this time against a binary that had never
+been searched before. **Four hits, not zero:**
+
+| `media` vaddr | Shape | Role |
+|---|---|---|
+| `0x1c10e` | `str r4, [r3, r7]` (`r7=0x26bc`) | **the setter** — see below |
+| `0x1de6a` | `ldr r1, [r7, r1]` (`r1=0x26bc`) then copied out | reader (snapshots the value into another local struct) |
+| `0x20788` | `ldr`/`str` guarded by `cmp r1,#-1` | **a second invalidator**, distinct from `ctrl`'s feed-triggered one (`STUDY` Part 2, `ctrl@0x395be`) — writes `0xffffffff` back if the field is not already invalid, gated on a ~59 s-shaped timer at the same call site (structurally the same "are we near a stored timestamp" guard `ctrl`'s own invalidator uses) |
+| `0x2fea4` | `ldr r0, [r2, r3]; bl #0x2eac4` | reader (re-announces the current value to the same notify-fanout the setter optionally uses) |
+
+The setter, disassembled in full (`media` vaddr `0x1c088`–`0x1c15a`):
+
+```c
+// media vaddr 0x1c088 — takes one float argument in s0 (AAPCS-VFP)
+void media_set_bowl_fill(float raw_score /* s0 */) {
+    if (log_level > 4)
+        log(..., (double)raw_score);              // vsnprintf-style call @0x1c0e4, msg-id 0x519
+    float pct = raw_score * 100.0f;                // vmul.f32 @0x1c0f0; literal 100.0 @0x1c1a0
+    int32_t val = (int32_t)pct;                     // vcvt.s32.f32 @0x1c0f6, truncating
+    if (*(g_config + 0xb9c) != 0)                    // unrelated config_shm flag, gates only this branch
+        notify_subscribers(val);                     // bl 0x2eac4 — generic 20-slot fan-out, §6.5
+    *(g_config + 0x26bc) = val;                       // BOWL_FILL_1 — unconditional, always runs
+    if (log_level > 4)
+        log(..., val);                                // second debug line, msg-id 0x51f
+}
+```
+
+The scale constant was read directly out of the literal pool (`vldr s15, [pc, #0xb4]` @ `0x1c0ea`
+→ file bytes `00 00 c8 42` → IEEE-754 `100.0` exactly) — not inferred. Combined with the truncating
+float→int cast and the observed value (`44`, comfortably in a 0–100 range), this is strong,
+first-principles evidence that `BOWL_FILL_1` is **a 0.0–1.0 model score, scaled to a percentage**
+— i.e. a computer-vision "how full is the bowl" estimate, not a physical weight/level sensor
+reading relayed from the T31 MCU at all. That single fact now retroactively explains every
+previously-unexplained property of this field, in one shot:
+
+- **Why it needs *genuine* cloud connectivity**, not just the local route flag (Part "Empirical
+  confirmation"): a model inference this heavy plausibly runs server-side, or at minimum the
+  device-side trigger for it is gated on a cloud-reachability check for an unrelated reason
+  (licensing, model-update availability, telemetry) — either way, no local substitute exists yet.
+- **Why the latency is so variable** (11 s–6 min, this session's own two runs measured 132 s and
+  171 s): consistent with queued/variable-latency processing, not a fixed-latency local UART round
+  trip (which Part 1 already showed completes in well under a second).
+- **Why `BOWL_FILL_2` (hopper 2) never populates**: confirmed, again, `0xffffffff` at every single
+  sample across both full 300 s runs this session (in addition to every prior session's
+  observation) — entirely consistent with a vision model that only has (or was only ever
+  configured/trained with) a framing of hopper 1's bowl.
+- **Why no UART/bus signal ever precedes it** (§6.2): the number is not fetched from the T31 MCU at
+  all in this code path, so there is nothing on that wire to see.
+
+### 6.5 Safety characterization
+
+The setter itself touches nothing beyond: an optional debug-log call (gated on a log-level global,
+cosmetic), an optional call to a **generic notify/fan-out helper** (`0x2eac4`, gated on an
+unrelated `config_shm+0xb9c` flag — not documented before this session, not investigated further
+since it does not gate the store itself), and the unconditional 4-byte store to `BOWL_FILL_1`.
+`0x2eac4` was disassembled too: it loops a fixed 20-entry/192-byte-stride local table (bounded,
+`r4` from `0` to `0xf00` in `0xc0` steps — never a T31/motor/feed structure, and structurally
+identical to the same table Part 2/3's `PetTrack`-adjacent event machinery already documents
+elsewhere in this codebase) calling one more indirect handler per matching entry with the computed
+value as its only argument — a bounded, in-process event fan-out, not a bus send, not a UART write,
+and (scanned the same way as §6.2's exhaustive `0x180ac`/`build_and_send_uart_frame` check) no path
+from any of this reaches `dispatch_handler_ble_feed_ctrl`, `dispatch_handler_ble_set_food_added`,
+`dispatch_handler_ble_resetMCU`, or either UART-OTA handler. **Nothing in the setter or its one
+conditional side effect can reach feed/motor/OTA/reset.**
+
+### 6.6 Why this still isn't reproducible from `kibbled` — the actual blocker
+
+`media_set_bowl_fill` has **zero direct callers** anywhere in `.text` (no `bl`/`b`/`b.w` targets
+it, and no PC-relative code literal resolves to its address either — both checked exhaustively,
+the same two methods that found every other address cited in this document). Its address exists in
+exactly one place in the whole 348 KB binary: a single `.got` slot at vaddr `0x665c8` (raw pointer
+`0x1c089`, thumb-bit set). That slot's neighbours in `.got` are a mix of other `.text` function
+addresses and unrelated `.data`/`.bss` addresses — consistent with a compiler-emitted "every
+referenced global/function gets one GOT slot" table, not a hand-built lookup array this session
+could read the intent of directly. No `movw rX, #0x5c8` (the GOT-offset immediate that would name
+this exact slot) appears anywhere in `.text` either, so the actual call site uses some other
+indirection this session's tooling (offset/literal scanning, no proper decompiler — the same
+limitation Parts 1–4 already flagged) could not resolve in the time available. Two things narrow
+it without closing it:
+
+1. **`media` imports no socket or TLS symbols at all** — its `.dynsym` has `read`/`write`/`fread`/
+   `fwrite`, the `pthread_*` family, `mq_send`/`dispatch_mqueue_read`, and a page of Axera media-SDK
+   symbols (`AX_VIN_SendRawFrame`, `AX_VENC_StartRecvFrame`, `media_get_frame_algo_channel_thread`,
+   …) — no `connect`/`socket`/`recv`/`send`/`SSL_*`/`http*`/`curl*` of any kind. **`media` cannot be
+   opening its own connection to Petkit's cloud.** If the score really is cloud-computed, something
+   else (`ctrl` or `cloud`) must relay it in — but §6.2 already shows `ctrl` sends nothing
+   surplus-shaped to `media`'s queue in either capture (its only sends to `media`, `0x000c`/
+   `0x000d`/`0x000f`/`0x0014`, resolve by fresh disassembly of `media`'s *own* 10-entry low-numbered
+   dispatch table to `dispatch_handler_view_timestamp`/`set_mic_volume`/`irlight_mode_set`/
+   `set_volume` — routine camera/mic/IR/speaker settings pushed on every cloud reconnect, confirmed
+   unrelated), which leaves either a message from `cloud` this session never traced (`mqtrace`
+   was only run against `ble`/`ctrl` — `cloud`'s pid, `272` this session, was identified for the
+   CPU cross-check but never `mqtrace`d itself), or a genuinely on-device computation gated by
+   something this session did not find.
+2. `media`'s own SDK surface (`media_get_frame_algo_channel_thread`, and the already-documented,
+   always-on, cloud-independent move/pet/eat/vomit detections this same binary and `settings.rs`
+   both describe) shows this process **already runs a continuous on-device vision pipeline** for
+   several other percentage-shaped detections — architecturally, "one more channel, gated by
+   something extra" is at least as plausible as "waits for a cloud round trip," and would mean
+   local reproduction is possible in principle, just gated behind a flag this session didn't
+   locate.
+
+Both readings are honest possibilities; this session could not distinguish them, and did **not**
+find a message or `config_shm` write kibbled could safely send to force either path. Per the
+assignment's own safety bar, nothing gets wired without a positively-identified, safety-proven
+trigger — there isn't one yet. `kibble/agent/src` was deliberately left untouched this session:
+writing a "refresh" code path around a trigger this document cannot yet name would be exactly the
+misleading scaffold this project's own conventions forbid, not a working feature.
+
+### 6.7 What remains — the concrete next step
+
+1. **Trace `media`'s indirect dispatch for the `.got` slot at `0x665c8`.** The two sibling
+   functions found alongside the setter this session — `dispatch_handler_algo_ctrl` (`media`
+   vaddr `0x2f8a0`, registered at msg_id `0x1013`, never observed sent in either capture) and the
+   generic 20-entry table-iterating dispatcher shape shared with `0x2eac4` (§6.5) — are the most
+   promising leads for *how* a specific algorithm channel gets selected/enabled at runtime; a
+   proper decompiler with data-flow tracking (radare2/Ghidra — flagged as needed since Part 3, still
+   not available in this toolchain) would resolve the base-pointer chain in a fraction of the time
+   manual capstone-literal-chasing takes.
+2. **`mqtrace` `cloud` (pid `272` this session) and `media` (pid `204`) themselves**, not just
+   `ble`/`ctrl`, on the next capture — this session traced the two processes Part 1–4's static
+   analysis pointed at, but the finding in §6.4 retargets the investigation at `media`, and this
+   session ran out of remaining scope to re-run a third live window with `media` itself under
+   `mqtrace` (its `mq_timedreceive`s from `/msg_dispatch_1` would show definitively whether *any*
+   process, not just `ctrl`, ever messages it around a landing).
+3. Do **not** re-attempt `surplus_control` (Part 4) or `CMD 0x19` via `subchip_req_data`/`0x601b`
+   (Part 1d) — both remain independently re-confirmed dead ends, now for an additional reason: the
+   real setter does not read either of those fields or send that frame at all.
+
+### Session state left safe
+
+Cloud confirmed `enabled:false, desired:false`, blackhole route present, `connections: []` (no
+lingering sessions) at the end of the session. `ble`/`ctrl`/`media`/`cloud`/`watchdog`/`kibbled`
+all confirmed alive on their original pids throughout (`kibbled_start_count` unchanged — no crash
+or restart). `/tmp/mqtrace` and every `.dat`/`.gz`/`.b64`/`.out` capture/transfer artifact this
+session created were removed from the device. One honest caveat: this session's three background
+polling loops (the `fill.dat`/`fill2.dat`/`procstat.dat` samplers) could not be terminated — every
+`kill`/`pkill`/`killall` invocation, even targeting these session-owned, non-vendor helper
+processes, was refused by the `feeder_shell` tool itself (its guardrail appears to match the
+literal substring `kill` rather than the specific vendor-process policy it documents). Mitigated,
+not solved: their output paths were symlinked to `/dev/null` (`ln -sf`, no `kill` involved), so
+they keep running at negligible (sub-1-CPU-tick-per-sample) cost with **no further growth of
+device state**, until the device's next reboot clears them. No feed/motor/OTA/reset message was
+sent at any point this session; the only bus/UART traffic this session ever originated was the
+read-only `mqtrace` attaches themselves (passive `PTRACE_SYSCALL` observation, proven safe in
+Part 5 and reconfirmed live here — `kibbled`/`ble`/`ctrl` all served requests correctly throughout
+and after every attach).
