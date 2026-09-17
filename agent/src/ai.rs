@@ -352,52 +352,68 @@ impl Feed {
         feed
     }
 
-    /// Rebuild the in-memory feed from the crops already on disk in [`EVENTS_DIR`].
+    /// Rebuild the in-memory feed from what's already on disk in [`EVENTS_DIR`]: image crops
+    /// (`visit`/`eat`/`face`) and persisted `track` records alike.
     ///
     /// Without this, `GET /events` reported an empty list after every `kibbled` restart even
     /// though the images were sitting right there -- and `kibbled` restarts for ordinary reasons
-    /// (a new binary, the supervisor's respawn loop). Filenames are the ones `poll_loop` writes,
-    /// `<unix_ts>-<class>.jpg`, so the timestamp and class are recoverable exactly; `score`,
-    /// `pet_id` and `box` stay `None` for the same honest reason they always are (that data only
-    /// ever existed in `ctrl`'s private queue, never in the file).
+    /// (a new binary, the supervisor's respawn loop). Image filenames are the ones `poll_loop`
+    /// writes, `<unix_ts>-<class>.jpg`, so the timestamp and class are recoverable exactly;
+    /// `score` and `box` stay `None` for the same honest reason they always are (that data only
+    /// ever existed in `ctrl`'s private queue, never in the file). A `track` detection has no
+    /// crop of its own -- see [`Feed::push_track`] for the `<ts>-track.json` sidecar this reads
+    /// back via [`parse_track_record`].
     fn rehydrate_from_disk(&self) {
         let Ok(entries) = fs::read_dir(EVENTS_DIR) else { return };
-        let mut found: Vec<(u64, &'static str, String)> = Vec::new();
+        // `image` is `None` for a `track` record (there is no crop to serve -- `track_image`
+        // finds one separately by timestamp window); `track_fields` (`pet_id`, `total_score`) is
+        // `None` for everything else.
+        let mut found: Vec<(u64, &'static str, Option<String>, Option<(u32, f32)>)> = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some((ts_str, rest)) = name.split_once('-') else { continue };
             let Ok(ts) = ts_str.parse::<u64>() else { continue };
+            if rest == "track.json" {
+                let Ok(json) = fs::read_to_string(e.path()) else { continue };
+                let Some(fields) = parse_track_record(&json) else { continue };
+                found.push((ts, "track", None, Some(fields)));
+                continue;
+            }
             let class = match rest.strip_suffix(".jpg").or_else(|| rest.strip_suffix(".jpeg")) {
                 Some("visit") => "visit",
                 Some("eat") => "eat",
                 Some("face") => "face",
                 _ => continue,
             };
-            found.push((ts, class, name));
+            found.push((ts, class, Some(name), None));
         }
         if found.is_empty() {
             return;
         }
-        found.sort_by_key(|(ts, _, _)| *ts);
+        found.sort_by_key(|(ts, _, _, _)| *ts);
         let skip = found.len().saturating_sub(MAX_EVENTS);
         // A face crop a human already filed under a cat keeps that name across restarts --
         // the same lookup `set_face_cat` applies live when the labelling happens.
         let labelled = faces::labelled_cats_by_ts();
         let mut inner = self.inner.lock().unwrap();
-        for (ts, class, name) in found.into_iter().skip(skip) {
+        for (ts, class, image, track_fields) in found.into_iter().skip(skip) {
             let seq = inner.next_seq;
             inner.next_seq += 1;
             let cat = if class == "face" { labelled_cat_for(&labelled, ts) } else { None };
+            let (pet_id, total_score) = match track_fields {
+                Some((pet_id, total_score)) => (Some(pet_id), Some(total_score)),
+                None => (None, None),
+            };
             inner.events.push_back(Detection {
                 seq,
                 ts,
                 class,
                 score: None,
-                pet_id: None,
+                pet_id,
                 b0x: None,
-                image: Some(name),
+                image,
                 cat,
-                total_score: None,
+                total_score,
             });
         }
     }
@@ -427,8 +443,21 @@ impl Feed {
         self.push_detection(now_unix(), class, image, cat, None, None);
     }
 
-    /// The vendor identified a pet: publish it under the vendor's own `start_time`.
+    /// The vendor identified a pet: publish it under the vendor's own `start_time`, and persist
+    /// a tiny on-disk record so the sighting survives a restart -- see
+    /// [`Feed::rehydrate_from_disk`]. Unlike a `visit`/`eat`/`face` crop, a vendor `track`
+    /// detection otherwise lives only in `config_shm`'s single-slot `PetTrack` block: gone the
+    /// instant the next visit overwrites it, let alone a `kibbled` restart. `poll_loop`'s
+    /// `last_track` gate is this method's only caller, so the write below is already on-change
+    /// only, never on a timer.
     fn push_track(&self, entry: &crate::state::TrackEntry) {
+        match save_track_record(entry) {
+            Ok(()) => prune_events_dir(),
+            Err(e) => eprintln!(
+                "kibbled: ai: save track record for ts={}: {e}",
+                entry.start_time
+            ),
+        }
         self.push_detection(entry.start_time, "track", None, None, Some(entry.pet_id), Some(entry.value));
     }
 
@@ -582,6 +611,25 @@ fn prune_events_dir() {
     }
 }
 
+/// Writes `EVENTS_DIR/<ts>-track.json`: `{"pet_id":N,"total_score":F}`. The counterpart to
+/// [`parse_track_record`], which [`Feed::rehydrate_from_disk`] reads back; see
+/// [`Feed::push_track`] for why this is on-change only.
+fn save_track_record(entry: &crate::state::TrackEntry) -> io::Result<()> {
+    let json = format!(r#"{{"pet_id":{},"total_score":{}}}"#, entry.pet_id, entry.value);
+    fs::write(Path::new(EVENTS_DIR).join(format!("{}-track.json", entry.start_time)), json)
+}
+
+/// The inverse of [`save_track_record`]'s body -- `(pet_id, total_score)`, or `None` if either
+/// field is missing or unparseable (a partial write, e.g. a `kibbled` restart mid-`fs::write`,
+/// is skipped on rehydrate rather than reconstructed with a guessed value). Reuses `http.rs`'s
+/// flat-JSON reader rather than a second ad hoc parser -- `feed_capture.rs`'s `parse_record`
+/// does the same for its own `<ts>-<id>.json` sidecar.
+fn parse_track_record(json: &str) -> Option<(u32, f32)> {
+    let pet_id = crate::http::json_field(json, "pet_id")?.parse().ok()?;
+    let total_score = crate::http::json_field(json, "total_score")?.parse().ok()?;
+    Some((pet_id, total_score))
+}
+
 /// Identity of a tracker entry for change detection: the vendor rewrites the block on every
 /// visit, and a new `(pet_id, start_time)` pair is what "a new identification" means. Pure so
 /// the tests can drive it without a live `config_shm`.
@@ -674,6 +722,14 @@ pub fn spawn(gallery: Arc<faces::Gallery>, shm: Arc<Shm>) -> Arc<Feed> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that touch the real, shared `EVENTS_DIR` on disk against each other.
+    /// `cargo test`'s default parallelism runs every test function on its own thread within one
+    /// process, and some tests here assert exact counts or emptiness that a concurrently-running
+    /// writer test would otherwise corrupt via `Feed::new()`'s rehydrate. Tests that only read
+    /// through `Feed`'s in-memory API, or that identify their own entries by a `ts`/filename
+    /// nothing else on disk can produce, don't need this -- see each test's own comment.
+    static EVENTS_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// Disassembly-derived, not a live wire capture: this project's own constraints forbid
     /// attaching to `ctrl`'s private inbox to get one (see the module doc), so this exercises
     /// the decoder against a payload constructed from the *confirmed* field layout
@@ -702,12 +758,14 @@ mod tests {
 
     #[test]
     fn feed_snapshot_is_empty_json_array_before_anything_is_pushed() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
         let feed = Feed::new();
         assert_eq!(feed.snapshot_json(), "[]");
     }
 
     #[test]
     fn push_assigns_increasing_seq_and_caps_at_max_events() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
         let feed = Feed::new();
         for _ in 0..(MAX_EVENTS + 10) {
             feed.push("visit", None, None);
@@ -790,23 +848,26 @@ mod tests {
 
     #[test]
     fn set_face_cat_names_the_matching_face_event_only() {
+        // Looked up by `ts`, not `VecDeque` index: `Feed::new()` also rehydrates from the real,
+        // shared `EVENTS_DIR` (see `rehydrate_from_disk`), so another test concurrently mid-write
+        // there can land extra entries ahead of this test's own two -- 1_000/1_001 are far from
+        // any other test's file-backed timestamps, so this stays unambiguous regardless.
         let feed = Feed::new();
         feed.push_detection(1_000, "visit", None, None, None, None);
         feed.push_detection(1_001, "face", Some("1001-face.jpg".into()), None, None, None);
+        let cat_at = |ts: u64| feed.inner.lock().unwrap().events.iter().find(|d| d.ts == ts).unwrap().cat.clone();
         feed.set_face_cat(1_000, Some("Pancake"));
-        {
-            let inner = feed.inner.lock().unwrap();
-            assert_eq!(inner.events[0].cat, None, "a visit is never named");
-            assert_eq!(inner.events[1].cat.as_deref(), Some("Pancake"));
-        }
+        assert_eq!(cat_at(1_000), None, "a visit is never named");
+        assert_eq!(cat_at(1_001), Some("Pancake".to_string()));
         feed.set_face_cat(1_001, None);
-        assert_eq!(feed.inner.lock().unwrap().events[1].cat, None);
+        assert_eq!(cat_at(1_001), None);
         feed.set_face_cat(2_000, Some("Kitty"));
-        assert_eq!(feed.inner.lock().unwrap().events[1].cat, None, "outside the match window");
+        assert_eq!(cat_at(1_001), None, "outside the match window");
     }
 
     #[test]
     fn push_track_publishes_the_vendor_pet_id_under_its_own_start_time() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
         use crate::state::TrackEntry;
         let feed = Feed::new();
         feed.push_track(&TrackEntry { pet_id: 101320712, start_time: 1789528968, value: 2058.042 });
@@ -815,6 +876,64 @@ mod tests {
         assert!(json.contains(r#""pet_id":101320712"#), "{json}");
         assert!(json.contains(r#""score":null"#), "{json}");
         assert!(json.contains(r#""total_score":2058.042"#), "{json}");
+        // push_track now also persists EVENTS_DIR/<ts>-track.json (see save_track_record) --
+        // clean it up so it doesn't pollute other tests' Feed::new() rehydrates, same discipline
+        // as read_event_serves_a_real_file_written_by_the_poller below.
+        let _ = fs::remove_file(Path::new(EVENTS_DIR).join("1789528968-track.json"));
+    }
+
+    #[test]
+    fn track_record_round_trips_through_save_and_parse() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
+        use crate::state::TrackEntry;
+        let entry = TrackEntry { pet_id: 555_666_777, start_time: 1_700_000_555, value: 42.5 };
+        save_track_record(&entry).unwrap();
+        let path = Path::new(EVENTS_DIR).join(format!("{}-track.json", entry.start_time));
+        let json = fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_track_record(&json), Some((entry.pet_id, entry.value)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_track_record_rejects_incomplete_or_non_json_content() {
+        assert_eq!(parse_track_record(r#"{"pet_id":1}"#), None, "missing total_score");
+        assert_eq!(parse_track_record(r#"{"total_score":1.0}"#), None, "missing pet_id");
+        assert_eq!(parse_track_record("not json at all"), None);
+        assert_eq!(parse_track_record(""), None, "truncated write, e.g. a restart mid-fs::write");
+    }
+
+    #[test]
+    fn rehydrate_orders_persisted_tracks_and_image_crops_together_by_ts() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
+        // Sentinel timestamps set safely past any real `now_unix()` this decade, so trimming to
+        // `MAX_EVENTS` (oldest-first eviction) can never push these out even if other tests are
+        // concurrently writing their own now()-stamped files into this same real directory.
+        let base = 9_700_000_000u64;
+        let _ = fs::create_dir_all(EVENTS_DIR);
+        let entries: [(u64, &str, &[u8]); 3] = [
+            (base + 30, "track.json", br#"{"pet_id":9002,"total_score":20.0}"#),
+            (base + 10, "visit.jpg", b"fake-jpeg"),
+            (base + 20, "track.json", br#"{"pet_id":9001,"total_score":10.0}"#),
+        ];
+        // Write in a different order than final ts order, to prove rehydrate sorts rather than
+        // trusting readdir order.
+        for (ts, suffix, body) in &entries {
+            fs::write(Path::new(EVENTS_DIR).join(format!("{ts}-{suffix}")), body).unwrap();
+        }
+        let feed = Feed::new();
+        let json = feed.snapshot_json();
+        let seen: Vec<u64> = json
+            .split("\"ts\":")
+            .skip(1)
+            .map(|part| part.split(',').next().unwrap().parse::<u64>().unwrap())
+            .filter(|ts| *ts >= base)
+            .collect();
+        assert_eq!(seen, vec![base + 10, base + 20, base + 30], "{json}");
+        assert!(json.contains(r#""class":"track","score":null,"box":null,"pet_id":9001"#), "{json}");
+        assert!(json.contains(r#""class":"visit""#) && json.contains(r#""image":"9700000010-visit.jpg""#), "{json}");
+        for (ts, suffix, _) in &entries {
+            let _ = fs::remove_file(Path::new(EVENTS_DIR).join(format!("{ts}-{suffix}")));
+        }
     }
 
     #[test]
@@ -854,6 +973,7 @@ mod tests {
 
     #[test]
     fn read_event_serves_a_real_file_written_by_the_poller() {
+        let _guard = EVENTS_DIR_TEST_LOCK.lock().unwrap();
         // Exercises the exact naming convention `poll_loop` uses, end to end, without needing
         // the real device -- the file this module actually watches (`PET_FACE_PIC_JPG` etc.) is
         // vendor-only, but the copy step (`fs::write` into `EVENTS_DIR`) is pure filesystem
