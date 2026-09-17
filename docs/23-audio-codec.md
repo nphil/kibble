@@ -1842,6 +1842,18 @@ of agora's double-write" is [MED] by construction rather than [HIGH] by control.
 "15+ s clean" acceptance run therefore did not pass today for a reason outside this project;
 the rollback control is the one-ask experiment that would settle it.
 
+**Correction, later the same night (reboot control) [HIGH]:** the "vendor bug" framing above
+was too strong. A kibbled-stopped control on the same 23-hour-up device was *still* garbled
+(that run was also tainted: the restore relaunched the vendor stack a second time, see the
+ops memory), but after a **clean reboot** the app talkback was clean with kibbled *not*
+running — and clean again 90 s later with kibbled running normally from the boot hook, and
+HomeKit talkback clean alongside it. So the double-write is **accumulated state over
+uptime**, not a permanent defect and not (as far as a fresh boot can show) caused by
+kibbled's presence. Open: whether kibbled's long-running pieces (ring poller, hours-long
+RTSP mic track, Scrypted rebroadcast clients) speed the accumulation. Test: app talkback
+after ~24 h up with kibbled running; if garbled, bisect those three, else schedule a
+nightly reboot only if it ever recurs.
+
 ### 20.4 Design decision for live talkback -- superseded by §20.6
 
 This section originally picked **chunked files** over `play_aac_file`, reasoning from §20.1's
