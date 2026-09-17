@@ -120,6 +120,7 @@ mod desired;
 mod embed;
 mod faces;
 mod feed_capture;
+mod foodlevel;
 mod g711;
 mod health;
 mod http;
@@ -219,6 +220,7 @@ fn main() {
     });
     let _rtsp = rtsp::spawn(rtsp_listener, Arc::clone(&feeds));
     let ai_feed = ai::spawn(Arc::clone(&gallery), Arc::clone(&shm));
+    let foodlevel = foodlevel::spawn(Arc::clone(&shm), Arc::clone(&ai_feed));
 
     eprintln!(
         "kibbled: listening on {bind}, rtsp on {RTSP_BIND} (/main chan {}, /sub chan {})",
@@ -269,8 +271,9 @@ fn main() {
         let ai_feed = Arc::clone(&ai_feed);
         let capture = Arc::clone(&capture);
         let gallery = Arc::clone(&gallery);
+        let foodlevel = Arc::clone(&foodlevel);
         let serialize: push::Serialize = Arc::new(move |f| match f {
-            push::Field::State => state_json(&shm, health),
+            push::Field::State => state_json(&shm, health, &foodlevel),
             push::Field::Schedule => schedule_status_json(&schedule, scheduler_enabled, tz),
             push::Field::Config => settings::to_json(&shm),
             push::Field::Cloud => cloud::status_json(),
@@ -304,6 +307,7 @@ fn main() {
             &capture,
             &speaker_owner,
             &gallery,
+            &foodlevel,
             health,
         )
     });
@@ -327,11 +331,12 @@ fn route(
     capture: &feed_capture::FeedCapture,
     speaker_owner: &Arc<audioout::SpeakerOwner>,
     gallery: &faces::Gallery,
+    foodlevel: &foodlevel::FoodLevel,
     health: health::Health,
 ) -> Response {
     let (path, query) = http::split_query(&req.path);
     match (req.method.as_str(), path) {
-        ("GET", "/state") => Response::Json(state_json(shm, health)),
+        ("GET", "/state") => Response::Json(state_json(shm, health, foodlevel)),
         ("GET", "/config") => Response::Json(settings::to_json(shm)),
         ("POST", "/config") => config_write(req),
         ("POST", "/feed") => feed(req, ble, capture),
@@ -406,15 +411,21 @@ fn route(
 /// investigation) onto the vendor-state JSON `Snapshot::to_json` already builds, rather than
 /// teaching `state.rs` (which is otherwise only about the vendor's own `config_shm`) about
 /// kibbled's own bookkeeping.
-fn state_json(shm: &Shm, health: health::Health) -> String {
+fn state_json(shm: &Shm, health: health::Health, foodlevel: &foodlevel::FoodLevel) -> String {
     let base = shm.snapshot().to_json();
     let exit_code = health::last_exit_code().map_or("null".to_string(), |c| c.to_string());
+    let (bowl_fill_local_pct, bowl_fill_local_ts) = match foodlevel.snapshot() {
+        Some(r) => (r.pct.to_string(), r.computed_unix.to_string()),
+        None => ("null".to_string(), "null".to_string()),
+    };
     format!(
-        r#"{},"kibbled_start_count":{},"kibbled_last_start_unix":{},"kibbled_last_exit_code":{}}}"#,
+        r#"{},"kibbled_start_count":{},"kibbled_last_start_unix":{},"kibbled_last_exit_code":{},"bowl_fill_local":[{},{}]}}"#,
         &base[..base.len() - 1],
         health.start_count,
         health.last_start_unix,
         exit_code,
+        bowl_fill_local_pct,
+        bowl_fill_local_ts,
     )
 }
 

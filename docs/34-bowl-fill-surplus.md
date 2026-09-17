@@ -27,6 +27,14 @@ it either -- there is nothing safe to send from `kibbled` yet. See Part 6 for th
 the two ble-bound messages this session ruled out by fresh disassembly, and the concrete next
 step.**
 
+**UPDATE (Part 7, same-day follow-on session): wired and shipped.** `media`'s setter being
+unreachable turned out not to matter: `agent/src/foodlevel.rs` + `tools/kibble-food.c` compute
+the same 0.0-1.0 score independently, on-device, by `dlopen`ing the vendor's own
+`/alg/libalgo.so` and calling its real `CPetkitAlgoFoodDetect` methods directly against a frame
+`kibbled` already has -- no `media` cooperation, no cloud, needed at all. `GET /state` now reports
+`bowl_fill_local:[pct, computed_unix]` live on the real device, survives a `kibbled` restart, and
+leaves the video stream and every vendor process untouched. See Part 7.
+
 
 ## The bug, restated precisely
 
@@ -884,3 +892,301 @@ sent at any point this session; the only bus/UART traffic this session ever orig
 read-only `mqtrace` attaches themselves (passive `PTRACE_SYSCALL` observation, proven safe in
 Part 5 and reconfirmed live here — `kibbled`/`ble`/`ctrl` all served requests correctly throughout
 and after every attach).
+
+## Part 7 — Bowl fill without `media`: driving `libalgo.so` directly [HIGH]
+
+Part 6 closed with the real setter (`media` vaddr `0x1c088`, `media_set_bowl_fill`) found but
+unreachable: no local trigger, message, or `config_shm` write makes `media` run its own copy of
+the food-detection model. This part does not solve that -- it makes it irrelevant. `media` is not
+the only process that can call `/alg/libalgo.so`; nothing stops a second, independent process from
+loading the same library and calling the same model wrapper directly, the same way
+`docs/18-npu-confirmed.md` already proved for the NPU itself and `embed.rs`/`tools/kibble-embed.c`
+already do for the face-recognition model. The only new work is figuring out `libalgo.so`'s own
+call contract for the food class well enough to drive it correctly.
+
+### 7.1 Pinning `CPetkitAlgoFoodDetect`'s real ABI, by disassembly [HIGH]
+
+Pulled `/alg/libalgo.so` (already on hand from Part 6's session, re-verified md5
+`d6f1c8cf84d8c205355f7b0d9ebea462` against the live device before use) and disassembled the
+food-detect symbol cluster (`.symtab` is unstripped, same as `docs/18` found) with a small
+capstone-based Thumb-2 disassembler built this session (PLT-stub resolution via manual ARM
+modified-immediate decoding of the two GOT-indirect/direct-branch stub shapes present, cross-
+checked against `readelf`'s own relocation table -- not guessed from mnemonics). Findings, each
+directly off the instruction bytes:
+
+- **`sizeof(CPetkitAlgoFoodDetect) == 0xB8` (184 bytes) -- confirmed, not estimated.** The one
+  caller (`petkit_algo_create`, libalgo.so vaddr `0x4b0bc`, the only static call site into the
+  constructor found by an exhaustive `bl`/`blx` scan of `.text`) does `movs r0,#0xb8; blx
+  operator_new` immediately before `blx CPetkitAlgoFoodDetectC1`.
+- **The constructor** (`_ZN21CPetkitAlgoFoodDetectC1ERKNSt7__cxx1112basic_stringIcSt11char_
+  traitsIcESaIcEEE`, vaddr `0x46bf0`, 184 bytes) takes `(this, const std::string& model_path)`.
+  It default-constructs a 7-byte SSO string at offset `0` (an internal name tag, self-supplied,
+  irrelevant to callers) and copy-constructs its **second** argument into a `std::__cxx11::
+  basic_string` at offset `0xA0` -- the exact field `petkit_algo_model_init` later
+  `read_file()`s from. No vtable: offset `0` is the first string's data pointer, not a vtable slot.
+- **`petkit_algo_model_init()`** (vaddr `0x46cd0`, 144 bytes): `read_file(this+0xA0, &buf)` ->
+  `AX_ENGINE_CreateHandle` (storing the handle at `this+0x18`) -> `AX_ENGINE_CreateContext` ->
+  `AX_ENGINE_GetIOInfo` (`this+0x1C`) -> `middleware::prepare_io` (allocates the IO tensors,
+  `this+0x20`). **No `AX_SYS_Init`/`AX_ENGINE_Init` call anywhere in this function** -- confirms
+  `docs/18`'s finding that the engine-level lifecycle lives one level up (`media`'s own startup /
+  `petkit_algo_engine_init`), so a caller outside `media` must bring that up itself, exactly as
+  `kibble-embed.c` already does.
+- **`petkit_algo_model_deinit()`** (vaddr `0x46d60`, 20 bytes): `middleware::free_io(this+0x20)`
+  then tail-calls `AX_ENGINE_DestroyHandle(this->handle)`. **Does not call `AX_ENGINE_Deinit`/
+  `AX_SYS_Deinit`** -- same asymmetry, the caller owns those.
+- **`petkit_algo_model_run(unsigned char* buf, int w, int h, char* tag, void(*cb)(float))`**
+  (`_ZN21CPetkitAlgoFoodDetect21petkit_algo_model_runEPhiiPcPFvfE`, vaddr `0x472e8`, 664 bytes) --
+  the real entry point this project calls. Fully traced via its own `cv::Mat` constructor calls
+  (register-level, literal pool resolved for every `vldr`/`ldr` PC-relative constant, not
+  inferred from call shape alone):
+  1. `cv::Mat src(rows=h, cols=w, type=CV_8UC3 /* =16 */, data=buf, step=AUTO)` -- **`buf` is a
+     plain, tightly packed, interleaved RGB24 buffer, `w` columns by `h` rows, exactly as the
+     caller's own `w`/`h` arguments say.** No NV12, no YUV, no fixed size baked into the model
+     itself at this layer.
+  2. `cv::Mat cropped = src(Range(182, 360), Range(0, 576))` -- a **hardcoded** crop: rows 182
+     through 359 (178 rows), all 576 columns. This is a fixed "where the bowl sits in this
+     camera's frame" rectangle, not derived from `w`/`h` at all -- so `w` **must** be exactly
+     `576` and `h` **must** be exactly `360` (or the `Range` construction throws a C++ exception
+     this plain-C caller cannot survive; see 7.5).
+  3. `cv::resize(cropped, resized, Size(416, 128), 0, 0, INTER_LINEAR)` -- resize target
+     **416x128**, matching the model's filename (`petkit_pp_fooddet_416_128_segreg_0509_u16`)
+     exactly, confirmed from the literal pool, not the filename.
+  4. If the resized crop's mean brightness (mean of R+G+B channel means) is `< 50.0` (out of
+     255), add a flat `+50` to every channel (`cv::add(resized, Scalar(50,50,50,...), resized)`)
+     -- a low-light gain heuristic, confirmed via the literal constants `50.0`/`3.0` in the
+     brightness-average computation and the `Scalar(50,50,50)` add. Not replicated by this
+     project's helper (see 7.5) -- the vendor's own compiled code does it, unconditionally,
+     whenever it applies.
+  5. `resized.copyTo(tensor_mat)` where `tensor_mat` wraps `AX_ENGINE_IO_T.pInputs[0].pVirAddr`
+     as `Mat(rows=128, cols=416, type=CV_8UC3, data=<tensor>, step=AUTO)` -- **the model's real
+     input tensor is `128x416x3 UINT8`, the identical dtype/layout as the resize output, zero
+     conversion.** ("`u16`" in the model filename is not the input pixel format -- likely an
+     internal quantization/build tag; disassembly of the actual tensor construction settles this
+     directly rather than guessing from the name.)
+  6. `AX_ENGINE_RunSync(handle, io)`, then (only on success) `petkit_food_detect_process(io_info,
+     io, tag_string, &score_out)` -- the real post-processing, see 7.2.
+- **`run_algo_food`** and the global `petkit_algo_food_detect_run(char* tag, void(*cb)(float))`
+  (the "simpler" entry point the assignment flagged as an alternative) were disassembled too, and
+  **ruled out** for this project: `petkit_algo_food_detect_run` reads its `axVIDEO_FRAME_T&`
+  argument to `run_algo_food` from a fixed **global** pointer inside `libalgo.so` -- one that only
+  `media`'s own frame-grab pipeline ever populates. In a fresh process that global is null/
+  uninitialised; calling this entry point from outside `media` would dereference garbage. This is
+  exactly the fallback case the assignment anticipated ("if it needs context media holds
+  exclusively") -- except the fix is one layer down: call `petkit_algo_model_run` directly (a
+  plain method on an object *this* process owns), not `petkit_algo_food_detect_run`.
+
+### 7.2 Post-processing: reusing the vendor's real formula, not reimplementing it [HIGH]
+
+`petkit_food_detect_process` (vaddr `0x46da0`, 1352 bytes) deinterleaves the model's dense
+`[3,128,416]` float32 output (three 212,992-byte planes, `vst3.32` interleave confirmed in the
+disassembly) into a per-cell 3-channel map, walks it against a second per-cell label byte array,
+buckets cells by label range, argmaxes the 3 channels per cell into one of three running-count
+pairs, and combines three resulting ratios into one score:
+
+```
+score = clamp(0.15 * ratio_a + W_b * ratio_b + W_c * ratio_c, upper=1.0)
+```
+
+`(W_b, W_c)` depends on a `tag` **string** argument compared against a literal: `(0.4, 1.0)` if
+`tag == "D4SH"`, else `(0.3, 0.6)`. **`"D4SH"` is not a guess** -- it is the literal 4-byte string
+`media` itself passes (confirmed by disassembling `media`'s own call site, vaddr `0x2092c`-
+`0x209aa`, which builds the tag argument from `config_shm + 0x12E0` / offset 4832) *and*
+independently confirmed live by dumping that exact `config_shm` offset on this device: `D4SH\0`,
+byte for byte. `tools/kibble-food.c` hardcodes the literal `"D4SH"` for exactly this reason --
+it's not read from `config_shm` at runtime because this helper is already Petkit-D4SH2-specific in
+several other hardcoded ways (model path, crop rectangle, frame size).
+
+This project's helper does **not** reimplement any of the above -- it `dlsym`s
+`petkit_algo_model_run` and lets the vendor's own compiled code do steps 7.1.2-7.1.6 and this
+section, unmodified. Reimplementing the deinterleave/bucket/argmax/weighted-ratio chain in Rust or
+C would risk a plausible-looking but silently wrong score with no way to cross-check it; calling
+the real function guarantees byte-identical behaviour to what `media` itself would produce given
+the same input frame.
+
+### 7.3 Frame source: the vendor's own `"visit"`/`"eat"` JPEGs, not a fresh decode [HIGH]
+
+The crop rectangle (7.1.2) assumes a full-scene frame, not a face crop. `kibbled` has no on-device
+H.264 decoder (`ring.rs`'s frames are Annex-B, decoded only by HA for `feed_capture.rs`'s before/
+after pictures), so decoding a *live* frame from the ring was not attempted this session -- the
+assignment's own fallback ("use the vendor's own `/tmp/fPre_*.jpeg` frames … if genuinely fresh")
+applies directly. `ai.rs` already taps exactly this: `FPRE_PET_JPEG`/`FPRE_EAT_JPEG` (`"visit"`/
+`"eat"` classes), copied into `/opt/kibble/events/<ts>-<class>.jpg` on every vendor detection.
+
+Two things were verified live before relying on this, not assumed:
+
+1. **Resolution and framing.** A real `visit.jpg` pulled from the device decodes (JPEG SOF0
+   marker, read directly) to **1152x720** -- exactly the sub RTSP stream's own resolution
+   (`ring.rs::CHAN_SUB`), and exactly **2x** the model wrapper's required `576x360` (7.1.2) at the
+   same 8:5 aspect ratio. Visually confirmed too (fetched and viewed the actual frame): a fisheye
+   night-vision view with the bowl filling roughly the bottom half of frame -- matching the
+   wrapper's own `Range(182,360)` of a 360-tall image (the bottom half) almost exactly. This is
+   not a coincidence this project engineered; it's how the vendor's own pipeline is scaled, and
+   `kibble-food.c`'s bilinear 0.5x downscale (`stb_image` decode + the same `resize_bilinear_rgb`
+   `kibble-embed.c` already uses, just a different target size) reproduces it cheaply.
+2. **Freshness is not guaranteed, and this project does not pretend it is.** These files are
+   written on the vendor's own detection cadence, not a timer -- there can be, and during this
+   session was, a multi-hour gap with no fresh frame (05:39-08:07 one morning; no cat traffic).
+   `foodlevel.rs` treats "no fresh-enough frame" as a normal, silent skip (see 7.4), exactly the
+   Contract's own "only when a frame is available" phrasing.
+
+`ai::Feed::latest_scene_image()` (new, small method) returns the most recent `"visit"`/`"eat"`
+detection's `(ts, filename)`, explicitly excluding `"face"` detections (224x224 face crops, wrong
+framing entirely for this model).
+
+### 7.4 The helper: `tools/kibble-food.c` [HIGH]
+
+Structure (full module doc in the file itself): decode+resize the JPEG to exactly 576x360 RGB24
+-> `AX_SYS_Init`/`AX_ENGINE_Init` (directly linked against `libax_engine.so`/`libax_sys.so`,
+identical to `kibble-embed.c`) -> `dlopen("/alg/libalgo.so", RTLD_LAZY)` -> `dlsym` the four
+`CPetkitAlgoFoodDetect` methods by their exact mangled names -> build a 184-byte object + a
+hand-built libstdc++-ABI `std::string` for the model path (no libstdc++ symbols needed -- the
+string's own bytes are constructed directly, then handed to the *real* constructor, which copies
+them out immediately) -> `model_init` -> `model_run` -> `model_deinit` -> `AX_ENGINE_Deinit`/
+`AX_SYS_Deinit` -> print `score=<float>`, exit 0.
+
+**`RTLD_LAZY`, not `RTLD_NOW` -- a real, live-discovered blocker, not a style choice.**
+`libalgo.so` has a genuinely unresolved import of its own: `jas_image_writecmpt` (a JasPer/
+JPEG2000 symbol, confirmed `UND` with **no** corresponding `DT_NEEDED` entry via `readelf -sW`/
+`-d`) -- OpenCV's JPEG2000 codec plugin is compiled in but its library was evidently never
+shipped/linked on this firmware. `dlopen(..., RTLD_NOW)` eagerly resolves every import and fails
+outright: `undefined symbol: jas_image_writecmpt`, reproduced live before the fix. This project's
+codepath never touches JPEG2000, so `RTLD_LAZY` (resolve-on-first-call) is both correct and
+sufficient -- confirmed live, the exact same build with only that one flag changed loads and runs
+cleanly.
+
+**Every exit path tears the NPU down**, more strictly than `kibble-embed.c`'s own precedent
+(which exits immediately on some `AX_ENGINE_*` failures without a matching `Deinit`): this helper
+is meant to run unattended, periodically, from `kibbled`, where a per-failure leak would
+accumulate rather than happen once per manual click.
+
+### 7.5 Live testing on the device [HIGH]
+
+Built (bullseye/glibc-2.31 sysroot assembled without Docker -- see `tools/README.md` for the full,
+reproducible recipe and why Docker wasn't available this session), deployed via `feeder_shell`
+(gzip+base64, transferred by scripting the chunk loop *inside* `eval` rather than relaying text by
+hand through the conversation -- see `tools/README.md`'s note on why that specific technique was
+necessary), md5-verified (`27201f4df0e99ee3d5a78671d1a91d76`, matching the build output exactly).
+
+**Ran repeatedly against real, on-device frames:**
+
+| Frame (`visit.jpg` ts) | Local time | `kibble-food` score | pct |
+|---|---|---|---|
+| 1789598397 | Sep 16 22:39 | 0.1356 | 14% |
+| 1789614427 | Sep 17 03:07 | 0.4360 | 44% |
+| 1789623595 | Sep 17 05:39 | 0.3483 | 35% |
+| 1789632467 | Sep 17 08:07 | 0.3477 | 35% |
+| 1789634276 | Sep 17 08:37 | 0.2036 | 20% |
+| 1789635232 | Sep 17 08:53 | 0.2237 | 22% |
+| 1789636208 | Sep 17 09:10 | 0.2273 | 23% |
+
+Five back-to-back runs against the same frame returned the identical score every time
+(deterministic, as expected -- no randomness anywhere in this pipeline). The scores form a
+sensible, roughly-monotonic decline across the morning (35% -> 20-23%), consistent with a bowl
+being eaten down over several hours rather than noise; visually, the 09:10 frame (23%) shows a
+visibly smaller, more concentrated kibble pile than the 08:53 frame the vendor's own historical
+`44` reading is closest to in time.
+
+**Honest comparison against the vendor's own historical value.** Part 6 recorded a real vendor
+reading of `44` (0.44) landing at unix `1789628573-1789628575`. No `visit`/`eat` frame exists at
+that exact moment (the device's own detection gap that morning runs `05:39`-`08:07`, spanning it
+entirely -- no cat traffic, so the vendor's own pipeline had nothing to photograph either). The
+closest available frame, `1789632467` (**63 minutes after**), scores **0.3477** -- same order of
+magnitude and the same qualitative "meaningfully occupied, not full" regime as the vendor's `0.44`,
+but **not an exact match**, and this document does not claim one. Given this project's own later
+readings show the bowl visibly declining over that same morning (0.35 -> 0.20-0.23 across the next
+~90 minutes), a genuine bowl-content change across the intervening 63 minutes is the more likely
+explanation than a scoring error -- but that is inference, not proof; no frame exists to settle it
+exactly. **[INFERENCE]** on the specific explanation, **[HIGH]** on the measured numbers
+themselves.
+
+**Safety/impact checks, all live on the device:**
+
+- `GET /streams` fps: `main` 25.0 / `sub` 25.0 both immediately before and immediately after five
+  back-to-back inferences -- unchanged.
+- `pidof media ctrl ble watchdog cloud` -- identical pids before and after every test run across
+  this entire session; no vendor process crashed or restarted.
+- `cat /proc/ax_proc/npu/vnpu` stayed `disable` throughout (matches `kibble-embed.c`'s own
+  attribute, and confirms no leftover engine-level state).
+- `ps` after every run set: no leftover `kibble-food` process (the helper always exits, even on
+  the deliberately-induced `RTLD_NOW` failure earlier in testing).
+- `GET /cloud`: `enabled:false, desired:false, connections:[]` unchanged throughout.
+
+### 7.6 Wiring: `agent/src/foodlevel.rs` [HIGH]
+
+New module, new background thread (`foodlevel::spawn`, started from `main.rs` alongside
+`ai::spawn`). Full reasoning in the module's own doc comment; summary:
+
+- **Scheduling** (`should_attempt`, pure and unit-tested): never while `state::off::FEEDING` is
+  set; always once right after a feed cycle completes (bypasses the periodic cooldown --
+  `SETTLE_AFTER_FEED = 3s` first, mirroring `feed_capture.rs`'s own constant); otherwise at most
+  once per `RATE_LIMIT = 10 min`. The rate limit is charged on every real *attempt*, success or
+  failure, so a misbehaving helper can never turn into a hot loop against the NPU.
+- **Double-enforced "never during a feed."** `should_attempt` refuses to start while `FEEDING` is
+  set; separately, `run_helper` polls the same flag every 50ms *while the child is running* and
+  kills it immediately if a feed starts mid-inference -- an inference that outlives its own
+  pre-flight check is exactly as unsafe as one that skipped it.
+- **Frame freshness**: `MAX_FRAME_AGE = 10 min`, matching `RATE_LIMIT` -- no point holding a frame
+  "fresh" longer than this module would ever go looking for one anyway. No fresh-enough frame is a
+  silent skip, not an error.
+- **Parsing** (`parse_score`, pure and unit-tested): requires the exact `"score=<float>"` shape on
+  the first stdout line, rejects non-finite and out-of-`[~0,~1]`-range values outright (defense in
+  depth -- the helper itself already rejects non-finite scores before printing) rather than
+  clamping a value that would indicate something is genuinely wrong.
+- **`GET /state`** gains `"bowl_fill_local":[pct_u8_or_null, computed_unix_or_null]`, alongside the
+  existing, **untouched** `"bowl_fill":[bowl_fill_1, bowl_fill_2]` (the vendor's own `config_shm`
+  reading). Deliberately a *new* field, not a reuse of `bowl_fill`'s own second slot: that slot is
+  hopper 2's own reading (confirmed, again this session, permanently `0xffffffff` --  never
+  populated by the vendor on this device), not a spare timestamp -- writing this project's own
+  hopper-1 estimate there would misrepresent hopper 2 on any physically two-hopper device. Units
+  and rounding match the vendor's own convention exactly (`(score*100.0).round()`, same as
+  `media_set_bowl_fill`'s `(int)(score*100.0f)`), so the two fields are directly comparable
+  whenever both happen to be populated.
+
+**End-to-end integration verified live** (not just the standalone helper): copied a real,
+already-tested `visit.jpg` to a fresh-timestamp filename in `EVENTS_DIR`, restarted `kibbled` (so
+`ai::Feed::rehydrate_from_disk` would pick it up by filename timestamp -- the in-memory event feed
+is not itself watching the directory), and confirmed `GET /state` returned
+`"bowl_fill_local":[23, 1789638048]` three seconds after the restart (`kibbled_last_start_unix:
+1789638045`) -- `23` matching the same source photo's standalone `kibble-food` run (`0.2273` ->
+round to `23`) exactly. Cleaned the fabricated file and did one further restart afterward so the
+in-memory event feed no longer references it; confirmed `bowl_fill_local` correctly reverted to
+`[null,null]` once no fresh frame remained, and `GET /events` no longer lists it. `kibbled_start_
+count` incremented normally across both restarts; no crash, no unexpected exit code recorded.
+
+### 7.7 Cost per run and how it compares [MED/INFERENCE]
+
+Observed wall time: **~1.5s cold** (model file not yet page-cached after a `kibbled`/device
+restart) down to **~0.6s warm** (repeated runs). This is the NPU inference plus the full second-
+process cost (`dlopen` of a 5.7MB library with its own OpenCV/WebP/FreeType/Eigen static
+initializers, JPEG decode, `AX_ENGINE_CreateHandle`+`GetIOInfo` from scratch every run -- this
+helper does not keep the engine handle warm across calls, matching `kibble-embed.c`'s own
+one-shot-per-invocation design). At the Contract's own cadence (at most once per 10 minutes, plus
+once per feed), this is comfortably infrequent enough not to compete meaningfully with `media`'s
+own continuous NPU usage -- confirmed directly by the fps checks in 7.5, not just argued from the
+duty cycle. **[MED]** on the exact timings (measured this session, a handful of samples, not
+statistically characterized); **[INFERENCE]** that this generalizes to sustained house-wide load
+the way `docs/18`'s own NPU-concurrency finding already established for the face model.
+
+### 7.8 Semantics -- restated for this project's own computed value
+
+Same characterization Part 6 established for the vendor's own `BOWL_FILL_1`, because it is
+literally the same model: `bowl_fill_local` is a **vision model's estimate of how full the bowl
+looks**, not a weight or physical level reading. It inherits the vendor's own model's limitations
+(a single 2D camera view, no depth, a fixed camera-relative crop rectangle assuming the bowl never
+moves in frame, a low-light gain heuristic tuned for IR night-vision frames as much as daylight
+ones) -- this project computes the *identical* score a genuine `media`-side run would, from a
+possibly-not-perfectly-fresh frame, nothing more and nothing less.
+
+### Session state left safe
+
+Cloud confirmed `enabled:false, desired:false, connections:[]` throughout and at the end. `media`/
+`ctrl`/`ble`/`watchdog`/`cloud` all on their original pids from before this session's testing began
+(no crash, no restart). `/opt/kibble/kibble-food` deployed and md5-verified against the build
+output; the two link-time-only stub `.so` files and the bullseye sysroot never left the sandbox
+(device only ever received the final cross-compiled ARM binary, same as every other tool in this
+directory). The one fabricated test-only event file was removed from `/opt/kibble/events` and
+`kibbled` restarted once more afterward specifically to clear it from the in-memory `GET /events`
+feed; no other file under `/opt` or `/tmp` was created and left behind by this session's testing.
+`kibbled` itself was deployed once (md5 `b3690a3c51ff8fe779e9329c069f2f87`) and restarted a further
+two times for the integration test above -- both ordinary, supervisor-driven restarts, not crashes
+(`kibbled_last_exit_code` stayed `null` throughout).

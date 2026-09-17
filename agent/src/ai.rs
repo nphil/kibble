@@ -241,7 +241,7 @@ fn labelled_cat_for(labelled: &[(u64, String)], ts: u64) -> Option<String> {
 const MAX_EVENTS: usize = 50;
 /// Where a watched crop is copied before the vendor's own pipeline can overwrite it in place
 /// (all three watched files are fixed, reused filenames -- the vendor does not rotate them).
-const EVENTS_DIR: &str = "/opt/kibble/events";
+pub(crate) const EVENTS_DIR: &str = "/opt/kibble/events";
 
 /// A name is safe to join onto `EVENTS_DIR` if it has no path separators and doesn't spell a
 /// traversal -- every name this module itself generates already satisfies this (`poll_loop`'s
@@ -536,6 +536,21 @@ impl Feed {
             select_track_image(inner.events.iter(), ts)?.to_string()
         };
         read_event(&name).ok()
+    }
+
+    /// The most recent `"visit"`/`"eat"` detection's image: a full camera-scene frame, unlike a
+    /// `"face"` detection's tight 224x224 face crop (wrong framing for anything but face
+    /// recognition). `foodlevel.rs` uses this to find a frame for its own on-device bowl-fill
+    /// inference -- see docs/34-bowl-fill-surplus.md Part 7. Returns `(ts, EVENTS_DIR filename)`;
+    /// the caller decides what "fresh enough" means for its own purpose.
+    pub fn latest_scene_image(&self) -> Option<(u64, String)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .events
+            .iter()
+            .rev()
+            .filter(|d| d.class == "visit" || d.class == "eat")
+            .find_map(|d| d.image.clone().map(|img| (d.ts, img)))
     }
 }
 
