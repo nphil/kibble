@@ -74,7 +74,8 @@ use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const STATE_PATH: &str = "/opt/kibble/cloud.json";
@@ -105,9 +106,50 @@ const SELF_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// can observe and keep running.
 static LOCK: Mutex<()> = Mutex::new(());
 
+/// Monotonic seconds (process uptime) before which the reconciler will not re-attempt a
+/// rolled-back disable, and the current backoff step. A failed self-check usually means the LAN
+/// path is genuinely down right now (Scrypted restarting, AP hiccup); hammering it every
+/// [`RECONCILE_INTERVAL`] would flap the default route, so the retry backs off -- but it never
+/// gives up, because "cloud left enabled forever after one blip" is the bug this replaces.
+static RETRY_AFTER: AtomicU64 = AtomicU64::new(0);
+static RETRY_BACKOFF: AtomicU64 = AtomicU64::new(0);
+const RETRY_BACKOFF_MIN_SECS: u64 = 60;
+const RETRY_BACKOFF_MAX_SECS: u64 = 15 * 60;
+
+/// Process-monotonic clock for the retry schedule: never goes backwards, unlike wall time.
+fn uptime_secs() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
+fn retry_due() -> bool {
+    uptime_secs() >= RETRY_AFTER.load(Ordering::Relaxed)
+}
+
+/// Doubles the backoff (from [`RETRY_BACKOFF_MIN_SECS`], capped at [`RETRY_BACKOFF_MAX_SECS`])
+/// and arms the next attempt. Returns the wait it just scheduled, for the log line.
+fn schedule_retry() -> u64 {
+    let prev = RETRY_BACKOFF.load(Ordering::Relaxed);
+    let wait = if prev == 0 {
+        RETRY_BACKOFF_MIN_SECS
+    } else {
+        (prev * 2).min(RETRY_BACKOFF_MAX_SECS)
+    };
+    RETRY_BACKOFF.store(wait, Ordering::Relaxed);
+    RETRY_AFTER.store(uptime_secs() + wait, Ordering::Relaxed);
+    wait
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
+    /// What is actually applied to the route table right now.
     pub enabled: bool,
+    /// What the operator last asked for. Differs from `enabled` only after a disable rolled
+    /// back (fail-safe, see `disable_with_safety`): the intent survives so the reconciler can
+    /// retry instead of leaving the cloud on forever after one transient self-check timeout --
+    /// which is exactly how the cloud came back up unnoticed after a DHCP renew re-added the
+    /// default route.
+    pub desired: bool,
     /// Last gateway this module derived from a live `ip route show`. Only ever read back when
     /// nothing live is available (typically: `enable()` while already blackholed, or a boot
     /// right after a `disabled` shutdown).
@@ -123,7 +165,7 @@ impl Default for State {
     fn default() -> Self {
         // No file yet means no `POST /cloud` has ever run: cloud is exactly as the vendor left
         // it (enabled), and there is nothing to restore, so no cached gateway either.
-        State { enabled: true, gateway: None, dev: None, last_error: None }
+        State { enabled: true, desired: true, gateway: None, dev: None, last_error: None }
     }
 }
 
@@ -208,8 +250,9 @@ pub fn enable() -> Result<State, Error> {
     let mut runner = RealRunner;
     let (gw, dev) = current_gateway(&mut runner)?;
     assert_enabled(&mut runner, &gw, &dev).map_err(Error::Command)?;
-    let state = State { enabled: true, gateway: Some(gw), dev: Some(dev), last_error: None };
+    let state = State { enabled: true, desired: true, gateway: Some(gw), dev: Some(dev), last_error: None };
     save(&state).map_err(Error::Io)?;
+    RETRY_AFTER.store(0, Ordering::Relaxed);
     Ok(state)
 }
 
@@ -228,6 +271,7 @@ pub fn status_json() -> String {
 
     let mut body = String::from("{\n");
     body.push_str(&format!("  \"enabled\": {},\n", state.enabled));
+    body.push_str(&format!("  \"desired\": {},\n", state.desired));
     body.push_str(&format!("  \"last_error\": {},\n", opt_json_escaped(&state.last_error)));
     body.push_str("  \"routes\": [");
     for (i, r) in route_lines.iter().enumerate() {
@@ -270,6 +314,7 @@ fn disable_with_safety(runner: &mut impl Runner, gw: &str, dev: &str) -> Result<
         let _ = assert_enabled(runner, gw, dev);
         let state = State {
             enabled: true,
+            desired: false,
             gateway: Some(gw.to_string()),
             dev: Some(dev.to_string()),
             last_error: Some(e.to_string()),
@@ -282,6 +327,7 @@ fn disable_with_safety(runner: &mut impl Runner, gw: &str, dev: &str) -> Result<
         let _ = assert_enabled(runner, gw, dev);
         let state = State {
             enabled: true,
+            desired: false,
             gateway: Some(gw.to_string()),
             dev: Some(dev.to_string()),
             last_error: Some(reason.clone()),
@@ -292,11 +338,13 @@ fn disable_with_safety(runner: &mut impl Runner, gw: &str, dev: &str) -> Result<
 
     let state = State {
         enabled: false,
+        desired: false,
         gateway: Some(gw.to_string()),
         dev: Some(dev.to_string()),
         last_error: None,
     };
     save(&state).map_err(Error::Io)?;
+    RETRY_AFTER.store(0, Ordering::Relaxed);
     Ok(state)
 }
 
@@ -383,20 +431,27 @@ fn reconcile_once() {
         }
     };
     let seen = parse_default_route(&live);
-    match (state.enabled, seen) {
+    match (state.desired, seen) {
         (false, Some((gw, dev))) => {
+            if !retry_due() {
+                return;
+            }
             eprintln!(
                 "kibbled: cloud reconcile: default route reappeared (via {gw} dev {dev}) while \
                  cloud is disabled, re-blackholing"
             );
             match disable_with_safety(&mut runner, &gw, &dev) {
                 Ok(_) => eprintln!("kibbled: cloud reconcile: re-blackholed default (via {gw} dev {dev})"),
-                Err(e) => eprintln!(
-                    "kibbled: cloud reconcile: could not safely re-blackhole, left cloud enabled: {e}"
-                ),
+                Err(e) => {
+                    let wait = schedule_retry();
+                    eprintln!(
+                        "kibbled: cloud reconcile: could not safely re-blackhole, cloud stays \
+                         enabled for now, retrying in {wait}s: {e}"
+                    );
+                }
             }
         }
-        (true, None) => {
+        (true, None) if state.enabled => {
             let (Some(gw), Some(dev)) = (state.gateway.clone(), state.dev.clone()) else {
                 eprintln!(
                     "kibbled: cloud reconcile: cloud should be enabled but no default route is \
@@ -412,6 +467,7 @@ fn reconcile_once() {
                 Ok(()) => {
                     let _ = save(&State {
                         enabled: true,
+                        desired: true,
                         gateway: Some(gw),
                         dev: Some(dev),
                         last_error: None,
@@ -636,7 +692,12 @@ fn parse_state(text: &str) -> State {
     let last_error = crate::http::json_field(text, "last_error")
         .filter(|v| *v != "null")
         .map(str::to_string);
-    State { enabled, gateway, dev, last_error }
+    // `desired` is younger than the file format: an older file (or a hand-written one) with no
+    // such key means the two were never distinguished, so `enabled` is also the intent.
+    let desired = crate::http::json_field(text, "desired")
+        .map(|v| v == "true")
+        .unwrap_or(enabled);
+    State { enabled, desired, gateway, dev, last_error }
 }
 
 fn save(state: &State) -> io::Result<()> {
@@ -654,8 +715,9 @@ fn save_to(path: &str, state: &State) -> io::Result<()> {
 
 fn to_json(state: &State) -> String {
     format!(
-        "{{\n  \"enabled\": {},\n  \"gateway\": {},\n  \"dev\": {},\n  \"last_error\": {}\n}}\n",
+        "{{\n  \"enabled\": {},\n  \"desired\": {},\n  \"gateway\": {},\n  \"dev\": {},\n  \"last_error\": {}\n}}\n",
         state.enabled,
+        state.desired,
         opt_json(&state.gateway),
         opt_json(&state.dev),
         opt_json_escaped(&state.last_error),
@@ -800,6 +862,7 @@ mod tests {
     fn resolve_gateway_prefers_live_over_cached() {
         let cached = State {
             enabled: false,
+            desired: false,
             gateway: Some("10.0.0.1".to_string()),
             dev: Some("eth9".to_string()),
             last_error: None,
@@ -814,6 +877,7 @@ mod tests {
     fn resolve_gateway_falls_back_to_cached_when_nothing_live() {
         let cached = State {
             enabled: false,
+            desired: false,
             gateway: Some("192.168.4.1".to_string()),
             dev: Some("wlan0".to_string()),
             last_error: None,
@@ -834,8 +898,45 @@ mod tests {
 
     impl State {
         fn default_for_test() -> Self {
-            State { enabled: true, gateway: None, dev: None, last_error: None }
+            State { enabled: true, desired: true, gateway: None, dev: None, last_error: None }
         }
+    }
+
+    #[test]
+    fn a_rolled_back_disable_keeps_the_intent_so_it_can_be_retried() {
+        // The bug this replaces: one transient self-check failure persisted `enabled: true` and
+        // nothing remembered that the operator wanted it off, so a DHCP renew re-adding the
+        // default route left the Petkit cloud up indefinitely.
+        let text = to_json(&State {
+            enabled: true,
+            desired: false,
+            gateway: Some("192.168.1.1".to_string()),
+            dev: Some("wlan0".to_string()),
+            last_error: Some("LAN unreachable after blackholing".to_string()),
+        });
+        let parsed = parse_state(&text);
+        assert!(parsed.enabled, "the route table really is enabled after a rollback");
+        assert!(!parsed.desired, "but the operator still wants it disabled");
+    }
+
+    #[test]
+    fn a_state_file_written_before_desired_existed_treats_enabled_as_the_intent() {
+        let parsed = parse_state("{\"enabled\": false, \"gateway\": null, \"dev\": null, \"last_error\": null}");
+        assert!(!parsed.enabled);
+        assert!(!parsed.desired);
+    }
+
+    #[test]
+    fn retry_backs_off_from_a_minute_to_a_quarter_hour_and_stops_growing() {
+        RETRY_BACKOFF.store(0, Ordering::Relaxed);
+        let waits: Vec<u64> = (0..8).map(|_| schedule_retry()).collect();
+        assert_eq!(waits[0], RETRY_BACKOFF_MIN_SECS);
+        assert_eq!(waits[1], 2 * RETRY_BACKOFF_MIN_SECS);
+        assert_eq!(*waits.last().unwrap(), RETRY_BACKOFF_MAX_SECS);
+        assert!(!retry_due(), "a scheduled retry is not due immediately");
+        RETRY_AFTER.store(0, Ordering::Relaxed);
+        RETRY_BACKOFF.store(0, Ordering::Relaxed);
+        assert!(retry_due());
     }
 
     #[test]
@@ -943,6 +1044,7 @@ mod tests {
     fn state_json_round_trips_including_an_error_message_with_a_quote() {
         let state = State {
             enabled: true,
+            desired: true,
             gateway: Some("192.168.4.1".to_string()),
             dev: Some("wlan0".to_string()),
             last_error: Some(r#"LAN unreachable after blackholing ("192.168.1.69:8554")"#.to_string()),
@@ -970,6 +1072,7 @@ mod tests {
             .into_owned();
         let state = State {
             enabled: false,
+            desired: false,
             gateway: Some("192.168.4.1".to_string()),
             dev: Some("wlan0".to_string()),
             last_error: None,

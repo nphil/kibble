@@ -288,9 +288,13 @@ impl Runner for RealRunner {
         // reconnect rather than trusting it to notice the link changed on its own (see
         // `cloud.rs`'s module docs for the live-confirmed citation of that vendor behaviour).
         let _ = Command::new("killall").arg("udhcpc").output();
+        // `-b` means udhcpc forks into the background itself, so the process this spawns exits
+        // almost immediately -- and MUST be waited on. `spawn()` without a `wait()` left one
+        // zombie child per reconnect parented to kibbled forever (4 of them in 4h of uptime,
+        // observed live); `status()` both launches it and reaps the short-lived parent.
         Command::new("udhcpc")
             .args(["-i", WIFI_IFACE, "-b"])
-            .spawn()
+            .status()
             .map(|_| ())
             .map_err(|e| format!("exec `udhcpc -i {WIFI_IFACE} -b`: {e}"))
     }
