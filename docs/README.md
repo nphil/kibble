@@ -52,6 +52,7 @@ be recovered, that is stated rather than guessed — read those gaps as gaps.
 - [scrypted-onboarding.md](scrypted-onboarding.md) — what the camera must implement for Scrypted + HomeKit
 - [20-two-way-audio.md](20-two-way-audio.md) — how HA does camera two-way audio, and what the agent must implement
 - [22-rebroadcast-two-way.md](22-rebroadcast-two-way.md) — Scrypted's rebroadcast is one-way (cited); the split video/talkback design
+- [34-bowl-fill-surplus.md](34-bowl-fill-surplus.md) — hopper-fill refresh without the cloud: one mechanism ruled out live, what's still open
 
 **Appendices** — [inventory](appendix-inventory.md), [prior art](appendix-prior-art.md),
 [Localkit's cloud protocol](appendix-localkit.md), [NPU research](appendix-npu-research.md),
