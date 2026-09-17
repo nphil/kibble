@@ -23,10 +23,11 @@
 //! decoder (`feed_capture.rs`'s before/after keyframes are raw Annex-B, served to HA for it to
 //! decode, never decoded here), so the cheapest correct source is what `ai.rs` already taps: the
 //! vendor's own `"visit"`/`"eat"` JPEG snapshots (`ai::Feed::latest_scene_image`) -- full 1152x720
-//! frames, written on the vendor's own detection cadence, not a fixed timer. That means a frame
-//! is not always available (no `poll_loop` tick, or plainly a bit stale after some time without
-//! cat traffic); this module accepts that honestly rather than reusing an old frame indefinitely
-//! -- see [`MAX_FRAME_AGE`].
+//! frames, written on the vendor's own detection cadence, not a fixed timer. The newest such
+//! frame is used whatever its age: the bowl only changes when the feeder dispenses or a cat eats,
+//! and both produce a fresh frame, so the last frame's score stays true until the next one
+//! arrives. The frame's own timestamp is carried on the reading (`Reading::frame_unix`) so a
+//! consumer can say *when* the bowl looked like that instead of implying "now".
 //!
 //! ## Scheduling: the Contract's two triggers
 //!
@@ -77,11 +78,6 @@ pub const HELPER_PATH: &str = "/opt/kibble/kibble-food";
 /// "After a feed" is its own trigger with no cooldown; otherwise, at most one real attempt per
 /// this long -- the Contract's own "at most once every 10 minutes" bound.
 const RATE_LIMIT: Duration = Duration::from_secs(600);
-/// How old the freshest `"visit"`/`"eat"` frame may be and still be worth an inference. Matches
-/// [`RATE_LIMIT`]: there is no point holding a frame "fresh" for longer than this module would
-/// ever go looking for one anyway, and a frame older than one full cycle is plausibly showing a
-/// bowl state that has already changed.
-const MAX_FRAME_AGE: Duration = Duration::from_secs(600);
 /// Settle time after `FEEDING` clears before looking for a frame -- mirrors
 /// `feed_capture.rs::SETTLE_AFTER_FEED` exactly (same reasoning: the scene needs a moment, and so
 /// does the vendor's own detection pipeline if a cat is right there).
@@ -104,6 +100,10 @@ pub struct Reading {
     pub pct: u8,
     /// Unix time this reading was computed (not the source frame's own timestamp).
     pub computed_unix: u64,
+    /// The source frame's own timestamp. The score describes the bowl *as the camera last saw
+    /// it*, which is what a consumer needs to caption it honestly -- a bowl nobody has walked
+    /// past in two hours still has whatever was in it two hours ago.
+    pub frame_unix: u64,
 }
 
 struct Inner {
@@ -265,17 +265,18 @@ fn run_helper(helper: &Path, model: &Path, image: &Path, timeout: Duration, shm:
 /// no frame is fresh enough -- per the module doc, that is an expected, non-error outcome.
 fn try_compute(foodlevel: &FoodLevel, shm: &Shm, feed: &ai::Feed, now: Instant) {
     let Some((ts, filename)) = feed.latest_scene_image() else { return };
-    let age = ai::now_unix().saturating_sub(ts);
-    if age > MAX_FRAME_AGE.as_secs() {
-        return;
-    }
+    // Deliberately no freshness veto. The bowl only changes when the feeder dispenses or a cat
+    // eats -- both of which produce a fresh frame -- so the newest frame's score stays true
+    // until the next one arrives. Skipping on age just replaced a correct-but-old reading with
+    // no reading at all, which is what left `bowl_fill_local` null after a restart with no cat
+    // traffic. The frame's own timestamp travels with the value instead.
     let image_path = Path::new(ai::EVENTS_DIR).join(&filename);
 
     foodlevel.record_attempt(now);
     match run_helper(Path::new(HELPER_PATH), Path::new(MODEL_PATH), &image_path, HELPER_TIMEOUT, shm) {
         Ok(score) => {
             let pct = (score * 100.0).round().clamp(0.0, 100.0) as u8;
-            foodlevel.record_reading(Reading { pct, computed_unix: ai::now_unix() });
+            foodlevel.record_reading(Reading { pct, computed_unix: ai::now_unix(), frame_unix: ts });
         }
         Err(e) => eprintln!("kibbled: foodlevel: {e}"),
     }

@@ -414,18 +414,19 @@ fn route(
 fn state_json(shm: &Shm, health: health::Health, foodlevel: &foodlevel::FoodLevel) -> String {
     let base = shm.snapshot().to_json();
     let exit_code = health::last_exit_code().map_or("null".to_string(), |c| c.to_string());
-    let (bowl_fill_local_pct, bowl_fill_local_ts) = match foodlevel.snapshot() {
-        Some(r) => (r.pct.to_string(), r.computed_unix.to_string()),
-        None => ("null".to_string(), "null".to_string()),
+    let (bowl_fill_local_pct, bowl_fill_local_ts, bowl_fill_local_frame) = match foodlevel.snapshot() {
+        Some(r) => (r.pct.to_string(), r.computed_unix.to_string(), r.frame_unix.to_string()),
+        None => ("null".to_string(), "null".to_string(), "null".to_string()),
     };
     format!(
-        r#"{},"kibbled_start_count":{},"kibbled_last_start_unix":{},"kibbled_last_exit_code":{},"bowl_fill_local":[{},{}]}}"#,
+        r#"{},"kibbled_start_count":{},"kibbled_last_start_unix":{},"kibbled_last_exit_code":{},"bowl_fill_local":[{},{}],"bowl_fill_local_frame_unix":{}}}"#,
         &base[..base.len() - 1],
         health.start_count,
         health.last_start_unix,
         exit_code,
         bowl_fill_local_pct,
         bowl_fill_local_ts,
+        bowl_fill_local_frame,
     )
 }
 

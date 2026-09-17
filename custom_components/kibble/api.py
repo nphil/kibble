@@ -78,6 +78,12 @@ class FeederState:
     desiccant_days: int
     feeding: bool
     bowl_fill: tuple[int | None, int | None]
+    #: Kibble's own bowl-fullness estimate, computed on-device from the camera by the same
+    #: vendor vision model the feeder itself uses -- the vendor only runs that model while its
+    #: cloud session is up (kibble docs/34), so this is the only reading that exists with the
+    #: cloud disabled. `(percent, frame_unix)`: the frame's own timestamp, i.e. when the bowl
+    #: actually looked like that.
+    bowl_fill_local: tuple[int | None, int | None]
     event_counter: int
     # Agent-process forensics, not device data: kibbled keeps these in tmpfs (`health.rs`), so
     # they reset to a single start on a feeder reboot. A count that climbs without a reboot is
@@ -90,6 +96,8 @@ class FeederState:
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> FeederState:
         fill = data.get("bowl_fill") or [None, None]
+        local = data.get("bowl_fill_local") or [None, None]
+        local_frame = data.get("bowl_fill_local_frame_unix")
         # `kibbled_last_exit_code` is null on a first, clean start -- a real 0 means "the
         # previous run exited successfully", which is a different fact, so neither collapses
         # into the other via `or`.
@@ -103,6 +111,10 @@ class FeederState:
             desiccant_days=int(data.get("desiccant_days") or 0),
             feeding=bool(data.get("feeding")),
             bowl_fill=(fill[0], fill[1] if len(fill) > 1 else None),
+            bowl_fill_local=(
+                local[0],
+                int(local_frame) if isinstance(local_frame, (int, float)) else None,
+            ),
             event_counter=int(data.get("event_counter") or 0),
             agent_starts=int(data.get("kibbled_start_count") or 0),
             agent_last_start=int(last_start) if isinstance(last_start, (int, float)) else None,

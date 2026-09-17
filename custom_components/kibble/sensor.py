@@ -44,15 +44,29 @@ class KibbleSensorDescription(SensorEntityDescription):
     """A sensor and how to read it out of a state snapshot."""
 
     value: Callable[[FeederState], int | str | None]
+    #: Extra state attributes for this sensor, or `None` for the common "just a value" case.
+    attributes: Callable[[FeederState], dict[str, Any]] | None = None
 
 
 SENSORS: tuple[KibbleSensorDescription, ...] = (
     KibbleSensorDescription(
+        # The vendor's own reading when there is one, else Kibble's own on-device estimate --
+        # with the Petkit cloud disabled the vendor never refreshes its copy (kibble docs/34),
+        # so this entity would otherwise be permanently unknown. `source`/`measured_at`
+        # attributes say which reading is showing and when the camera saw it.
         key="bowl_fill_1",
         translation_key="bowl_fill_1",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value=lambda s: s.bowl_fill[0],
+        value=lambda s: s.bowl_fill[0] if s.bowl_fill[0] is not None else s.bowl_fill_local[0],
+        attributes=lambda s: (
+            {"source": "feeder"}
+            if s.bowl_fill[0] is not None
+            else {
+                "source": "kibble",
+                "measured_at": _iso_or_none(s.bowl_fill_local[1]),
+            }
+        ),
     ),
     KibbleSensorDescription(
         key="bowl_fill_2",
@@ -231,6 +245,11 @@ class KibbleSensor(KibbleEntity, SensorEntity):
     @property
     def native_value(self) -> int | str | None:
         return self.entity_description.value(self.coordinator.data.state)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        hook = self.entity_description.attributes
+        return hook(self.coordinator.data.state) if hook is not None else None
 
 
 class KibbleSettingSensor(KibbleEntity, SensorEntity):

@@ -14,9 +14,12 @@
 //! straight through via another `PTRACE_SYSCALL` with no inspection. `read`/`write` are logged
 //! only when the fd resolves (via `/proc/<pid>/fd/<n>`, checked fresh on every event — no
 //! caching, so an fd reused for something else is never misattributed) to `--uart-path`
-//! (default `/dev/ttyS3`); `mq_timedsend`/`mq_timedreceive` are always logged, with the queue
-//! name resolved the same way and the envelope decoded per `docs/05-bus.md`'s corrected format
-//! (`u16 msg_id | u16 src` + payload, `agent/src/bus.rs`).
+//! (default `/dev/ttyS3`) — unless `--all-io` is given, in which case every fd's read/write is
+//! logged (tagged `IO_READ`/`IO_WRITE`, with the resolved path, instead of `UART_READ`/
+//! `UART_WRITE`), for tracing a process (`media`, `cloud`) whose relevant I/O isn't the UART --
+//! `docs/34-bowl-fill-surplus.md` Part 7. `mq_timedsend`/`mq_timedreceive` are always logged,
+//! with the queue name resolved the same way and the envelope decoded per `docs/05-bus.md`'s
+//! corrected format (`u16 msg_id | u16 src` + payload, `agent/src/bus.rs`).
 //!
 //! Deliberately does NOT set `PTRACE_O_TRACEFORK`/`PTRACE_O_TRACEVFORK`: `ctrl` periodically
 //! `system()`s a shell (e.g. `reset_wifi.sh`) while traced, and a forked child must run
@@ -206,6 +209,8 @@ struct Tracer {
     mem: MemReader,
     pid: Pid,
     uart_path: Vec<u8>,
+    /// `--all-io`: log every fd's read/write, not just `uart_path`'s.
+    all_io: bool,
     /// tid -> "currently inside a syscall" (i.e. the next stop for this tid is an EXIT stop).
     /// Absence means "seen no stop for this tid yet".
     tracked: HashMap<Pid, bool>,
@@ -254,12 +259,12 @@ impl Tracer {
             SYS_WRITE if ret > 0 => {
                 let fd = regs.orig_r0() as i32;
                 let len = (ret as usize).min(MAX_IO);
-                self.log_uart(tid, "UART_WRITE", fd, regs.r1(), len);
+                self.log_io(tid, "WRITE", fd, regs.r1(), len);
             }
             SYS_READ if ret > 0 => {
                 let fd = regs.orig_r0() as i32;
                 let len = (ret as usize).min(MAX_IO);
-                self.log_uart(tid, "UART_READ", fd, regs.r1(), len);
+                self.log_io(tid, "READ", fd, regs.r1(), len);
             }
             _ => {}
         }
@@ -287,14 +292,21 @@ impl Tracer {
         ));
     }
 
-    fn log_uart(&mut self, tid: Pid, tag: &str, fd: i32, ptr: u32, len: usize) {
+    /// Logs a `read`/`write` syscall's payload. Always for `uart_path` (tag `UART_<verb>`,
+    /// matching every prior capture's format byte for byte); for every other fd only when
+    /// `--all-io` was given (tag `IO_<verb>`) -- `media`/`cloud` have no UART fd at all, so
+    /// tracing either one's non-mqueue I/O (a file, a socket, `cloud`'s TLS write) needs this,
+    /// see `docs/34-bowl-fill-surplus.md` Part 7.
+    fn log_io(&mut self, tid: Pid, verb: &str, fd: i32, ptr: u32, len: usize) {
         let path = match fd_path(self.pid, fd) {
             Some(p) => p,
             None => return,
         };
-        if path != self.uart_path {
+        let is_uart = path == self.uart_path;
+        if !is_uart && !self.all_io {
             return;
         }
+        let tag = if is_uart { format!("UART_{verb}") } else { format!("IO_{verb}") };
         let bytes = match self.mem.read_at(ptr, len) {
             Ok(b) => b,
             Err(e) => {
@@ -408,7 +420,7 @@ fn open_log(path: &str) -> fs::File {
     })
 }
 
-fn run(pid: Pid, uart_path: &str, log_path: &str) {
+fn run(pid: Pid, uart_path: &str, log_path: &str, all_io: bool) {
     let log = open_log(log_path);
     let mem = MemReader::open(pid).unwrap_or_else(|e| {
         eprintln!("mqtrace: open /proc/{pid}/mem: {e} (is the pid correct, and are you root?)");
@@ -419,6 +431,7 @@ fn run(pid: Pid, uart_path: &str, log_path: &str) {
         mem,
         pid,
         uart_path: uart_path.as_bytes().to_vec(),
+        all_io,
         tracked: HashMap::new(),
         shutting_down: false,
     };
@@ -445,7 +458,7 @@ fn run(pid: Pid, uart_path: &str, log_path: &str) {
         std::process::exit(1);
     }
     t.log_line(&format!(
-        "ATTACH pid={pid} tids={:?} uart_path={uart_path} log={log_path}",
+        "ATTACH pid={pid} tids={:?} uart_path={uart_path} all_io={all_io} log={log_path}",
         seized
     ));
     eprintln!("mqtrace: attached to pid {pid}, {} thread(s): {:?}", seized.len(), seized);
@@ -461,7 +474,7 @@ fn run(pid: Pid, uart_path: &str, log_path: &str) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: mqtrace --pid <pid> [--timeout <secs>=240] [--uart-path <path>=/dev/ttyS3] [--log <path>=/tmp/mqtrace.log]"
+        "usage: mqtrace --pid <pid> [--timeout <secs>=240] [--uart-path <path>=/dev/ttyS3] [--log <path>=/tmp/mqtrace.log] [--all-io]"
     );
     std::process::exit(2);
 }
@@ -472,7 +485,7 @@ fn main() {
     let mut timeout_secs: u32 = 240;
     let mut uart_path = "/dev/ttyS3".to_string();
     let mut log_path = "/tmp/mqtrace.log".to_string();
-
+    let mut all_io = false;
     let mut i = 1;
     while i < args.len() {
         let val = |i: usize| args.get(i).unwrap_or_else(|| usage());
@@ -493,6 +506,9 @@ fn main() {
                 log_path = val(i + 1).clone();
                 i += 1;
             }
+            "--all-io" => {
+                all_io = true;
+            }
             _ => usage(),
         }
         i += 1;
@@ -502,5 +518,5 @@ fn main() {
     install_signal_handlers();
     unsafe { libc::alarm(timeout_secs) };
 
-    run(pid, &uart_path, &log_path);
+    run(pid, &uart_path, &log_path, all_io);
 }
