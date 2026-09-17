@@ -127,6 +127,7 @@ mod md5;
 mod persist;
 mod localtime;
 mod push;
+mod resetguard;
 mod rfc3640;
 mod ring;
 mod rtsp;
@@ -176,6 +177,7 @@ fn main() {
             "kibbled: could not back up /opt/user.conf: {e} (continuing — settings writes never touch that file)"
         ),
     }
+    resetguard::install();
     eprintln!(
         "kibbled: start_count={} (this boot; {} = 1 means first start since /opt/kibble/health.json was last cleared)",
         health.start_count,

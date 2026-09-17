@@ -10,25 +10,36 @@
 //! already running with `ctrl_interface=/var/run/wpa_supplicant` and `update_config=1`
 //! (confirmed live), so `wpa_cli` can add, select and remove networks against the live process
 //! with no flash write and no vendor process touched at all. `/tmp/wpa_supplicant.conf` is
-//! tmpfs and gets fully regenerated from the vendor's own stored credentials by its
-//! `wifi_connect.sh` on every boot (docs/02-boot.md), so it is never this module's persistence
-//! layer -- `/opt/kibble/wifi.json` is (see "Boot re-apply and reconcile" below), exactly the
-//! same division of responsibility `desired.rs`/`persist.rs` use for device settings and
-//! `cloud.rs` uses for routing state.
+//! tmpfs, never survives a reboot, and holds whatever `wpa_supplicant` was last told to
+//! `save_config` to (confirmed live: `/proc/<wpa_supplicant-pid>/cmdline` shows `-c
+//! /tmp/wpa_supplicant.conf`, and `/opt/wpa_supplicant.conf` does not exist on this device at
+//! all). The vendor's own `app/script/wifi_connect.sh` (both copies read in full -- see
+//! `docs/35-wifi-tug-of-war.md`) does **not** itself decrypt or regenerate credentials: it only
+//! picks between `/tmp/wpa_supplicant.conf` (if present) and a static fallback path, then
+//! launches `wpa_supplicant` pointed at whichever exists. Something upstream of that script
+//! (almost certainly `ctrl`, decrypting `/opt/user.conf` at its own startup -- see
+//! `docs/35-wifi-tug-of-war.md` for why this is inferred, not disassembly-proven) must be what
+//! actually populates `/tmp/wpa_supplicant.conf`'s real content fresh on every boot. Either way,
+//! this module never touches that file directly -- `/opt/kibble/wifi.json` is this module's own
+//! persistence layer (see "Boot re-apply and reconcile" below), exactly the same division of
+//! responsibility `desired.rs`/`persist.rs` use for device settings and `cloud.rs` uses for
+//! routing state.
 //!
 //! ## The fail-safe connect sequence
 //!
 //! `add_network` (never reusing the vendor's id 0, and never reusing another SSID's id) ->
 //! `set_network` ssid/psk/key_mgmt -> `enable_network` -> `select_network` (which disables
 //! every *other* configured network, confirmed live and by this module's own `list_networks`
-//! wrapper) -> poll `status` for `wpa_state=COMPLETED` *on that id* -> force a fresh DHCP lease
-//! (kill + respawn `udhcpc`, matching the vendor's own `wifi_connect.sh` -- see `cloud.rs`'s
-//! module docs for the live citation that a stale lease does not just self-heal) -> poll
-//! `ip -4 addr show wlan0` for a lease, all inside one [`CONNECT_TIMEOUT`] budget shared by both
-//! waits, not 30s apiece. Any failure from `select_network` onward re-`select_network`s whatever
-//! id was active before this attempt and reports why in `last_error` -- the device is never left
-//! associating to nowhere. A wrong password fails the *first* wait (association never reaches
-//! `COMPLETED`); a right password but no reachable DHCP server fails the *second*.
+//! wrapper) -> poll `status` for `wpa_state=COMPLETED` *on that id* -> a conditional fresh DHCP
+//! lease ([`needs_dhcp_refresh`]: kill + respawn `udhcpc`, matching the vendor's own
+//! `wifi_connect.sh` -- see `cloud.rs`'s module docs for the live-confirmed citation that a
+//! stale lease does not just self-heal -- but only when the interface doesn't already hold one
+//! for this exact network) -> poll `ip -4 addr show wlan0` for a lease, all inside one
+//! [`CONNECT_TIMEOUT`] budget shared by both waits, not 30s apiece. Any failure from
+//! `select_network` onward re-`select_network`s whatever id was active before this attempt and
+//! reports why in `last_error` -- the device is never left associating to nowhere. A wrong
+//! password fails the *first* wait (association never reaches `COMPLETED`); a right password
+//! but no reachable DHCP server fails the *second*.
 //!
 //! An existing Kibble-owned network (any id but the vendor's `0`) matching the requested SSID is
 //! reused -- its `psk` is updated in place -- rather than adding a duplicate every time the same
@@ -49,16 +60,38 @@
 //!
 //! ## Boot re-apply and reconcile
 //!
-//! The vendor's own `wifi_connect.sh` reruns at boot and reselects *its own* stored network
-//! (`docs/02-boot.md`), so a Kibble-desired network never wins a boot race on its own. Once
-//! `wpa_supplicant`'s control socket appears, [`spawn_reconciler`] re-runs the connect sequence
-//! once if `/opt/kibble/wifi.json` names a different SSID than the live one, then rechecks every
-//! [`RECONCILE_INTERVAL`] for the rest of the process's life (the vendor's own reconnect logic
-//! can reselect its own network at any time, not just at boot). A target that keeps failing backs
-//! off after [`MAX_CONSECUTIVE_FAILURES`] consecutive attempts rather than flapping the link
-//! every tick forever -- but a *new* desired target (a fresh `connect()`, even to a network that
-//! previously failed) always gets a fresh run of attempts, since backing off is about not
-//! hammering the *same* bad target, not about refusing to ever try again.
+//! The device always boots onto the vendor's own network first (confirmed live: `wpa_supplicant`
+//! comes up with the vendor's id 0 selected, before Kibble ever runs), so a Kibble-desired
+//! network never wins a boot race on its own. Once `wpa_supplicant`'s control socket appears,
+//! [`spawn_reconciler`] re-runs the connect sequence once if `/opt/kibble/wifi.json` names a
+//! different SSID than the live one, then rechecks every [`RECONCILE_INTERVAL`] for the rest of
+//! the process's life -- the vendor's own `ctrl` process independently re-`select_network`s its
+//! own id 0 during ordinary operation too, confirmed live (`docs/35-wifi-tug-of-war.md`), not
+//! just at boot, so this has to keep winning the fight for as long as both processes run.
+//!
+//! Two things keep that fight from being disruptive. First, [`link_drifted`] only calls it a
+//! real drift once the link has *settled* onto something other than the desired SSID -- fully
+//! `COMPLETED` on a different network, or genuinely disconnected -- never while `wpa_supplicant`
+//! is still mid-transition (`SCANNING`/`ASSOCIATING`/`*_HANDSHAKE`, toward either target):
+//! racing our own `select_network` against a transition already in progress never resolves
+//! faster, it just adds a second concurrent state change to the same control socket. Second, a
+//! fix that doesn't even survive one full [`RECONCILE_INTERVAL`] before drifting again -- the
+//! signature of actively fighting another supervisor, not a one-off blip -- earns a
+//! [`REDRIFT_COOLDOWN_TICKS`] cooldown before the next attempt, so the two sides settle into a
+//! bounded, predictable retry cadence instead of reconnecting (and restarting DHCP) on every
+//! single tick; a fix that *does* stick clears the cooldown immediately on the next healthy
+//! tick. Separately, a target that keeps failing outright (e.g. a wrong password) backs off
+//! after [`MAX_CONSECUTIVE_FAILURES`] consecutive attempts -- but a *new* desired target (a
+//! fresh `connect()`, even to a network that previously failed) always gets a fresh run of
+//! attempts, since backing off there is about not hammering the *same* bad target, not about
+//! refusing to ever try again.
+//!
+//! [`connect_with_timeout`] also only restarts DHCP ([`needs_dhcp_refresh`]) when the interface
+//! doesn't already show a lease or the target network is one this process hasn't already
+//! confirmed a lease on -- re-selecting straight back to a network we never actually finished
+//! leaving (the vendor's own re-select frequently loses the race before `udhcpc` even notices)
+//! must not force a fresh DHCP transaction, since that is what re-adds the default route and
+//! (`cloud.rs`'s fail-safe rollback) re-enables the Petkit cloud on every such cycle.
 
 use std::collections::HashMap;
 use std::fs;
@@ -81,11 +114,13 @@ pub const WIFI_IFACE: &str = "wlan0";
 const WPA_CLI: &str = "/soc/bin/wpa_cli";
 const STATE_PATH: &str = "/opt/kibble/wifi.json";
 const CTRL_SOCK: &str = "/var/run/wpa_supplicant/wlan0";
-/// `wpa_supplicant.conf`'s network id 0 is always the vendor's own -- regenerated from its
-/// encrypted store by `wifi_connect.sh` on every boot (docs/02-boot.md), confirmed live
-/// (`wpa_cli list_networks` -> `0	IoT	any	[CURRENT]` on a stock, unmodified device). Kibble
-/// adds every network of its own at id >= 1 and never rewrites, disables-permanently, or
-/// removes id 0.
+/// `wpa_supplicant.conf`'s network id 0 is always the vendor's own -- the SSID the phone app
+/// provisioned (confirmed live: `wpa_cli list_networks` -> `0	IoT	any	[CURRENT]` on a stock,
+/// unmodified device). Its content is re-populated fresh every boot (`/tmp/wpa_supplicant.conf`
+/// is tmpfs), almost certainly by `ctrl` decrypting `/opt/user.conf` at its own startup, not by
+/// `wifi_connect.sh` itself (see `docs/35-wifi-tug-of-war.md` for the live script content that
+/// rules the latter out). Kibble adds every network of its own at id >= 1 and never rewrites,
+/// disables-permanently, or removes id 0.
 const VENDOR_NETWORK_ID: u32 = 0;
 
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
@@ -105,8 +140,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SCAN_SETTLE: Duration = Duration::from_secs(2);
 /// After this many consecutive reconcile failures *against the same desired target*, stop
 /// actively re-selecting every tick -- `last_error` (surfaced via `GET /wifi`) already explains
-/// why, and hammering a bad password every 60s would just flap the link for no benefit.
+/// why, and hammering a bad password every 60s would just flap the link for no benefit. This is
+/// for a target that keeps failing outright (e.g. a wrong password); see
+/// [`REDRIFT_COOLDOWN_TICKS`] for the separate cooldown that applies when a fix *succeeds* but
+/// doesn't stick.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+/// Ticks (each one real [`RECONCILE_INTERVAL`]) to sit out after a reconcile fix doesn't even
+/// survive one full interval before drifting again -- the signature of actively fighting another
+/// supervisor over the same association, not a one-off blip. Applied once per rapid re-drift
+/// (not compounded), and cleared immediately the moment a fix survives a full interval (see
+/// `reconcile_once`), so a network something else keeps contesting is still reclaimed every few
+/// minutes -- this is a cooldown, never the permanent-until-the-target-changes give-up
+/// [`MAX_CONSECUTIVE_FAILURES`] applies to outright failures.
+const REDRIFT_COOLDOWN_TICKS: u32 = 3;
 
 /// Serialises every `wpa_cli`/`ip`/dhcp mutation between the HTTP handler thread and the
 /// reconciler thread, exactly like `cloud.rs`'s `LOCK` and `persist.rs`'s `WRITE_LOCK`. Same
@@ -478,6 +524,46 @@ fn current_signal_dbm(runner: &mut impl Runner, current_bssid: Option<&str>) -> 
         .map(|r| r.signal_dbm)
 }
 
+/// `wpa_state` values that mean "still actively trying to get somewhere" -- neither a settled
+/// wrong-network association nor a settled failure. Racing our own `select_network` against a
+/// transition already in progress (toward *either* target) never resolves it faster, it just
+/// hands the control socket a second concurrent state change to reconcile.
+fn is_transient_state(wpa_state: &str) -> bool {
+    matches!(
+        wpa_state,
+        "SCANNING" | "ASSOCIATING" | "AUTHENTICATING" | "ASSOCIATED" | "4WAY_HANDSHAKE"
+            | "GROUP_HANDSHAKE"
+    )
+}
+
+/// Whether this tick's live status is worth reacting to at all: the live SSID must actually not
+/// be the desired one -- never true while `wpa_supplicant` already has the right target loaded,
+/// even mid-handshake, since that is its own reassociation in progress, not another supervisor's
+/// doing -- and the link must have settled into a stable, "usable-or-broken" state (fully
+/// `COMPLETED` on the wrong network, or a settled disconnect) rather than still transitioning.
+fn link_drifted(current: Option<&Status>, desired_ssid: &str) -> bool {
+    match current {
+        Some(s) if s.ssid.as_deref() == Some(desired_ssid) => false,
+        Some(s) if is_transient_state(&s.wpa_state) => false,
+        Some(_) => true,
+        None => true,
+    }
+}
+
+/// Whether the fail-safe sequence needs a fresh DHCP lease after a successful (re)association,
+/// or whether the interface's existing address can be trusted as-is. Refreshing unconditionally
+/// on every reconnect -- including one that only ever left, then immediately returned to, the
+/// *same* network another supervisor briefly stole the association from -- is exactly what
+/// re-adds the default route and (`cloud.rs`'s fail-safe rollback) re-enables the Petkit cloud on
+/// every such cycle. `known_good_id` is the id this process last confirmed a working lease on
+/// (`None` for a freshly started process, or any network never leased before); `has_ip` is
+/// whether the interface already shows an address right now, checked before touching DHCP at
+/// all. A network this process has never confirmed a lease for always gets a fresh one, even if
+/// some stale, unrelated address happens to still be sitting on the interface.
+fn needs_dhcp_refresh(has_ip: bool, known_good_id: Option<u32>, id: u32) -> bool {
+    !has_ip || known_good_id != Some(id)
+}
+
 /// Ensures a network for `ssid` exists, reusing an existing Kibble-owned entry (any id but the
 /// vendor's) if one matches. Returns its id.
 fn ensure_network(
@@ -538,6 +624,7 @@ fn connect_with_timeout(
     runner: &mut impl Runner,
     ssid: &str,
     psk: Option<&str>,
+    known_good_id: Option<u32>,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Status, Error> {
@@ -563,8 +650,13 @@ fn connect_with_timeout(
         return Err(Error::AssociationFailed { rolled_back_to: previous_id, rollback_error });
     }
 
-    if let Err(e) = runner.restart_dhcp() {
-        eprintln!("kibbled: wifi: dhcp restart failed, still checking for a lease: {e}");
+    let has_ip = get_ip(runner).is_some();
+    if needs_dhcp_refresh(has_ip, known_good_id, id) {
+        if let Err(e) = runner.restart_dhcp() {
+            eprintln!("kibbled: wifi: dhcp restart failed, still checking for a lease: {e}");
+        }
+    } else {
+        eprintln!("kibbled: wifi: network {id} already has a valid lease, skipping dhcp refresh");
     }
     let mut leased = false;
     loop {
@@ -736,6 +828,14 @@ pub fn spawn_reconciler() {
         boot_reapply(CONNECT_TIMEOUT, POLL_INTERVAL);
         let mut consecutive_failures = 0u32;
         let mut last_target: Option<(String, Option<String>)> = None;
+        // The id this reconciler last confirmed a working DHCP lease on, and how many ticks
+        // left to sit out after a fix that didn't survive one interval -- see
+        // `needs_dhcp_refresh`/`REDRIFT_COOLDOWN_TICKS`. Both start empty: `boot_reapply` above
+        // already ran its own independent connect attempt (or found nothing to do), so the very
+        // first drift this loop ever handles conservatively refreshes DHCP once, then tracks
+        // accurately from there.
+        let mut known_good_id: Option<u32> = None;
+        let mut cooldown_remaining = 0u32;
         // Association/signal/scan results are live radio state; diff the exact bytes HA would
         // receive on this thread's existing tick and mark only on change (same as cloud.rs).
         let (mut last_status, mut last_scan) = (status_json(), scan_json());
@@ -746,6 +846,8 @@ pub fn spawn_reconciler() {
                 &mut runner,
                 &mut consecutive_failures,
                 &mut last_target,
+                &mut known_good_id,
+                &mut cooldown_remaining,
                 CONNECT_TIMEOUT,
                 POLL_INTERVAL,
             );
@@ -793,7 +895,8 @@ fn boot_reapply(timeout: Duration, poll_interval: Duration) {
         return;
     }
     eprintln!("kibbled: wifi: boot re-apply: selecting desired network {ssid}");
-    let outcome = connect_with_timeout(&mut runner, &ssid, desired.psk.as_deref(), timeout, poll_interval);
+    let outcome =
+        connect_with_timeout(&mut runner, &ssid, desired.psk.as_deref(), None, timeout, poll_interval);
     match &outcome {
         Ok(s) => eprintln!("kibbled: wifi: boot re-apply succeeded, state={}", s.wpa_state),
         Err(e) => eprintln!("kibbled: wifi: boot re-apply failed: {e}"),
@@ -825,10 +928,58 @@ fn effective_failures(
     }
 }
 
+/// What one reconcile tick should do, decided by [`decide_reconcile_tick`] purely from the live
+/// drift signal and the bookkeeping [`reconcile_once`] threads across ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Not drifted -- either genuinely healthy, or the vendor's own transition hasn't settled
+    /// into anything worth reacting to yet ([`link_drifted`]).
+    Healthy,
+    /// Drifted, but sitting out a [`REDRIFT_COOLDOWN_TICKS`] cooldown from a fix that didn't
+    /// survive one full interval last time.
+    CoolingOff,
+    /// Drifted, but this exact target has already failed [`MAX_CONSECUTIVE_FAILURES`] times.
+    BackedOff,
+    /// Drifted, past every gate above -- run the fail-safe connect sequence.
+    Attempt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconcileTick {
+    action: ReconcileAction,
+    consecutive_failures: u32,
+    cooldown_remaining: u32,
+}
+
+/// The pure decision for one reconcile tick, given the live drift signal and the two counters
+/// [`reconcile_once`] threads across ticks. Isolates every gate above the actual `Runner` call
+/// (drifted? cooling off? backed off? attempt) into one place with no file I/O or `Runner`
+/// involved, so the full drifted -> cooldown -> failure-cap -> attempt sequence -- the part that
+/// actually matters to get right -- is directly testable (see the tests below) without a real
+/// `/opt/kibble/wifi.json` or a fake `Runner`.
+fn decide_reconcile_tick(drifted: bool, consecutive_failures: u32, cooldown_remaining: u32) -> ReconcileTick {
+    if !drifted {
+        return ReconcileTick { action: ReconcileAction::Healthy, consecutive_failures: 0, cooldown_remaining: 0 };
+    }
+    if cooldown_remaining > 0 {
+        return ReconcileTick {
+            action: ReconcileAction::CoolingOff,
+            consecutive_failures,
+            cooldown_remaining: cooldown_remaining - 1,
+        };
+    }
+    if !should_attempt(drifted, consecutive_failures) {
+        return ReconcileTick { action: ReconcileAction::BackedOff, consecutive_failures, cooldown_remaining };
+    }
+    ReconcileTick { action: ReconcileAction::Attempt, consecutive_failures, cooldown_remaining }
+}
+
 fn reconcile_once(
     runner: &mut impl Runner,
     consecutive_failures: &mut u32,
     last_target: &mut Option<(String, Option<String>)>,
+    known_good_id: &mut Option<u32>,
+    cooldown_remaining: &mut u32,
     timeout: Duration,
     poll_interval: Duration,
 ) {
@@ -837,31 +988,54 @@ fn reconcile_once(
     let Some(ssid) = desired.ssid.clone() else {
         *last_target = None;
         *consecutive_failures = 0;
+        *cooldown_remaining = 0;
         return;
     };
     let target = (ssid.clone(), desired.psk.clone());
     *consecutive_failures = effective_failures(last_target, &target, *consecutive_failures);
+    if last_target.as_ref() != Some(&target) {
+        *cooldown_remaining = 0; // a genuinely new target always gets an immediate fresh attempt
+    }
     *last_target = Some(target);
 
     let current = get_status(runner).ok();
-    let drifted = !matches!(&current, Some(s) if s.wpa_state == "COMPLETED" && s.ssid.as_deref() == Some(ssid.as_str()));
-    if !drifted {
-        *consecutive_failures = 0;
-        return; // healthy tick -- silent, matching cloud.rs's reconcile philosophy
-    }
-    if !should_attempt(drifted, *consecutive_failures) {
-        return; // backed off on this exact target -- last_error already explains why
+    let drifted = link_drifted(current.as_ref(), &ssid);
+    let tick = decide_reconcile_tick(drifted, *consecutive_failures, *cooldown_remaining);
+    *consecutive_failures = tick.consecutive_failures;
+    *cooldown_remaining = tick.cooldown_remaining;
+    match tick.action {
+        ReconcileAction::Healthy => return, // silent, matching cloud.rs's reconcile philosophy
+        ReconcileAction::BackedOff => return, // last_error already explains why
+        ReconcileAction::CoolingOff => {
+            eprintln!(
+                "kibbled: wifi reconcile: still drifted from {ssid} but cooling off \
+                 ({} tick(s) left) after a recent rapid re-drift",
+                *cooldown_remaining
+            );
+            return;
+        }
+        ReconcileAction::Attempt => {}
     }
 
     eprintln!("kibbled: wifi reconcile: current SSID drifted from desired {ssid}, re-selecting");
-    match connect_with_timeout(runner, &ssid, desired.psk.as_deref(), timeout, poll_interval) {
-        Ok(_) => {
+    match connect_with_timeout(
+        runner,
+        &ssid,
+        desired.psk.as_deref(),
+        *known_good_id,
+        timeout,
+        poll_interval,
+    ) {
+        Ok(s) => {
             *consecutive_failures = 0;
+            *cooldown_remaining = REDRIFT_COOLDOWN_TICKS;
+            *known_good_id = s.id;
             let _ = save(&Desired { ssid: Some(ssid.clone()), psk: desired.psk, last_error: None });
             eprintln!("kibbled: wifi reconcile: re-selected {ssid}");
         }
         Err(e) => {
             *consecutive_failures += 1;
+            *cooldown_remaining = 0;
             let msg = e.to_string();
             let note = if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 " (giving up until the desired network changes)"
@@ -897,7 +1071,7 @@ pub fn scan_json() -> String {
 pub fn connect(ssid: &str, psk: Option<&str>) -> Result<Status, Error> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut runner = RealRunner;
-    let result = connect_with_timeout(&mut runner, ssid, psk, CONNECT_TIMEOUT, POLL_INTERVAL);
+    let result = connect_with_timeout(&mut runner, ssid, psk, None, CONNECT_TIMEOUT, POLL_INTERVAL);
     let last_error = result.as_ref().err().map(|e| e.to_string());
     let _ = save(&Desired { ssid: Some(ssid.to_string()), psk: psk.map(str::to_string), last_error });
     result
@@ -1163,13 +1337,14 @@ mod tests {
                 Ok("wpa_state=COMPLETED\nid=5\nssid=BEAST_ROUTER\n"), // poll: associated
                 Ok("wpa_state=COMPLETED\nid=5\nssid=BEAST_ROUTER\n"), // final status returned to the caller
             ],
-            vec![Ok(REAL_IP_ADDR_SHOW)],
+            vec![Ok(REAL_IP_ADDR_SHOW), Ok(REAL_IP_ADDR_SHOW)],
         );
 
         let result = connect_with_timeout(
             &mut runner,
             "BEAST_ROUTER",
             Some("test-password"),
+            None,
             Duration::from_millis(200),
             Duration::from_millis(5),
         );
@@ -1209,10 +1384,10 @@ mod tests {
                 Ok("wpa_state=COMPLETED\nid=3\nssid=BEAST_ROUTER\n"), // poll: associated
                 Ok("wpa_state=COMPLETED\nid=3\nssid=BEAST_ROUTER\n"), // final status returned to the caller
             ],
-            vec![Ok(REAL_IP_ADDR_SHOW)],
+            vec![Ok(REAL_IP_ADDR_SHOW), Ok(REAL_IP_ADDR_SHOW)],
         );
         let result = connect_with_timeout(
-            &mut runner, "BEAST_ROUTER", Some("corrected-password"),
+            &mut runner, "BEAST_ROUTER", Some("corrected-password"), None,
             Duration::from_millis(200), Duration::from_millis(5),
         );
         assert!(matches!(result, Ok(s) if s.id == Some(3) && s.wpa_state == "COMPLETED"));
@@ -1233,10 +1408,10 @@ mod tests {
                 Ok("wpa_state=COMPLETED\nid=2\nssid=Guest\n"), // poll: associated
                 Ok("wpa_state=COMPLETED\nid=2\nssid=Guest\n"), // final status returned to the caller
             ],
-            vec![Ok(REAL_IP_ADDR_SHOW)],
+            vec![Ok(REAL_IP_ADDR_SHOW), Ok(REAL_IP_ADDR_SHOW)],
         );
         let result = connect_with_timeout(
-            &mut runner, "Guest", None, Duration::from_millis(200), Duration::from_millis(5),
+            &mut runner, "Guest", None, None, Duration::from_millis(200), Duration::from_millis(5),
         );
         assert!(matches!(result, Ok(s) if s.id == Some(2) && s.wpa_state == "COMPLETED"));
         assert!(runner.psk_calls.is_empty());
@@ -1252,7 +1427,7 @@ mod tests {
             vec![],
         );
         let result = connect_with_timeout(
-            &mut runner, "BEAST_ROUTER", None, Duration::from_millis(200), Duration::from_millis(5),
+            &mut runner, "BEAST_ROUTER", None, None, Duration::from_millis(200), Duration::from_millis(5),
         );
         assert!(matches!(result, Err(Error::PskRequired)));
         assert!(!flat(&runner.wpa_calls).iter().any(|c| c.first() == Some(&"select_network")));
@@ -1289,7 +1464,7 @@ mod tests {
             vec![],
         );
         let result = connect_with_timeout(
-            &mut runner, "BEAST_ROUTER", Some("wrong-password"),
+            &mut runner, "BEAST_ROUTER", Some("wrong-password"), None,
             Duration::from_millis(30), Duration::from_millis(3),
         );
         assert!(matches!(result, Err(Error::AssociationFailed { rolled_back_to: Some(0), rollback_error: None })));
@@ -1319,7 +1494,7 @@ mod tests {
             vec![Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok("")], // no `inet` line, ever
         );
         let result = connect_with_timeout(
-            &mut runner, "BEAST_ROUTER", Some("right-password-bad-dhcp"),
+            &mut runner, "BEAST_ROUTER", Some("right-password-bad-dhcp"), None,
             Duration::from_millis(30), Duration::from_millis(3),
         );
         assert!(matches!(result, Err(Error::NoDhcpLease { rolled_back_to: Some(0), rollback_error: None })));
@@ -1348,13 +1523,69 @@ mod tests {
             vec![],
         );
         let result = connect_with_timeout(
-            &mut runner, "BEAST_ROUTER", Some("x"),
+            &mut runner, "BEAST_ROUTER", Some("x"), None,
             Duration::from_millis(10), Duration::from_millis(2),
         );
         assert!(matches!(result, Err(Error::AssociationFailed { rolled_back_to: None, .. })));
         assert_eq!(flat(&runner.wpa_calls).last(), Some(&vec!["save_config"]));
         let calls = flat(&runner.wpa_calls);
         assert!(calls.contains(&vec!["select_network", "0"]));
+    }
+
+    // ---- dhcp refresh gating (integration, via connect_with_timeout) -------------------------
+
+    #[test]
+    fn connect_skips_dhcp_refresh_when_already_leased_on_the_target_network() {
+        let existing_list = "network id / ssid / bssid / flags\n0\tIoT\tany\t[CURRENT]\n3\tBEAST_ROUTER\tany\t[DISABLED]\n";
+        let mut runner = FakeRunner::new(
+            vec![
+                Ok("wpa_state=COMPLETED\nid=0\nssid=IoT\n"), // previous_id -- the vendor briefly took over
+                Ok(existing_list),                           // ensure_network finds the existing id 3
+                Ok("OK"),                                    // enable_network 3
+                Ok("OK"),                                    // select_network 3
+                Ok("OK"),                                    // save_config
+                Ok("wpa_state=COMPLETED\nid=3\nssid=BEAST_ROUTER\n"), // poll: associated
+                Ok("wpa_state=COMPLETED\nid=3\nssid=BEAST_ROUTER\n"), // final status returned to the caller
+            ],
+            vec![Ok(REAL_IP_ADDR_SHOW), Ok(REAL_IP_ADDR_SHOW)],
+        );
+        // known_good_id already names id 3 -- this process leased it before the vendor's brief
+        // takeover, and the interface still shows an address, so reclaiming it needs no new
+        // DHCP transaction (the exact case that used to re-add the default route and re-enable
+        // the Petkit cloud on every vendor reselect).
+        let result = connect_with_timeout(
+            &mut runner, "BEAST_ROUTER", None, Some(3), Duration::from_millis(200), Duration::from_millis(5),
+        );
+        assert!(matches!(result, Ok(s) if s.id == Some(3) && s.wpa_state == "COMPLETED"));
+        assert_eq!(runner.dhcp_restarts, 0, "must not restart dhcp when the target network already has a valid lease");
+    }
+
+    #[test]
+    fn connect_still_refreshes_dhcp_when_reconnecting_to_a_network_never_leased_under_that_id() {
+        let mut runner = FakeRunner::new(
+            vec![
+                Ok("wpa_state=COMPLETED\nid=0\nssid=IoT\n"),
+                Ok(REAL_LIST_NETWORKS_ONE_ENTRY),
+                Ok("5\n"),
+                Ok("OK"),
+                Ok("OK"),
+                Ok("OK"),
+                Ok("OK"),
+                Ok("OK"),
+                Ok("wpa_state=COMPLETED\nid=5\nssid=BEAST_ROUTER\n"),
+                Ok("wpa_state=COMPLETED\nid=5\nssid=BEAST_ROUTER\n"),
+            ],
+            vec![Ok(REAL_IP_ADDR_SHOW), Ok(REAL_IP_ADDR_SHOW)],
+        );
+        // known_good_id names a *different* network (e.g. one this process leased before the
+        // desired SSID was last changed) -- a stale address for that old network sitting on the
+        // interface must never be trusted for a network never confirmed under this id.
+        let result = connect_with_timeout(
+            &mut runner, "BEAST_ROUTER", Some("test-password"), Some(99),
+            Duration::from_millis(200), Duration::from_millis(5),
+        );
+        assert!(matches!(result, Ok(s) if s.id == Some(5)));
+        assert_eq!(runner.dhcp_restarts, 1);
     }
 
     // ---- forget ------------------------------------------------------------------------------
@@ -1399,6 +1630,73 @@ mod tests {
         let result = forget_network(&mut runner, "BEAST_ROUTER");
         assert!(result.is_ok());
         assert!(flat(&runner.wpa_calls).contains(&vec!["remove_network", "4"]));
+    }
+
+    // ---- link drift classification (pure decision) --------------------------------------------
+
+    fn status_with(ssid: Option<&str>, id: Option<u32>, wpa_state: &str) -> Status {
+        Status { ssid: ssid.map(str::to_string), bssid: None, freq_mhz: None, id, wpa_state: wpa_state.to_string() }
+    }
+
+    #[test]
+    fn link_drifted_false_when_completed_on_the_desired_network() {
+        let s = status_with(Some("BEAST_ROUTER"), Some(1), "COMPLETED");
+        assert!(!link_drifted(Some(&s), "BEAST_ROUTER"));
+    }
+
+    #[test]
+    fn link_drifted_false_while_reassociating_to_the_desired_network() {
+        // A normal rekey/roam on our own network is still pursuing the right target -- must not
+        // be fought just because `wpa_state` hasn't reached `COMPLETED` yet.
+        let s = status_with(Some("BEAST_ROUTER"), Some(1), "4WAY_HANDSHAKE");
+        assert!(!link_drifted(Some(&s), "BEAST_ROUTER"));
+    }
+
+    #[test]
+    fn link_drifted_false_while_transitioning_toward_a_different_network() {
+        // The vendor's own reselect is in flight but hasn't settled yet -- wait for it rather
+        // than adding a second concurrent state change to the same control socket.
+        for state in
+            ["SCANNING", "ASSOCIATING", "AUTHENTICATING", "ASSOCIATED", "4WAY_HANDSHAKE", "GROUP_HANDSHAKE"]
+        {
+            let s = status_with(Some("IoT"), Some(0), state);
+            assert!(!link_drifted(Some(&s), "BEAST_ROUTER"), "must not react mid-{state}");
+        }
+    }
+
+    #[test]
+    fn link_drifted_true_when_settled_on_a_different_completed_network() {
+        let s = status_with(Some("IoT"), Some(0), "COMPLETED");
+        assert!(link_drifted(Some(&s), "BEAST_ROUTER"));
+    }
+
+    #[test]
+    fn link_drifted_true_when_settled_disconnected() {
+        let s = status_with(None, None, "DISCONNECTED");
+        assert!(link_drifted(Some(&s), "BEAST_ROUTER"));
+    }
+
+    #[test]
+    fn link_drifted_true_when_status_is_unreadable() {
+        assert!(link_drifted(None, "BEAST_ROUTER"));
+    }
+
+    // ---- dhcp refresh gating (pure decision) ---------------------------------------------------
+
+    #[test]
+    fn needs_dhcp_refresh_false_when_ip_present_and_network_unchanged() {
+        assert!(!needs_dhcp_refresh(true, Some(3), 3));
+    }
+
+    #[test]
+    fn needs_dhcp_refresh_true_when_no_ip_even_on_a_known_good_network() {
+        assert!(needs_dhcp_refresh(false, Some(3), 3));
+    }
+
+    #[test]
+    fn needs_dhcp_refresh_true_when_the_target_was_never_confirmed_leased() {
+        assert!(needs_dhcp_refresh(true, None, 3));
+        assert!(needs_dhcp_refresh(true, Some(9), 3));
     }
 
     // ---- reconcile backoff (pure decision) ---------------------------------------------------
@@ -1469,6 +1767,74 @@ mod tests {
         let fixed_target = ("BEAST_ROUTER".to_string(), Some("corrected".to_string()));
         consecutive_failures = effective_failures(&last_target, &fixed_target, consecutive_failures);
         assert!(should_attempt(drifted, consecutive_failures), "a changed target must not stay backed off");
+    }
+
+    // ---- decide_reconcile_tick (pure decision) -------------------------------------------------
+
+    #[test]
+    fn decide_reconcile_tick_is_healthy_and_resets_when_not_drifted() {
+        let tick = decide_reconcile_tick(false, 2, 3);
+        assert_eq!(tick.action, ReconcileAction::Healthy);
+        assert_eq!(tick.consecutive_failures, 0);
+        assert_eq!(tick.cooldown_remaining, 0);
+    }
+
+    #[test]
+    fn decide_reconcile_tick_cools_off_and_counts_down_when_drifted_during_a_cooldown() {
+        let tick = decide_reconcile_tick(true, 0, 2);
+        assert_eq!(tick.action, ReconcileAction::CoolingOff);
+        assert_eq!(tick.cooldown_remaining, 1, "must count down by exactly one tick");
+        assert_eq!(tick.consecutive_failures, 0, "a cooldown tick is not a hard failure");
+    }
+
+    #[test]
+    fn decide_reconcile_tick_attempts_when_drifted_with_no_cooldown_and_under_the_cap() {
+        let tick = decide_reconcile_tick(true, 0, 0);
+        assert_eq!(tick.action, ReconcileAction::Attempt);
+    }
+
+    #[test]
+    fn decide_reconcile_tick_backs_off_when_drifted_but_the_failure_cap_is_reached() {
+        let tick = decide_reconcile_tick(true, MAX_CONSECUTIVE_FAILURES, 0);
+        assert_eq!(tick.action, ReconcileAction::BackedOff);
+    }
+
+    /// Composes `decide_reconcile_tick` across a realistic multi-tick sequence -- exactly what
+    /// `reconcile_once` does -- proving the documented ping-pong-suppression behaviour end to
+    /// end: a fix that succeeds but immediately drifts again earns a cooldown, every tick during
+    /// that cooldown is suppressed (never re-attempted), the cooldown expires on its own, the
+    /// network is reclaimed again (never a permanent give-up), and a fix that actually holds
+    /// resets everything immediately.
+    #[test]
+    fn redrift_cooldown_suppresses_immediate_reattempts_but_keeps_reclaiming_the_network() {
+        // Tick 1: drifted, no cooldown yet -- attempt allowed.
+        let tick = decide_reconcile_tick(true, 0, 0);
+        assert_eq!(tick.action, ReconcileAction::Attempt);
+        // Simulates `connect_with_timeout` succeeding -- `reconcile_once`'s `Ok` branch always
+        // arms the cooldown, in case the vendor immediately re-drifts it back.
+        let mut failures = 0u32;
+        let mut cooldown = REDRIFT_COOLDOWN_TICKS;
+
+        // Every tick during the cooldown must be suppressed, counting down by exactly one tick.
+        for remaining in (0..REDRIFT_COOLDOWN_TICKS).rev() {
+            let tick = decide_reconcile_tick(true, failures, cooldown);
+            assert_eq!(tick.action, ReconcileAction::CoolingOff, "must still be cooling off");
+            assert_eq!(tick.cooldown_remaining, remaining);
+            failures = tick.consecutive_failures;
+            cooldown = tick.cooldown_remaining;
+        }
+        assert_eq!(cooldown, 0, "cooldown must fully expire on its own");
+
+        // Cooldown expired, still drifted: the network is reclaimed again -- never permanently
+        // abandoned the way exhausting MAX_CONSECUTIVE_FAILURES would be.
+        let tick = decide_reconcile_tick(true, failures, cooldown);
+        assert_eq!(tick.action, ReconcileAction::Attempt);
+
+        // This time the fix actually holds: the next tick observes `!drifted`, which clears
+        // everything immediately rather than waiting out a cooldown that no longer applies.
+        let tick = decide_reconcile_tick(false, 0, REDRIFT_COOLDOWN_TICKS);
+        assert_eq!(tick.action, ReconcileAction::Healthy);
+        assert_eq!(tick.cooldown_remaining, 0);
     }
 
     // ---- persistence --------------------------------------------------------------------------
