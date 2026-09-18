@@ -240,7 +240,6 @@ async def async_setup_entry(
     entities.append(KibbleWifiSignalSensor(coordinator))
     entities.append(KibbleLastSeenPetSensor(coordinator))
     entities.append(KibbleIdentificationScoreSensor(coordinator))
-    entities.append(KibbleVendorLastSeenPetSensor(coordinator))
     entities.append(KibblePendingFacesSensor(coordinator))
     entities.append(KibbleClipsSensor(coordinator))
     entities.append(KibbleLastDetectionSensor(coordinator))
@@ -607,86 +606,6 @@ class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
             attrs["second_best_score"] = result.second_best.score
         if result.ts is not None:
             attrs["last_identified"] = dt_util.utc_from_timestamp(result.ts).isoformat()
-        return attrs
-
-
-class KibbleVendorLastSeenPetSensor(KibbleEntity, RestoreEntity, SensorEntity):
-    """The vendor's own on-device identifier's most recent result -- independent of Kibble's
-    classifier above. State is the operator's name for the pet id (`vendor_pet_ids` option),
-    the raw id as a string if it is unmapped, or unavailable until the vendor has identified
-    anything since the agent started. The vendor gallery only knows cats enrolled with face
-    photos in the Petkit app (one, on this feeder), so this can only ever name those.
-
-    `track` events live only in the agent's in-memory event ring (`ai.rs`'s `Feed`), unlike
-    `/events`'s detections which `ai.rs` rehydrates from disk on startup -- so `kibbled`
-    restarting (routine, e.g. an OTA or a crash) empties `vendor_sightings` even though the
-    last known sighting is still perfectly true, just not freshly re-announced yet. Without a
-    restore this went `unavailable` on every agent restart, which is wrong: nothing about the
-    *feeder* is actually unreachable. `RestoreEntity` keeps the last known sighting (state and
-    its `pet_id`/`last_identified`/`total_score` attributes) showing across that gap; a fresh
-    `vendor_sightings` entry always wins over the restored one the moment it arrives.
-
-    `track` events are the vendor's own on-device AI -- LibreFeed structurally never produces
-    one, so this sensor is unavailable there deliberately (`data.stack.running != "vendor"`),
-    not as an accident of never having happened to see a sighting yet. An agent old enough to
-    predate `GET /mode` (`data.stack is None`) falls back to the pre-existing sighting-only
-    check -- no opinion either way, same as `select.py`'s `KibbleStackSelect.available`."""
-
-    _attr_translation_key = "vendor_last_seen_pet"
-
-    def __init__(self, coordinator: KibbleCoordinator) -> None:
-        super().__init__(coordinator, "vendor_last_seen_pet")
-        self._restored_value: str | None = None
-        self._restored_attrs: dict[str, Any] = {}
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        if self._latest() is not None:
-            return  # a live sighting already exists this run -- nothing to restore
-        last_state = await self.async_get_last_state()
-        if last_state is None or last_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            return
-        self._restored_value = last_state.state
-        self._restored_attrs = {
-            key: value
-            for key, value in last_state.attributes.items()
-            if key in ("pet_id", "last_identified", "total_score")
-        }
-
-    def _latest(self) -> VendorSighting | None:
-        sightings = self.coordinator.data.vendor_sightings
-        return sightings[-1] if sightings else None
-
-    @property
-    def available(self) -> bool:
-        stack = self.coordinator.data.stack
-        if stack is not None and stack.running != "vendor":
-            return False
-        return super().available and (
-            self._latest() is not None or self._restored_value is not None
-        )
-
-    @property
-    def native_value(self) -> str | None:
-        s = self._latest()
-        if s is not None:
-            return s.cat if s.cat is not None else s.pet_id
-        return self._restored_value
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        s = self._latest()
-        if s is None:
-            return self._restored_attrs
-        attrs: dict[str, Any] = {
-            "pet_id": s.pet_id,
-            "last_identified": dt_util.utc_from_timestamp(s.ts).isoformat(),
-        }
-        if s.total_score is not None:
-            # The vendor's own `total_score`: the sum of per-frame identification confidence
-            # over the tracked visit (docs/33 §track). Bigger = longer/steadier visit, not a
-            # probability -- which is why it is not the entity's state.
-            attrs["total_score"] = s.total_score
         return attrs
 
 

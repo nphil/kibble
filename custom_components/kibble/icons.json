@@ -226,9 +226,6 @@
       "last_seen_pet": {
         "default": "mdi:cat"
       },
-      "vendor_last_seen_pet": {
-        "default": "mdi:cat"
-      },
       "identification_score": {
         "default": "mdi:percent-outline"
       },

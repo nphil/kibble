@@ -125,9 +125,9 @@
         "state_attributes": {
           "event_type": {
             "state": {
-              "press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::press%]",
-              "long_press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::long_press%]",
-              "release": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::release%]"
+              "press": "Press",
+              "long_press": "Long press",
+              "release": "Release"
             }
           }
         }
@@ -137,9 +137,9 @@
         "state_attributes": {
           "event_type": {
             "state": {
-              "press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::press%]",
-              "long_press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::long_press%]",
-              "release": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::release%]"
+              "press": "Press",
+              "long_press": "Long press",
+              "release": "Release"
             }
           }
         }
@@ -282,9 +282,6 @@
       },
       "last_seen_pet": {
         "name": "Last seen pet"
-      },
-      "vendor_last_seen_pet": {
-        "name": "Vendor last seen pet"
       },
       "identification_score": {
         "name": "Identification score"

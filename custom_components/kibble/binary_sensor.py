@@ -369,9 +369,9 @@ class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEnti
 
     The `last_seen` attribute is what the dashboard's cat tiles show ("Last here 2 hours
     ago"). The vendor's `track` sightings live only in the agent's memory, so after an agent
-    restart there is nothing to derive it from until the next visit; like
-    `KibbleVendorLastSeenPetSensor`, the last value is restored across that gap and any newer
-    live identification wins over it."""
+    restart there is nothing to derive it from until the next visit; the last value is
+    restored across that gap via `RestoreEntity` and any newer live identification wins
+    over it."""
 
     _attr_translation_key = "cat_present"
 
