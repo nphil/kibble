@@ -4,12 +4,13 @@ Authenticated (`requires_auth = True`) -- unlike `image.py`'s existing entities,
 `ImageEntity._attr_image_url` straight at the agent's own LAN address for HA's own built-in
 image proxy to fetch, a card is not guaranteed to be able to reach the feeder's LAN address
 directly, so it needs a request HA itself fetches and forwards. `kind` selects which agent
-store `name` (and, for `sample`, `cat`) names -- `event`/`pending`/`sample/<cat>`/`track` are
-already-JPEG passthroughs through `api.py`'s `*_bytes` methods (`track`'s `name` is a `track`
-detection's unix `ts`, not a filename -- the agent re-resolves and serves whichever `eat`/
-`visit` it judges paired with that timestamp live); `feed` is the one exception:
-`agent/src/feed_capture.rs` stores a raw H.264 keyframe, not a JPEG, so that case reuses
-`image.py`'s existing ffmpeg decode instead of a client byte-fetch.
+store `name` (and, for `sample`, `cat`) names -- every kind is an already-JPEG passthrough
+through `api.py`'s `*_bytes` methods (`track`'s `name` is a `track` detection's unix `ts`, not
+a filename -- the agent re-resolves and serves whichever `eat`/`visit` it judges paired with
+that timestamp live). `feed` alone can still need a decode: a feeder still running the vendor
+kibbled stack serves `agent/src/feed_capture.rs`'s raw H.264 keyframe at this same URL instead
+of a JPEG, told apart from LibreFeed's own real one by its magic bytes -- never by guessing
+which stack is running -- in `image.py`'s `_feed_snapshot_jpeg`.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from homeassistant.config_entries import ConfigEntryState
 
 from .api import KibbleError, KibbleNotFoundError
 from .const import DOMAIN
-from .image import _feed_snapshot_url, _h264_keyframe_to_jpeg
+from .image import _feed_snapshot_jpeg
 from .websocket import TRACK_PAIR_LOOKAHEAD_SECONDS
 
 CACHE_CONTROL = "private, max-age=31536000, immutable"
@@ -96,7 +97,7 @@ class KibbleImageView(HomeAssistantView):
                 jpeg = await client.track_image_bytes(int(name))
                 cache_control = _track_cache_control(int(name))
             elif kind == "feed":
-                jpeg = await _h264_keyframe_to_jpeg(hass, _feed_snapshot_url(entry, name))
+                jpeg = await _feed_snapshot_jpeg(hass, entry, name)
             else:
                 return web.Response(status=HTTPStatus.NOT_FOUND)
         except KibbleNotFoundError:
@@ -105,7 +106,8 @@ class KibbleImageView(HomeAssistantView):
             return web.Response(status=HTTPStatus.BAD_GATEWAY)
 
         if jpeg is None:
-            # Only the `feed` branch above can reach this -- `_h264_keyframe_to_jpeg` reports a
+            # Only the `feed` branch above can reach this -- `_feed_snapshot_jpeg` delegates a
+            # non-JPEG (H.264 keyframe) response to `_h264_keyframe_to_jpeg`, which reports a
             # decode failure as `None`, not an exception (see its own doc comment).
             return web.Response(status=HTTPStatus.NOT_FOUND)
         return web.Response(

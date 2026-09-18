@@ -97,6 +97,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -298,16 +299,32 @@ async def _pcm_from_ffmpeg(
     return pcm
 
 
-async def _resolve_media_to_pcm(hass: HomeAssistant, media_content_id: str) -> bytes:
+def _media_player_entity_id(hass: HomeAssistant, serial: str) -> str | None:
+    """The one media_player entity `media_player.py`'s `async_setup_entry` always creates for
+    this feeder (`entity.py`'s `unique_id` scheme: `f"{serial}_speaker"`), resolved through the
+    entity registry rather than reconstructed from a slugified name -- a user rename must never
+    break this. `None` only in the narrow window before that entity has ever registered (mid
+    first setup); `media_source.async_resolve_media` treats that exactly like an omitted
+    target, the same outcome `target_media_player=None` always meant."""
+    return er.async_get(hass).async_get_entity_id("media_player", DOMAIN, f"{serial}_speaker")
+
+
+async def _resolve_media_to_pcm(
+    hass: HomeAssistant, media_content_id: str, entity_id: str | None
+) -> bytes:
     """Turns an HA media reference -- a media-source URI (what `tts.speak` produces, among
     others) or a plain music URL -- into raw PCM. `media_source.async_resolve_media` first
-    (the same boilerplate every core media_player integration uses for this exact step);
+    (the same boilerplate every core media_player integration uses for this exact step),
+    passed `entity_id` (`_media_player_entity_id`, the feeder's own `KibbleSpeaker`) rather than
+    leaving it at its `UNDEFINED` default -- an omitted `target_media_player` trips
+    `homeassistant.helpers.frame`'s `report_usage` deprecation warning on every single call,
+    logged from this integration's own domain, not from Home Assistant core.
     `async_process_play_media_url` after, so a same-instance URL (a local TTS/media file)
     picks up HA's own auth signature before ffmpeg fetches it over plain HTTP with no HA
     session of its own. A bad/unresolvable reference raises `Unresolvable`, already a
     `HomeAssistantError` -- left to propagate as-is rather than rewrapped."""
     if is_media_source_id(media_content_id):
-        played = await async_resolve_media(hass, media_content_id)
+        played = await async_resolve_media(hass, media_content_id, entity_id)
         media_content_id = played.url
     url = async_process_play_media_url(hass, media_content_id)
     return await _pcm_from_ffmpeg(hass, url)
@@ -838,8 +855,12 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     async def async_resolve_and_convert(self, media_content_id: str) -> bytes:
         """Turns an HA media reference into raw PCM -- the shared first half of both
         `async_play_media_content` (posts it to `/speak`) and `async_save_clip` (puts it to
-        `/clips/<name>`)."""
-        return await _resolve_media_to_pcm(self.hass, media_content_id)
+        `/clips/<name>`). Passes the feeder's own `KibbleSpeaker` entity id to `media_source.
+        async_resolve_media` either way: it is the entity actually about to render this media
+        for `async_play_media_content`, and the closest thing this integration has to "the
+        target player" for `async_save_clip` too, since there is exactly one per feeder."""
+        entity_id = _media_player_entity_id(self.hass, self.data.state.serial)
+        return await _resolve_media_to_pcm(self.hass, media_content_id, entity_id)
 
     async def async_play_media_content(self, media_content_id: str) -> dict:
         """Resolves an HA media reference to PCM and plays it once via `async_speak`. Returns

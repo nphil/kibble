@@ -170,11 +170,34 @@ async def test_get_sample_kind_calls_the_client_with_both_cat_and_name() -> None
     client.sample_bytes.assert_awaited_once_with("Kitty", "a.jpg")
 
 
-async def test_get_feed_kind_reuses_the_ffmpeg_h264_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_get_feed_kind_serves_librefeeds_real_jpeg_directly_with_no_ffmpeg_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual 2026-09-18 bug: LibreFeed's `GET /feeds/<name>` already answers with a real
+    JPEG (confirmed against the live device), but this view used to force every `feed` fetch
+    through an H.264-only ffmpeg decode regardless, which 404s decoding a JPEG as raw H.264.
+    `_is_jpeg`'s magic-byte check must skip the decode entirely for real JPEG bytes."""
+    decode = AsyncMock()
+    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", decode)
+    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\xff\xd8jpeg-bytes"))
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="feed")
+    assert resp.status == HTTPStatus.OK
+    assert resp.body == b"\xff\xd8jpeg-bytes"
+    client.feed_bytes.assert_awaited_once_with("a.jpg")
+    decode.assert_not_awaited()
+
+
+async def test_get_feed_kind_reuses_the_ffmpeg_h264_decode_for_a_still_vendor_stack_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feeder still running the vendor kibbled stack serves a raw H.264 keyframe at this same
+    URL, not a JPEG -- told apart by `_is_jpeg`'s magic-byte check, never by guessing which
+    stack answered."""
     decode = AsyncMock(return_value=b"decoded-jpeg")
-    monkeypatch.setattr("kibble.views._h264_keyframe_to_jpeg", decode)
-    monkeypatch.setattr("kibble.views._feed_snapshot_url", lambda entry, name: f"http://x/feeds/{name}")
-    client = AsyncMock()
+    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", decode)
+    monkeypatch.setattr("kibble.image._feed_snapshot_url", lambda entry, name: f"http://x/feeds/{name}")
+    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\x00\x00\x00\x01not-a-jpeg"))
     entry = _fake_entry(client)
     resp = await view_get(entry, kind="feed")
     assert resp.status == HTTPStatus.OK
@@ -185,11 +208,26 @@ async def test_get_feed_kind_reuses_the_ffmpeg_h264_decode(monkeypatch: pytest.M
 
 async def test_get_feed_kind_404s_when_ffmpeg_decode_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """`_h264_keyframe_to_jpeg` reports a decode failure as `None`, not an exception."""
-    monkeypatch.setattr("kibble.views._h264_keyframe_to_jpeg", AsyncMock(return_value=None))
-    monkeypatch.setattr("kibble.views._feed_snapshot_url", lambda entry, name: "http://x/feeds/a.jpg")
-    entry = _fake_entry(AsyncMock())
+    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", AsyncMock(return_value=None))
+    monkeypatch.setattr("kibble.image._feed_snapshot_url", lambda entry, name: "http://x/feeds/a.jpg")
+    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\x00\x00\x00\x01not-a-jpeg"))
+    entry = _fake_entry(client)
     resp = await view_get(entry, kind="feed")
     assert resp.status == HTTPStatus.NOT_FOUND
+
+
+async def test_get_feed_kind_404s_when_the_client_reports_the_file_is_gone() -> None:
+    client = AsyncMock(feed_bytes=AsyncMock(side_effect=KibbleNotFoundError("gone")))
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="feed")
+    assert resp.status == HTTPStatus.NOT_FOUND
+
+
+async def test_get_feed_kind_502s_when_the_feeder_is_unreachable() -> None:
+    client = AsyncMock(feed_bytes=AsyncMock(side_effect=KibbleConnectionError("down")))
+    entry = _fake_entry(client)
+    resp = await view_get(entry, kind="feed")
+    assert resp.status == HTTPStatus.BAD_GATEWAY
 
 
 async def test_get_404s_when_the_client_reports_the_crop_is_gone() -> None:

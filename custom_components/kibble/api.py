@@ -897,13 +897,25 @@ class KibbleClient:
 
     async def label_face(self, crop_id: str, cat: str) -> None:
         """Moves a pending crop into `cat`'s permanent storage and feeds its embedding into
-        that cat's running centroid (`agent/src/main.rs`'s `faces_label_post`)."""
-        await self._request("POST", "/faces/label", {"name": crop_id, "cat": cat})
+        that cat's running centroid (`agent/src/main.rs`'s `faces_label_post`). `crop_id` naming
+        a crop that is no longer pending (already labelled by a race, evicted, a stale/double-
+        submitted UI reference) is a real, if infrequent, 404 from the agent -- `not_found_is_
+        missing` surfaces that as `KibbleNotFoundError` carrying the agent's own message ("no
+        such pending face crop") instead of the default "not supported by this agent version"
+        `KibbleError`, which used to make a stale crop id read exactly like the agent lacking
+        this route entirely."""
+        await self._request(
+            "POST", "/faces/label", {"name": crop_id, "cat": cat}, not_found_is_missing=True
+        )
 
     async def unlabel_face(self, crop_id: str, cat: str) -> None:
         """The exact inverse of `label_face` -- moves a labelled crop back to pending and
-        corrects the centroid. A full re-label is this followed by another `label_face`."""
-        await self._request("POST", "/faces/unlabel", {"name": crop_id, "cat": cat})
+        corrects the centroid. A full re-label is this followed by another `label_face`. Same
+        `not_found_is_missing` reasoning as `label_face`: a `crop_id`/`cat` pair that is no
+        longer labelled is a real 404, not evidence the route is unsupported."""
+        await self._request(
+            "POST", "/faces/unlabel", {"name": crop_id, "cat": cat}, not_found_is_missing=True
+        )
 
     async def upload_face_sample(self, cat: str, jpeg: bytes) -> dict:
         """`POST /faces/upload?cat=<cat>`: `jpeg` is raw bytes the browser has already
@@ -950,6 +962,17 @@ class KibbleClient:
         identified cat at the bowl, as opposed to a stored/trained sample. Raises
         `KibbleNotFoundError` when nothing qualifies, via the HTTP view's `kind="track"`."""
         return await self._get_bytes(f"/events/track/{ts}/image")
+
+    async def feed_bytes(self, name: str) -> bytes:
+        """`GET /feeds/<name>`: one dish-snapshot's raw bytes. LibreFeed's own
+        `daemon/src/feeds.rs::read_feed_file` already serves a real JPEG; a feeder still running
+        the vendor kibbled stack instead serves a raw H.264 keyframe (`agent/src/
+        feed_capture.rs`) that needs further decoding -- see `image.py`'s `_feed_snapshot_jpeg`
+        (told apart by magic bytes, not by guessing which stack is running) for which. Routed
+        through this client's own locked, timed-out `_get_bytes`, exactly like every other
+        passthrough kind, rather than an independent fetch -- see that method's own doc on why
+        that matters against this agent's single-client HTTP server."""
+        return await self._get_bytes(f"/feeds/{quote(name, safe='')}")
 
     async def clips(self) -> list[ClipInfo]:
         return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips", not_found_is_missing=True)]

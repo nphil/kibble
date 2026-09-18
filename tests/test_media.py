@@ -9,9 +9,17 @@ Assistant core instance or a real ffmpeg binary:
   express.
 - `image._latest_dish_snapshot`: picking the before/after pair from the same (newest) feed
   record, never independently "whichever record happens to have my half".
+- `coordinator._media_player_entity_id`/`_resolve_media_to_pcm`: `media_source.
+  async_resolve_media` must always be passed an explicit `target_media_player` (the feeder's
+  own `KibbleSpeaker`, resolved through the entity registry) -- never left at its `UNDEFINED`
+  default, which trips a deprecation warning on every single call.
 - `api.KibbleClient.speak`: a 409 from the agent raises the distinct `KibbleSpeakerBusyError`,
   not a generic `KibbleError` -- the one thing `media_player.py`/`__init__.py`'s clip services
   need to tell "speaker busy" from "the agent rejected the request" and give a clear message.
+- `api.KibbleClient.label_face`/`unlabel_face`: a 404 names a specific crop that is no longer
+  pending/labelled (a race, an eviction, a stale UI reference) -- `KibbleNotFoundError` with the
+  agent's own message, not the default "not supported by this agent version" `KibbleError` that
+  used to make it read like the agent lacked the route entirely.
 
 `coordinator.py`/`image.py`/`media_player.py` import real `homeassistant` components (`ffmpeg`,
 `media_player`, `media_source`), unlike the BLE-only modules the rest of this test suite
@@ -23,11 +31,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from homeassistant.util import dt as dt_util
-from kibble.api import DetectionEvent, FeedRecord, KibbleClient, KibbleSpeakerBusyError
-from kibble.coordinator import _pcm_convert_args
+from kibble.api import DetectionEvent, FeedRecord, KibbleClient, KibbleNotFoundError, KibbleSpeakerBusyError
+from kibble.const import DOMAIN
+from kibble.coordinator import (
+    KibbleCoordinator,
+    _media_player_entity_id,
+    _pcm_convert_args,
+    _resolve_media_to_pcm,
+)
 from kibble.image import KibbleLastDetectionImage, _h264_to_jpeg_args, _latest_dish_snapshot
 
 
@@ -118,6 +133,79 @@ def test_latest_dish_snapshot_uses_the_newest_records_own_side_not_an_older_reco
     assert _latest_dish_snapshot(feeds, "after") == (None, None)
 
 
+# --- coordinator._media_player_entity_id / _resolve_media_to_pcm -----------------------------
+
+
+def test_media_player_entity_id_looks_up_the_speakers_known_unique_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`media_player.py`'s `async_setup_entry` always registers `KibbleSpeaker` under
+    `f"{serial}_speaker"` (`entity.py`'s `unique_id` scheme) -- resolved through the entity
+    registry, never reconstructed from a (renamable) display name."""
+    registry = SimpleNamespace(async_get_entity_id=Mock(return_value="media_player.cat_feeder_speaker"))
+    monkeypatch.setattr("kibble.coordinator.er.async_get", Mock(return_value=registry))
+
+    result = _media_player_entity_id(SimpleNamespace(), "ABC123")
+
+    assert result == "media_player.cat_feeder_speaker"
+    registry.async_get_entity_id.assert_called_once_with("media_player", DOMAIN, "ABC123_speaker")
+
+
+async def test_resolve_media_to_pcm_never_leaves_target_media_player_at_its_deprecated_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`media_source.async_resolve_media` warns (`homeassistant.helpers.frame`'s `report_usage`)
+    the instant `target_media_player` is left at its `UNDEFINED` default -- the actual
+    2026-09-18 log entry this integration triggered. Passing an explicit third argument, even a
+    real one resolved from the registry, structurally rules that out."""
+    hass = SimpleNamespace()
+    resolve = AsyncMock(return_value=SimpleNamespace(url="http://x/resolved.mp3"))
+    monkeypatch.setattr("kibble.coordinator.async_resolve_media", resolve)
+    monkeypatch.setattr("kibble.coordinator.async_process_play_media_url", lambda _hass, url: url)
+    monkeypatch.setattr("kibble.coordinator._pcm_from_ffmpeg", AsyncMock(return_value=b"pcm"))
+
+    pcm = await _resolve_media_to_pcm(hass, "media-source://tts/x", "media_player.cat_feeder_speaker")
+
+    assert pcm == b"pcm"
+    resolve.assert_awaited_once_with(hass, "media-source://tts/x", "media_player.cat_feeder_speaker")
+
+
+async def test_resolve_media_to_pcm_skips_resolution_entirely_for_a_plain_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain (non media-source) URL never reaches `async_resolve_media` at all -- `entity_id`
+    is irrelevant to this path, so a bogus one must not matter."""
+    hass = SimpleNamespace()
+    resolve = AsyncMock()
+    monkeypatch.setattr("kibble.coordinator.async_resolve_media", resolve)
+    monkeypatch.setattr("kibble.coordinator.async_process_play_media_url", lambda _hass, url: url)
+    monkeypatch.setattr("kibble.coordinator._pcm_from_ffmpeg", AsyncMock(return_value=b"pcm"))
+
+    pcm = await _resolve_media_to_pcm(hass, "http://example.com/song.mp3", "bogus.entity")
+
+    assert pcm == b"pcm"
+    resolve.assert_not_awaited()
+
+
+async def test_async_resolve_and_convert_passes_the_serials_speaker_entity_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The coordinator-level glue: `self.data.state.serial` -> `_media_player_entity_id` ->
+    `_resolve_media_to_pcm`'s `entity_id`, so a real feeder's `KibbleSpeaker` entity actually
+    ends up passed through both `async_play_media_content` and `async_save_clip`, not a
+    hardcoded stand-in."""
+    registry = SimpleNamespace(async_get_entity_id=Mock(return_value="media_player.cat_feeder_speaker"))
+    monkeypatch.setattr("kibble.coordinator.er.async_get", Mock(return_value=registry))
+    resolve_to_pcm = AsyncMock(return_value=b"pcm")
+    monkeypatch.setattr("kibble.coordinator._resolve_media_to_pcm", resolve_to_pcm)
+    hass = SimpleNamespace()
+    fake_self = SimpleNamespace(hass=hass, data=SimpleNamespace(state=SimpleNamespace(serial="ABC123")))
+
+    pcm = await KibbleCoordinator.async_resolve_and_convert(fake_self, "media-source://tts/x")
+
+    assert pcm == b"pcm"
+    resolve_to_pcm.assert_awaited_once_with(hass, "media-source://tts/x", "media_player.cat_feeder_speaker")
+    registry.async_get_entity_id.assert_called_once_with("media_player", DOMAIN, "ABC123_speaker")
+
+
 # --- api.KibbleClient.speak / 409 handling --------------------------------------------------------
 
 
@@ -155,3 +243,30 @@ async def test_speak_409_raises_speaker_busy_error_not_a_generic_kibble_error() 
 
     with pytest.raises(KibbleSpeakerBusyError, match="already in use"):
         await client.speak(b"\x00\x00" * 100)
+
+
+# --- api.KibbleClient.label_face / unlabel_face 404 handling ---------------------------------
+
+
+async def test_label_face_404_surfaces_the_agents_own_not_found_message() -> None:
+    """A 404 from `POST /faces/label` names a specific crop that is no longer pending (already
+    labelled by a race, evicted, a stale/double-submitted UI reference) -- a real
+    `KibbleNotFoundError` carrying the agent's own message, not the default "not supported by
+    this agent version" `KibbleError` that used to make it read exactly like the agent lacked
+    this route entirely (the actual 2026-09-18 log: "Label face failed: /faces/label not
+    supported by this agent version")."""
+    session = _FakeSession(404, {"error": "no such pending face crop"})
+    client = KibbleClient(session, "192.168.4.85", 8765)
+
+    with pytest.raises(KibbleNotFoundError, match="no such pending face crop"):
+        await client.label_face("1-unknown.jpg", "Kitty")
+
+
+async def test_unlabel_face_404_surfaces_the_agents_own_not_found_message() -> None:
+    """Same reasoning as `label_face` -- `unlabel_face`'s crop/cat pair not currently being
+    labelled is a real 404, not evidence the route is unsupported."""
+    session = _FakeSession(404, {"error": "no such labelled crop"})
+    client = KibbleClient(session, "192.168.4.85", 8765)
+
+    with pytest.raises(KibbleNotFoundError, match="no such labelled crop"):
+        await client.unlabel_face("1-unknown.jpg", "Kitty")

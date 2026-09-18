@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .api import DetectionEvent, FeedRecord, ReviewFace
+from .api import DetectionEvent, FeedRecord, KibbleError, ReviewFace
 from .const import CONF_HOST, CONF_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
@@ -197,11 +197,12 @@ def _h264_to_jpeg_args(url: str) -> tuple[list[str], str, str]:
 
 async def _h264_keyframe_to_jpeg(hass: HomeAssistant, url: str) -> bytes | None:
     """One `GET /feeds/<name>` H.264 keyframe (SPS+PPS+IDR access unit -- `agent/src/
-    feed_capture.rs`) decoded to a JPEG via HA's own ffmpeg helper, per that module's own doc
-    comment ("Home Assistant ... decodes them to a displayable image"). Returns `None` (not an
-    exception) on any ffmpeg failure -- an image entity degrading to "no picture right now" is
-    the normal, supported outcome, the same as `ImageEntity`'s own built-in URL fetch already
-    does for a bad response."""
+    feed_capture.rs`, a still-vendor-stack agent only -- see `_feed_snapshot_jpeg`'s doc for how
+    that's told apart from LibreFeed's own already-JPEG answer) decoded to a JPEG via HA's own
+    ffmpeg helper, per that module's own doc comment ("Home Assistant ... decodes them to a
+    displayable image"). Returns `None` (not an exception) on any ffmpeg failure -- an image
+    entity degrading to "no picture right now" is the normal, supported outcome, the same as
+    `ImageEntity`'s own built-in URL fetch already does for a bad response."""
     manager = get_ffmpeg_manager(hass)
     decoder = HAFFmpeg(manager.binary)
     cmd, input_source, output = _h264_to_jpeg_args(url)
@@ -220,11 +221,46 @@ async def _h264_keyframe_to_jpeg(hass: HomeAssistant, url: str) -> bytes | None:
     return jpeg or None
 
 
+# A JPEG stream's first two bytes are always its SOI marker, `FF D8` -- true regardless of which
+# optional segment (APP0/JFIF, APP1/Exif, ...) comes next, and sufficient on its own to identify
+# one. A raw H.264 Annex-B access unit (`agent/src/feed_capture.rs`'s own format) never starts
+# this way: its first NAL unit's start code is `00 00 00 01` or `00 00 01`.
+_JPEG_MAGIC = b"\xff\xd8"
+
+
+def _is_jpeg(data: bytes) -> bool:
+    return data[:2] == _JPEG_MAGIC
+
+
+async def _feed_snapshot_jpeg(hass: HomeAssistant, entry: KibbleConfigEntry, name: str) -> bytes | None:
+    """One `GET /feeds/<name>` dish snapshot as a JPEG, regardless of which stack answers it.
+    LibreFeed's own `daemon/src/feeds.rs::read_feed_file` already serves a real JPEG; a feeder
+    still running the vendor kibbled stack serves a raw H.264 keyframe instead (`agent/src/
+    feed_capture.rs`) that still needs `_h264_keyframe_to_jpeg`'s ffmpeg decode. The two are
+    told apart by `_is_jpeg`'s magic-byte check on the actual bytes on the wire -- never by
+    guessing which stack is running, since `kibble.set_mode` can switch stacks without Home
+    Assistant ever being told.
+
+    Fetched through this entry's own `KibbleClient.feed_bytes` -- the same locked, timed-out
+    path every other passthrough kind uses -- rather than ffmpeg's own independent URL fetch,
+    so this request is properly serialised against the feeder's single-client HTTP server too
+    (`api.py`'s module docstring). A failure decoding a genuine H.264 keyframe is reported as
+    `None`, never an exception -- see `_h264_keyframe_to_jpeg`'s own doc; a failure fetching the
+    bytes in the first place is *not* caught here, so it propagates as the same `KibbleError`
+    every other passthrough kind raises, for callers (`views.py`'s `kind="feed"`) to map to the
+    same 404/502 they already do."""
+    raw = await entry.runtime_data.client.feed_bytes(name)
+    if _is_jpeg(raw):
+        return raw
+    return await _h264_keyframe_to_jpeg(hass, _feed_snapshot_url(entry, name))
+
+
 class KibbleDishImage(KibbleEntity, ImageEntity):
     """One half (`side`: 'before'/'after') of the dish snapshot pair for the most recent feed
-    cycle. Sourced from a raw H.264 keyframe, not a ready-made image -- `async_image` decodes
-    it on demand via `_h264_keyframe_to_jpeg` rather than `ImageEntity`'s own built-in URL
-    fetch, which requires the URL to directly return a recognized image content type."""
+    cycle. `async_image` fetches it through `_feed_snapshot_jpeg` -- a ready-made JPEG on
+    LibreFeed, still a raw H.264 keyframe needing an on-demand ffmpeg decode on the vendor
+    kibbled stack -- rather than `ImageEntity`'s own built-in URL fetch, which requires the URL
+    to directly return a recognized image content type up front."""
 
     entity_description: KibbleDishImageDescription
     _attr_content_type = "image/jpeg"
@@ -258,7 +294,12 @@ class KibbleDishImage(KibbleEntity, ImageEntity):
         if self._name is None:
             return None
         if self._jpeg is None:
-            self._jpeg = await _h264_keyframe_to_jpeg(
-                self.hass, _feed_snapshot_url(self._entry, self._name)
-            )
+            try:
+                self._jpeg = await _feed_snapshot_jpeg(self.hass, self._entry, self._name)
+            except KibbleError as err:
+                # An image entity degrading to "no picture right now" is the normal, supported
+                # outcome -- see `_h264_keyframe_to_jpeg`'s own doc for the ffmpeg-decode half
+                # of this same contract.
+                _LOGGER.warning("Could not fetch dish snapshot %s: %s", self._name, err)
+                return None
         return self._jpeg
