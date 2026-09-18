@@ -22,10 +22,15 @@ const POLL_GAP_MS = 5_000;
 /** `GET /events` is an instant in-memory read; this is a sanity ceiling, not an expected wait. */
 const REQUEST_TIMEOUT_MS = 5_000;
 const RETRY_DELAY_MS = 10_000;
+/** LibreFeed serves no `/events` (the vision stack is vendor-only until its stage 4), so a 404
+ * is a stack answer, not a fault: re-check at this gap so a switch back to the vendor stack is
+ * picked up, and say so once rather than every retry. */
+const NOT_SERVED_RECHECK_MS = 60_000;
 
 export class KibbleDetectionFeed {
     private stopped = false;
     private since = 0;
+    private notServed = false;
     private abortController = new AbortController();
 
     constructor(
@@ -72,6 +77,9 @@ export class KibbleDetectionFeed {
                 return;
             try {
                 const snapshot = await this.fetchEvents();
+                if (this.notServed)
+                    this.console.log('kibble: /events is back');
+                this.notServed = false;
                 if (this.stopped)
                     return;
                 const fresh = snapshot.filter(d => d.seq > this.since);
@@ -83,7 +91,15 @@ export class KibbleDetectionFeed {
             } catch (e) {
                 if (this.stopped)
                     return;
-                this.console.warn(`kibble: GET /events error (${(e as Error).message}), retrying in ${RETRY_DELAY_MS}ms`);
+                const message = (e as Error).message;
+                if (message.includes('HTTP 404')) {
+                    if (!this.notServed)
+                        this.console.log(`kibble: this stack serves no /events (detections unavailable); re-checking every ${NOT_SERVED_RECHECK_MS / 1000}s`);
+                    this.notServed = true;
+                    await sleep(NOT_SERVED_RECHECK_MS);
+                    continue;
+                }
+                this.console.warn(`kibble: GET /events error (${message}), retrying in ${RETRY_DELAY_MS}ms`);
                 await sleep(RETRY_DELAY_MS);
             }
         }
