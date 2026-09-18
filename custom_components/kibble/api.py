@@ -301,6 +301,28 @@ class LedState:
             camera=camera if camera == "auto" else int(camera),
         )
 
+
+@dataclass(frozen=True, slots=True)
+class DesiccantState:
+    """The feeder's desiccant-pack countdown, as reported by `GET /desiccant` (LibreFeed-only
+    -- the vendor stack's equivalent counter is set from Petkit's cloud config, not served by
+    the agent; see `_request`'s `not_found_is_missing`). `days_left` counts down to `0`;
+    `replaced_unix` is when the pack was last marked replaced (unix seconds), the value
+    `POST /desiccant {"replaced": true}` bumps; `interval_days` is the rated interval a
+    replacement resets `days_left` to."""
+
+    days_left: int
+    replaced_unix: int
+    interval_days: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> DesiccantState:
+        return cls(
+            days_left=int(data.get("days_left") or 0),
+            replaced_unix=int(data.get("replaced_unix") or 0),
+            interval_days=int(data.get("interval_days") or 0),
+        )
+
 @dataclass(frozen=True, slots=True)
 class WifiNetwork:
     """One scanned Wi-Fi network, as reported by `GET /wifi/scan` -- already deduplicated by
@@ -766,6 +788,35 @@ class KibbleClient:
         return await self._request(
             "POST", "/beep", {"count": count, "on_ms": on_ms, "off_ms": off_ms}
         )
+
+    async def desiccant(self) -> DesiccantState:
+        return DesiccantState.from_json(
+            await self._request("GET", "/desiccant", not_found_is_missing=True)
+        )
+
+    async def set_desiccant(
+        self,
+        *,
+        replaced: bool | None = None,
+        days_left: int | None = None,
+        interval_days: int | None = None,
+    ) -> DesiccantState:
+        """`POST /desiccant`: the agent accepts exactly one of `{"replaced": true}`,
+        `{"days_left": N}`, `{"interval_days": N}` per call and 400s for anything else
+        (LibreFeed-only, `agent/src/compat.rs`) -- `coordinator.py`'s `async_set_desiccant`
+        never gives more than one of these at once, so this simply forwards whichever single
+        field the caller passed, the same trust-the-caller shape as `set_led`. A 404 here
+        means the vendor stack is running -- like `set_led`, this write is not passed
+        `not_found_is_missing`, since a 404 on a write is a real failure, not an optional read
+        to fall back on. Returns the new snapshot, the same shape as `desiccant()`."""
+        payload: dict[str, Any] = {}
+        if replaced is not None:
+            payload["replaced"] = replaced
+        if days_left is not None:
+            payload["days_left"] = days_left
+        if interval_days is not None:
+            payload["interval_days"] = interval_days
+        return DesiccantState.from_json(await self._request("POST", "/desiccant", payload))
 
     async def wifi(self) -> WifiState:
         return WifiState.from_json(await self._request("GET", "/wifi"))

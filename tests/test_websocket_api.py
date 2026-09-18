@@ -46,10 +46,16 @@ from kibble.websocket import (
 
 
 def _event(
-    seq: int, ts: int, cls: str, pet_id: str | None = None, cat: str | None = None, image: str | None = None
+    seq: int,
+    ts: int,
+    cls: str,
+    pet_id: str | None = None,
+    cat: str | None = None,
+    image: str | None = None,
+    score: float | None = None,
 ) -> DetectionEvent:
     return DetectionEvent(
-        seq=seq, ts=ts, cls=cls, image=image, cat=cat, score=None, pet_id=pet_id, total_score=None
+        seq=seq, ts=ts, cls=cls, image=image, cat=cat, score=score, pet_id=pet_id, total_score=None
     )
 
 
@@ -259,6 +265,68 @@ def test_timeline_two_close_tracks_can_independently_claim_the_same_eat() -> Non
     assert len(identified) == 2
     assert all(i["paired_class"] == "eat" for i in identified)
     assert "eat" not in [i["kind"] for i in items]
+
+
+# --- timeline_items: LibreFeed-shaped visit/eat carrying their own `cat` directly ---------------
+
+
+def test_timeline_librefeed_visit_with_a_cat_is_one_identified_row() -> None:
+    """LibreFeed never emits a `track`; the identification lives on the `visit`/`eat` event
+    itself. `score` is carried through when the event has one."""
+    events = (_event(1, 10, "visit", cat="Pancake", image="10-visit.jpg", score=0.83),)
+    items = timeline_items(events, (), {})
+    assert items == [
+        {
+            "kind": "identified",
+            "ts": 10,
+            "cat": "Pancake",
+            "paired_class": "visit",
+            "image": "10-visit.jpg",
+            "image_kind": "event",
+            "score": 0.83,
+        }
+    ]
+
+
+def test_timeline_librefeed_visit_without_a_cat_stays_gated_behind_include_visits() -> None:
+    """The exact same visit, minus the identification, is bare noise again -- same gate as
+    the vendor stack's own unclaimed `visit`."""
+    events = (_event(1, 10, "visit", image="10-visit.jpg"),)
+    assert timeline_items(events, (), {}) == []
+    items = timeline_items(events, (), {}, include_visits=True)
+    assert items[0]["kind"] == "visit"
+
+
+def test_timeline_librefeed_eat_without_a_cat_still_shows() -> None:
+    """An `eat` never needs `include_visits` -- identified or not, on either stack."""
+    items = timeline_items((_event(1, 10, "eat", image="10-eat.jpg"),), (), {})
+    assert [i["kind"] for i in items] == ["eat"]
+
+
+def test_timeline_librefeed_eat_with_a_cat_is_one_identified_row_with_no_score_key() -> None:
+    """No `score` on the event means no `score` key on the row -- not a `None` placeholder."""
+    items = timeline_items((_event(1, 10, "eat", cat="Kitty", image="10-eat.jpg"),), (), {})
+    assert items == [
+        {
+            "kind": "identified",
+            "ts": 10,
+            "cat": "Kitty",
+            "paired_class": "eat",
+            "image": "10-eat.jpg",
+            "image_kind": "event",
+        }
+    ]
+
+
+def test_timeline_vendor_track_and_visit_pair_stays_a_single_identified_row() -> None:
+    """Regression: a vendor-shaped `track` paired with a bare `visit` (no `cat` of its own,
+    since the vendor's identification lives on the `track`, not the `visit`) must still
+    collapse to exactly one `identified` row, unaffected by the LibreFeed direct-cat path."""
+    events = (_event(1, 100, "track", pet_id="5"), _event(2, 102, "visit", image="102-visit.jpg"))
+    items = timeline_items(events, (), {"5": "Pancake"}, include_visits=True)
+    assert [i["kind"] for i in items] == ["identified"]
+    assert items[0]["cat"] == "Pancake"
+    assert items[0]["image"] == "100"
 
 
 # --- cats_items --------------------------------------------------------------------------------

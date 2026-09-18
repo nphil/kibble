@@ -182,3 +182,15 @@ DEFAULT_BEEP_ON_MS = 100
 MIN_BEEP_OFF_MS = 0
 MAX_BEEP_OFF_MS = 2000
 DEFAULT_BEEP_OFF_MS = 100
+
+SERVICE_SET_DESICCANT = "set_desiccant"
+
+ATTR_DAYS_LEFT = "days_left"
+ATTR_INTERVAL_DAYS = "interval_days"
+
+# `POST /desiccant`'s own writable ranges (LibreFeed-only -- see `api.py`'s
+# `KibbleClient.set_desiccant`); the agent 400s outside them.
+MIN_DESICCANT_DAYS_LEFT = 0
+MAX_DESICCANT_DAYS_LEFT = 365
+MIN_DESICCANT_INTERVAL_DAYS = 1
+MAX_DESICCANT_INTERVAL_DAYS = 365

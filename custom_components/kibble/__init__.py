@@ -12,7 +12,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import config_validation as cv, device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
@@ -25,6 +25,7 @@ from .const import (
     ATTR_COUNT,
     ATTR_CROP_ID,
     ATTR_CROP_NAME,
+    ATTR_DAYS_LEFT,
     ATTR_ENABLED,
     ATTR_ENTRIES,
     ATTR_ENTRY_ID,
@@ -34,6 +35,7 @@ from .const import (
     ATTR_HOPPER2_G,
     ATTR_HOUR,
     ATTR_ID,
+    ATTR_INTERVAL_DAYS,
     ATTR_JPEG_B64,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MINUTE,
@@ -56,6 +58,8 @@ from .const import (
     MAX_BEEP_OFF_MS,
     MAX_BEEP_ON_MS,
     MAX_CLIP_SECONDS,
+    MAX_DESICCANT_DAYS_LEFT,
+    MAX_DESICCANT_INTERVAL_DAYS,
     MAX_SCHEDULE_AMOUNT,
     MAX_SCHEDULE_ENTRIES,
     MIN_AMOUNT,
@@ -63,6 +67,8 @@ from .const import (
     MIN_BEEP_OFF_MS,
     MIN_BEEP_ON_MS,
     MIN_CLIP_SECONDS,
+    MIN_DESICCANT_DAYS_LEFT,
+    MIN_DESICCANT_INTERVAL_DAYS,
     MIN_SCHEDULE_AMOUNT,
     SERVICE_ADD_CAT,
     SERVICE_BEEP,
@@ -82,6 +88,7 @@ from .const import (
     SERVICE_SCHEDULE_REMOVE,
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
+    SERVICE_SET_DESICCANT,
     SERVICE_UNLABEL_FACE,
     SERVICE_UPLOAD_FACE_SAMPLE,
     SERVICE_WIFI_CONNECT,
@@ -309,6 +316,23 @@ BEEP_SCHEMA = vol.Schema(
     }
 )
 
+SET_DESICCANT_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Optional("device_id"): cv.string,
+            vol.Optional(ATTR_DAYS_LEFT): vol.All(
+                vol.Coerce(int),
+                vol.Range(min=MIN_DESICCANT_DAYS_LEFT, max=MAX_DESICCANT_DAYS_LEFT),
+            ),
+            vol.Optional(ATTR_INTERVAL_DAYS): vol.All(
+                vol.Coerce(int),
+                vol.Range(min=MIN_DESICCANT_INTERVAL_DAYS, max=MAX_DESICCANT_INTERVAL_DAYS),
+            ),
+        }
+    ),
+    cv.has_at_least_one_key(ATTR_DAYS_LEFT, ATTR_INTERVAL_DAYS),
+)
+
 
 def _entry_payload(entry: dict) -> dict:
     """Translates one validated schedule-entry dict (HA vocabulary) into kibbled's wire
@@ -407,6 +431,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
 async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
     return await hass.config_entries.async_unload_platforms(
         entry, entry.runtime_data.loaded_platforms
+    )
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: KibbleConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow the UI to delete a `kibble` device only once it is no longer the entry's live
+    feeder. Every kibble device's identifier is `(DOMAIN, serial)` (`entity.py`'s
+    `KibbleEntity`); the live feeder's serial is the config entry's own unique id
+    (`config_flow.py` sets it to `state.serial` at setup, stable across reboots and address
+    changes). A device that does not carry that identifier -- an orphan from an earlier,
+    since-replaced serial, or a stale duplicate registration -- is safe to remove; the device
+    this entry actually represents never is."""
+    return not any(
+        domain == DOMAIN and identifier == entry.unique_id
+        for domain, identifier in device.identifiers
     )
 
 
@@ -646,6 +686,16 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Beep", err)
 
+    async def handle_set_desiccant(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
+        try:
+            await coordinator.async_set_desiccant(
+                days_left=call.data.get(ATTR_DAYS_LEFT),
+                interval_days=call.data.get(ATTR_INTERVAL_DAYS),
+            )
+        except KibbleError as err:
+            raise_agent_action_failed("Set desiccant", err)
+
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
     hass.services.async_register(
@@ -709,6 +759,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(DOMAIN, SERVICE_PLAY_CLIP, handle_play_clip, PLAY_CLIP_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_BEEP, handle_beep, BEEP_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_DESICCANT, handle_set_desiccant, SET_DESICCANT_SCHEMA
+    )
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: KibbleConfigEntry) -> None:

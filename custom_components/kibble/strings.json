@@ -102,6 +102,9 @@
       },
       "beep": {
         "name": "Beep"
+      },
+      "replace_desiccant": {
+        "name": "Replace desiccant"
       }
     },
     "event": {
@@ -696,6 +699,24 @@
         "off_ms": {
           "name": "Gap length",
           "description": "How long the silence between beeps lasts, in milliseconds."
+        }
+      }
+    },
+    "set_desiccant": {
+      "name": "Set desiccant",
+      "description": "Set the desiccant pack's remaining days or its rated replacement interval (LibreFeed-only).",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to update."
+        },
+        "days_left": {
+          "name": "Days left",
+          "description": "How many days remain before the desiccant pack should be replaced."
+        },
+        "interval_days": {
+          "name": "Replacement interval",
+          "description": "How many days a fresh desiccant pack is rated to last."
         }
       }
     }

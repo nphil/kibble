@@ -14,14 +14,17 @@ from types import SimpleNamespace
 
 import pytest
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from kibble.api import StackState
 from kibble.coordinator import VendorSighting
 from kibble.sensor import KibbleVendorLastSeenPetSensor
 
 
-def _bare_sensor(vendor_sightings=(), *, last_update_success: bool = True) -> KibbleVendorLastSeenPetSensor:
+def _bare_sensor(
+    vendor_sightings=(), *, last_update_success: bool = True, stack=None
+) -> KibbleVendorLastSeenPetSensor:
     ent = object.__new__(KibbleVendorLastSeenPetSensor)
     ent.coordinator = SimpleNamespace(
-        data=SimpleNamespace(vendor_sightings=vendor_sightings),
+        data=SimpleNamespace(vendor_sightings=vendor_sightings, stack=stack),
         last_update_success=last_update_success,
     )
     ent._restored_value = None
@@ -109,4 +112,25 @@ def test_an_unreachable_feeder_overrides_even_a_restored_value() -> None:
     ent = _bare_sensor(vendor_sightings=(), last_update_success=False)
     ent._restored_value = "Kitty"
     ent._restored_attrs = {"pet_id": "101320712"}
+    assert ent.available is False
+
+
+def test_running_librefeed_is_unavailable_even_with_a_restored_value() -> None:
+    """LibreFeed structurally never produces a `track` event -- a restored value from before
+    a switch away from the vendor stack must not linger as a stale-but-available reading."""
+    ent = _bare_sensor(vendor_sightings=(), stack=StackState(running="librefeed", next="librefeed", librefeed_installed=True))
+    ent._restored_value = "Kitty"
+    ent._restored_attrs = {"pet_id": "101320712"}
+    assert ent.available is False
+
+
+def test_running_vendor_uses_the_normal_sighting_or_restore_check() -> None:
+    ent = _bare_sensor(vendor_sightings=(), stack=StackState(running="vendor", next="vendor", librefeed_installed=False))
+    ent._restored_value = "Kitty"
+    ent._restored_attrs = {"pet_id": "101320712"}
+    assert ent.available is True
+
+
+def test_running_vendor_with_no_sighting_and_no_restore_is_unavailable() -> None:
+    ent = _bare_sensor(vendor_sightings=(), stack=StackState(running="vendor", next="vendor", librefeed_installed=False))
     assert ent.available is False

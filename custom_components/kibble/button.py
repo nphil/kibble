@@ -62,6 +62,7 @@ async def async_setup_entry(
     entities: list[ButtonEntity] = [KibbleFeedButton(coordinator, d) for d in FEEDS]
     entities.append(KibbleCancelButton(coordinator))
     entities.append(KibbleBeepButton(coordinator))
+    entities.append(KibbleReplaceDesiccantButton(coordinator))
     async_add_entities(entities)
 
 
@@ -133,3 +134,24 @@ class KibbleBeepButton(KibbleEntity, ButtonEntity):
             await self.coordinator.async_beep()
         except KibbleError as err:
             raise_agent_action_failed("Beep", err)
+
+
+class KibbleReplaceDesiccantButton(KibbleEntity, ButtonEntity):
+    """Mark the desiccant pack as replaced (`POST /desiccant {"replaced": true}`,
+    LibreFeed-only -- unavailable, not broken, on the vendor stack, whose equivalent counter
+    is set from Petkit's cloud config, not the agent; see `api.py`'s `DesiccantState`)."""
+
+    _attr_translation_key = "replace_desiccant"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "replace_desiccant")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.desiccant is not None
+
+    async def async_press(self) -> None:
+        try:
+            await self.coordinator.async_set_desiccant(replaced=True)
+        except KibbleError as err:
+            raise_agent_action_failed("Replace desiccant", err)

@@ -338,13 +338,23 @@ class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):
 
 
 class KibbleSettingBinarySensor(KibbleEntity, BinarySensorEntity):
-    """One read-only boolean device setting, read from the feeder's shared config."""
+    """One read-only boolean device setting, read from the feeder's shared config.
+
+    Unavailable, rather than a bare `unknown`, when this setting's key is missing from
+    `GET /config` altogether -- LibreFeed serves only `light`/`night`/`microphone` there
+    today, so every other entry in `SETTING_SENSORS` names a vendor-only setting the agent
+    genuinely does not have an opinion on, not a value that happens to be unset. Mirrors
+    `light.py`'s `KibbleStatusLight.available`/`select.py`'s `KibbleStackSelect.available`."""
 
     entity_description: BinarySensorEntityDescription
 
     def __init__(self, coordinator, description: BinarySensorEntityDescription) -> None:
         super().__init__(coordinator, description.key)
         self.entity_description = description
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.entity_description.key in self.coordinator.data.config
 
     @property
     def is_on(self) -> bool | None:

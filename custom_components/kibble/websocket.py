@@ -134,6 +134,28 @@ def _labelled_face_item(event: DetectionEvent) -> dict[str, Any]:
     }
 
 
+def _direct_identified_item(event: DetectionEvent) -> dict[str, Any]:
+    """A `visit`/`eat` row that already carries its own `cat` -- LibreFeed's own onboard
+    identification (`ai::Feed`), which has no separate `track` event to pair against at all.
+    Same `identified` row shape as `_identified_item`/`_labelled_face_item`: `paired_class` is
+    the event's own class (`"eat"|"visit"`, so the card's "ate" vs "was here" verb still
+    works), `image`/`image_kind` point at the event's own crop exactly like
+    `_bare_detection_item` would. `score` -- LibreFeed's own identification confidence -- is
+    carried through only when the event actually has one, so a vendor-shaped event (which
+    never reaches this path -- see `timeline_items`) can never grow a spurious key."""
+    item: dict[str, Any] = {
+        "kind": "identified",
+        "ts": event.ts,
+        "cat": event.cat,
+        "paired_class": event.cls,
+        "image": event.image,
+        "image_kind": "event",
+    }
+    if event.score is not None:
+        item["score"] = event.score
+    return item
+
+
 def _bare_detection_item(event: DetectionEvent, kind: str) -> dict[str, Any]:
     """A `visit`/`eat` row no `track` claimed as its pairing image (see `timeline_items`).
     `image` is the bare `GET /events/<name>` filename, for the HTTP image view's `kind="event"`
@@ -179,14 +201,21 @@ def timeline_items(
     cat, paired via `_track_pair` with the nearest qualifying `eat`/`visit` for its live
     thumbnail. Whichever single `eat`/`visit` a track actually claims is dropped from also
     appearing as its own bare row -- the identified row already carries its image, and the same
-    physical visit showing up twice is exactly the noise this split exists to remove.
+    physical visit showing up twice is exactly the noise this split exists to remove. This is
+    the vendor stack's shape; LibreFeed never emits a `track` at all, so `tracks`/`pairs`/
+    `claimed_ids` are simply empty there and every LibreFeed event falls through to the loop
+    below untouched.
 
-    An unclaimed `eat` stays its own `eat` row: a cat at the bowl the vendor never identified.
-    An unclaimed `visit` stays its own `visit` row, included only when `include_visits` is true
-    (default `False`): a bare "a cat came by" with no identity and no feeding is the least
-    useful row on the timeline. A `face` event produces a row only once it carries a `cat`
-    (`_labelled_face_item`); an unlabelled one is `kibble/faces/*` training material, not
-    timeline activity.
+    A `visit`/`eat` event not claimed by any track and carrying its own `cat` -- LibreFeed's
+    onboard identification, never a vendor shape -- becomes an `identified` row too
+    (`_direct_identified_item`), on either stack: a `track`-less feeder has no other way to
+    ever surface who it saw. An unclaimed, uncatted `eat` stays its own `eat` row: a cat at
+    the bowl nobody identified. An unclaimed, uncatted `visit` stays its own `visit` row,
+    included only when `include_visits` is true (default `False`): a bare "a cat came by"
+    with no identity and no feeding is the least useful row on the timeline -- note a catted
+    `visit` is never "bare", so it is never subject to that gate. A `face` event produces a
+    row only once it carries a `cat` (`_labelled_face_item`); an unlabelled one is
+    `kibble/faces/*` training material, not timeline activity.
     """
     tracks = [e for e in events if e.cls == "track"]
     pairs = [_track_pair(track, events) for track in tracks]
@@ -196,11 +225,17 @@ def timeline_items(
         _identified_item(track, pair, pet_ids) for track, pair in zip(tracks, pairs, strict=True)
     ]
     for event in events:
-        if event.cls == "face" and event.cat:
-            items.append(_labelled_face_item(event))
-        elif event.cls == "eat" and id(event) not in claimed_ids:
+        if event.cls == "face":
+            if event.cat:
+                items.append(_labelled_face_item(event))
+            continue
+        if event.cls not in ("eat", "visit") or id(event) in claimed_ids:
+            continue
+        if event.cat:
+            items.append(_direct_identified_item(event))
+        elif event.cls == "eat":
             items.append(_bare_detection_item(event, "eat"))
-        elif include_visits and event.cls == "visit" and id(event) not in claimed_ids:
+        elif include_visits:
             items.append(_bare_detection_item(event, "visit"))
     items.extend(_feed_item(f) for f in feeds)
     items.sort(key=lambda item: item["ts"], reverse=True)

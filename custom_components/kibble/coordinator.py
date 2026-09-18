@@ -105,6 +105,7 @@ from .api import (
     CatInfo,
     ClipInfo,
     CloudState,
+    DesiccantState,
     DetectionEvent,
     FeederState,
     FeedRecord,
@@ -239,6 +240,10 @@ class KibbleData:
     #: `None` on the vendor stack (`GET /led` is a LibreFeed-only route -- see `light.py`'s
     #: `KibbleStatusLight.available`).
     led: LedState | None = None
+    #: `None` on the vendor stack (`GET /desiccant` is a LibreFeed-only route -- the vendor's
+    #: equivalent counter is cloud-set, not agent-served; see `button.py`'s
+    #: `KibbleReplaceDesiccantButton.available`).
+    desiccant: DesiccantState | None = None
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -474,6 +479,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             # `_async_update_data`'s own `KibbleError` handling exists for.
             stack = None
         led = await _optional(self.client.led(), None)
+        desiccant = await _optional(self.client.desiccant(), None)
         wifi = await self.client.wifi()
         wifi_scan = tuple(await _optional(self.client.wifi_scan(), ()))
         cats = tuple(await _optional(self.client.cats(), ()))
@@ -492,6 +498,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             cloud=cloud,
             stack=stack,
             led=led,
+            desiccant=desiccant,
             wifi=wifi,
             wifi_scan=wifi_scan,
             cats=cats,
@@ -731,6 +738,30 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         the caller uncaught, same as every other `async_*` write here."""
         try:
             return await self.client.beep(count=count, on_ms=on_ms, off_ms=off_ms)
+        finally:
+            await self.async_request_refresh()
+
+    async def async_set_desiccant(
+        self,
+        *,
+        replaced: bool | None = None,
+        days_left: int | None = None,
+        interval_days: int | None = None,
+    ) -> None:
+        """Write the desiccant counter, then refresh so the new value reflects immediately --
+        same "write then refresh" shape as `async_set_led`. The agent's `POST /desiccant`
+        accepts only one field per call (`api.py`'s `set_desiccant`); `kibble.set_desiccant`
+        lets an operator set `days_left` and `interval_days` in the same service call, so
+        those two are issued as sequential writes here rather than exposing that one-field-
+        per-call quirk to the caller. `replaced` (the button) is always given alone. Refreshes
+        exactly once, after every requested write, even if an earlier one raised."""
+        try:
+            if replaced is not None:
+                await self.client.set_desiccant(replaced=replaced)
+            if days_left is not None:
+                await self.client.set_desiccant(days_left=days_left)
+            if interval_days is not None:
+                await self.client.set_desiccant(interval_days=interval_days)
         finally:
             await self.async_request_refresh()
 

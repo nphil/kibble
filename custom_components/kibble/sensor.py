@@ -269,13 +269,23 @@ class KibbleSensor(KibbleEntity, SensorEntity):
 
 
 class KibbleSettingSensor(KibbleEntity, SensorEntity):
-    """One read-only integer device setting, read from the feeder's shared config."""
+    """One read-only integer device setting, read from the feeder's shared config.
+
+    Unavailable, rather than a bare `unknown`, when this setting's key is missing from
+    `GET /config` altogether -- LibreFeed serves only `light`/`night`/`microphone` there
+    today, so every other entry in `SETTING_SENSORS` names a vendor-only setting the agent
+    genuinely does not have an opinion on, not a value that happens to be unset. Mirrors
+    `light.py`'s `KibbleStatusLight.available`/`select.py`'s `KibbleStackSelect.available`."""
 
     entity_description: SensorEntityDescription
 
     def __init__(self, coordinator, description: SensorEntityDescription) -> None:
         super().__init__(coordinator, description.key)
         self.entity_description = description
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.entity_description.key in self.coordinator.data.config
 
     @property
     def native_value(self) -> int | None:
@@ -614,9 +624,13 @@ class KibbleVendorLastSeenPetSensor(KibbleEntity, RestoreEntity, SensorEntity):
     restore this went `unavailable` on every agent restart, which is wrong: nothing about the
     *feeder* is actually unreachable. `RestoreEntity` keeps the last known sighting (state and
     its `pet_id`/`last_identified`/`total_score` attributes) showing across that gap; a fresh
-    `vendor_sightings` entry always wins over the restored one the moment it arrives. Only a
-    genuinely unreachable feeder (`super().available`, i.e. `coordinator.last_update_success`)
-    still marks this unavailable."""
+    `vendor_sightings` entry always wins over the restored one the moment it arrives.
+
+    `track` events are the vendor's own on-device AI -- LibreFeed structurally never produces
+    one, so this sensor is unavailable there deliberately (`data.stack.running != "vendor"`),
+    not as an accident of never having happened to see a sighting yet. An agent old enough to
+    predate `GET /mode` (`data.stack is None`) falls back to the pre-existing sighting-only
+    check -- no opinion either way, same as `select.py`'s `KibbleStackSelect.available`."""
 
     _attr_translation_key = "vendor_last_seen_pet"
 
@@ -645,6 +659,9 @@ class KibbleVendorLastSeenPetSensor(KibbleEntity, RestoreEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
+        stack = self.coordinator.data.stack
+        if stack is not None and stack.running != "vendor":
+            return False
         return super().available and (
             self._latest() is not None or self._restored_value is not None
         )

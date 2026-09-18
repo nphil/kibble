@@ -380,3 +380,25 @@ beep:
           max: 2000
           step: 1
           mode: box
+
+set_desiccant:
+  fields:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: kibble
+    days_left:
+      selector:
+        number:
+          min: 0
+          max: 365
+          step: 1
+          mode: box
+    interval_days:
+      selector:
+        number:
+          min: 1
+          max: 365
+          step: 1
+          mode: box

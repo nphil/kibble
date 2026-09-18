@@ -92,6 +92,9 @@
       },
       "beep": {
         "default": "mdi:bell-ring-outline"
+      },
+      "replace_desiccant": {
+        "default": "mdi:air-filter"
       }
     },
     "image": {
@@ -309,6 +312,7 @@
     "save_clip": "mdi:content-save-outline",
     "record_clip": "mdi:microphone-outline",
     "play_clip": "mdi:play-circle-outline",
-    "beep": "mdi:bell-ring"
+    "beep": "mdi:bell-ring",
+    "set_desiccant": "mdi:air-filter"
   }
 }
