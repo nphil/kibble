@@ -88,7 +88,7 @@ import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
 from homeassistant.components.media_player import async_process_play_media_url
@@ -112,6 +112,7 @@ from .api import (
     KibbleClient,
     KibbleError,
     KibbleMediaError,
+    KibbleNotFoundError,
     ReviewFace,
     ScheduleState,
     StackState,
@@ -191,6 +192,22 @@ def vendor_sightings(
     )
 
 
+_T = TypeVar("_T")
+
+
+async def _optional(coro: Awaitable[_T], default: _T) -> _T:
+    """Await one of `_fetch_all`'s optional reads, substituting `default` for a 404
+    (`KibbleNotFoundError`) -- LibreFeed serves only part of `kibbled`'s API today, and a route
+    it hasn't grown yet must not fail the whole poll cycle any more than an old agent missing
+    `GET /mode` does (see the `try`/`except` around `self.client.mode()` below). Any other
+    `KibbleError` (connection refused, timeout, a real 5xx) still propagates unchanged and
+    fails the poll exactly as before -- only "this route doesn't exist" is optional."""
+    try:
+        return await coro
+    except KibbleNotFoundError:
+        return default
+
+
 @dataclass(frozen=True, slots=True)
 class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
@@ -206,7 +223,6 @@ class KibbleData:
     schedule: ScheduleState
     config: dict[str, int]
     cloud: CloudState
-    stack: StackState | None
     wifi: WifiState
     wifi_scan: tuple[WifiNetwork, ...]
     cats: tuple[CatInfo, ...]
@@ -217,6 +233,8 @@ class KibbleData:
     feeds: tuple[FeedRecord, ...]
     events: tuple[DetectionEvent, ...]
     vendor_sightings: tuple[VendorSighting, ...]
+    #: `None` on agents that predate `GET /mode` (the stack select is unavailable then).
+    stack: StackState | None = None
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -440,8 +458,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         connection `self.client` serialises (see `api.py`). Bounded from the outside by
         `POLL_TIMEOUT` in `_async_update_data`, not by summing each call's own `api.TIMEOUT`."""
         state = await self.client.state()
-        schedule = await self.client.schedule()
-        config = await self.client.config()
+        schedule = await _optional(self.client.schedule(), ScheduleState.from_json({"entries": []}))
+        config = await _optional(self.client.config(), {})
         cloud = await self.client.cloud()
         try:
             stack = await self.client.mode()
@@ -452,14 +470,14 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             # `_async_update_data`'s own `KibbleError` handling exists for.
             stack = None
         wifi = await self.client.wifi()
-        wifi_scan = tuple(await self.client.wifi_scan())
-        cats = tuple(await self.client.cats())
-        identify = await self.client.identify()
-        review_face = await self.client.review_face()
-        pending_face_count = len(await self.client.pending_faces())
-        clips = tuple(await self.client.clips())
-        feeds = tuple(await self.client.feeds())
-        events = tuple(await self.client.events())
+        wifi_scan = tuple(await _optional(self.client.wifi_scan(), ()))
+        cats = tuple(await _optional(self.client.cats(), ()))
+        identify = await _optional(self.client.identify(), IdentifyResult.from_json({}))
+        review_face = await _optional(self.client.review_face(), ReviewFace.from_json({}))
+        pending_face_count = len(await _optional(self.client.pending_faces(), ()))
+        clips = tuple(await _optional(self.client.clips(), ()))
+        feeds = tuple(await _optional(self.client.feeds(), ()))
+        events = tuple(await _optional(self.client.events(), ()))
         # A malformed option can't reach here: the options flow validates it before saving.
         pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
         return KibbleData(

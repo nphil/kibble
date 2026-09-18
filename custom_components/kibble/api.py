@@ -520,13 +520,16 @@ class KibbleClient:
         and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
         (mutually exclusive with `payload`; nothing here needs both at once).
 
-        `not_found_is_missing`: a 404 here names a specific resource the caller asked for by
-        id/name (an unknown cat, an unknown sample) rather than a route this agent version
-        simply doesn't have -- raises `KibbleNotFoundError` (carrying the agent's own
-        `{"error": ...}` message, e.g. "not found") instead of the default "not supported by
+        `not_found_is_missing`: a 404 here names either a specific resource the caller asked
+        for by id/name (an unknown cat, an unknown sample) or an optional route this agent
+        version simply doesn't serve yet (LibreFeed today only implements `/state`, `/feeds`,
+        `/wifi`, `/cloud`, `/mode`, `/schedule`) -- either way it raises `KibbleNotFoundError`
+        (carrying the agent's own `{"error": ...}` message when there is one, e.g. "not
+        found", falling back to `path` otherwise) instead of the default "not supported by
         this agent version" `KibbleError`, exactly like `_get_bytes` already does for crop
-        fetches, so callers (and `websocket.py`'s WS error mapping) can tell "this cat/sample
-        is gone" from "this agent is too old" apart."""
+        fetches, so callers -- `coordinator.py`'s `_fetch_all` for the optional reads, and
+        `websocket.py`'s WS error mapping for the by-id ones -- can tell "this route/
+        cat/sample doesn't exist" from "the agent is genuinely unreachable" apart."""
         async with self._lock:
             try:
                 async with self._session.request(
@@ -596,7 +599,7 @@ class KibbleClient:
     async def config(self) -> dict[str, int]:
         """Every device setting's current value, as reported by `GET /config` (flat
         `{"key": value, ...}` -- see `agent/src/settings.rs`'s `SETTINGS` table)."""
-        body = await self._request("GET", "/config")
+        body = await self._request("GET", "/config", not_found_is_missing=True)
         return {key: int(value) for key, value in body.items()}
 
     async def set_config(self, key: str, value: int) -> dict:
@@ -613,7 +616,7 @@ class KibbleClient:
         return await self._request("POST", "/feed/cancel")
 
     async def schedule(self) -> ScheduleState:
-        return ScheduleState.from_json(await self._request("GET", "/schedule"))
+        return ScheduleState.from_json(await self._request("GET", "/schedule", not_found_is_missing=True))
 
     async def set_schedule(self, entries: list[dict[str, Any]]) -> ScheduleState:
         """Replace the whole table. `entries` items: `time`/`amount_l`/`amount_r`, optional
@@ -682,7 +685,7 @@ class KibbleClient:
 
     async def wifi_scan(self) -> list[WifiNetwork]:
         """Deduplicated (strongest per SSID), hidden SSIDs already omitted by the agent."""
-        networks = await self._request("GET", "/wifi/scan")
+        networks = await self._request("GET", "/wifi/scan", not_found_is_missing=True)
         return [WifiNetwork.from_json(n) for n in networks]
 
     async def wifi_connect(self, ssid: str, psk: str | None = None) -> WifiState:
@@ -705,12 +708,15 @@ class KibbleClient:
         return WifiState.from_json(await self._request("POST", "/wifi/forget", {"ssid": ssid}))
 
     async def cats(self) -> list[CatInfo]:
-        return [CatInfo.from_json(c) for c in await self._request("GET", "/cats")]
+        return [CatInfo.from_json(c) for c in await self._request("GET", "/cats", not_found_is_missing=True)]
 
     async def pending_faces(self) -> list[PendingFace]:
         """Every crop still awaiting a human label (`GET /faces/pending`), newest last. Backs
         both the diagnostic pending-count sensor (via `len()`) and `kibble/faces/pending`."""
-        return [PendingFace.from_json(p) for p in await self._request("GET", "/faces/pending")]
+        return [
+            PendingFace.from_json(p)
+            for p in await self._request("GET", "/faces/pending", not_found_is_missing=True)
+        ]
 
     async def faces_samples(self, cat: str) -> list[FaceSample]:
         """Every permanently-labelled sample in `cat`'s gallery (`GET /faces/samples/<cat>`),
@@ -732,10 +738,12 @@ class KibbleClient:
         )
 
     async def identify(self) -> IdentifyResult:
-        return IdentifyResult.from_json(await self._request("GET", "/identify"))
+        return IdentifyResult.from_json(await self._request("GET", "/identify", not_found_is_missing=True))
 
     async def review_face(self) -> ReviewFace:
-        return ReviewFace.from_json(await self._request("GET", "/faces/current/info"))
+        return ReviewFace.from_json(
+            await self._request("GET", "/faces/current/info", not_found_is_missing=True)
+        )
 
     async def label_face(self, crop_id: str, cat: str) -> None:
         """Moves a pending crop into `cat`'s permanent storage and feeds its embedding into
@@ -794,15 +802,18 @@ class KibbleClient:
         return await self._get_bytes(f"/events/track/{ts}/image")
 
     async def clips(self) -> list[ClipInfo]:
-        return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips")]
+        return [ClipInfo.from_json(c) for c in await self._request("GET", "/clips", not_found_is_missing=True)]
 
     async def feeds(self) -> list[FeedRecord]:
-        return [FeedRecord.from_json(f) for f in await self._request("GET", "/feeds")]
+        return [FeedRecord.from_json(f) for f in await self._request("GET", "/feeds", not_found_is_missing=True)]
 
     async def events(self) -> list[DetectionEvent]:
         """`GET /events`: the agent's last 50 detections, oldest first. Rehydrated from disk on
         agent startup, so this survives a `kibbled` restart."""
-        return [DetectionEvent.from_json(e) for e in await self._request("GET", "/events")]
+        return [
+            DetectionEvent.from_json(e)
+            for e in await self._request("GET", "/events", not_found_is_missing=True)
+        ]
 
     async def speak(self, pcm: bytes) -> dict:
         """`POST /speak`: plays `pcm` (raw signed-16-bit-LE/mono/16kHz, no container -- exactly
