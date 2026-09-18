@@ -60,7 +60,7 @@ async def test_get_led_parsed_reflects_is_on_and_effect_for_auto_and_off() -> No
     fake_auto = SimpleNamespace(coordinator=SimpleNamespace(data=SimpleNamespace(led=auto_led)))
     assert KibbleStatusLight.is_on.fget(fake_auto) is True
     assert KibbleStatusLight.effect.fget(fake_auto) == "auto"
-    assert KibbleStatusLight.extra_state_attributes.fget(fake_auto) == {"green": True}
+    assert KibbleStatusLight.extra_state_attributes.fget(fake_auto) == {"green": True, "camera": "auto"}
 
     off_session = _RecordingSession(200, {"white": 0, "green": 0})
     off_led = await KibbleClient(off_session, HOST, PORT).led()
