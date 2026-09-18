@@ -19,7 +19,8 @@ def _fake_text(description, *, config: dict, last_update_success: bool = True) -
     ent.coordinator = SimpleNamespace(
         data=SimpleNamespace(config=config),
         last_update_success=last_update_success,
-        async_set_config=AsyncMock(),
+        client=SimpleNamespace(set_config=AsyncMock()),
+        async_request_refresh=AsyncMock(),
     )
     return ent
 
@@ -53,10 +54,14 @@ def test_parse_rejects_a_malformed_value() -> None:
 async def test_set_value_writes_both_config_keys_in_order(description) -> None:
     ent = _fake_text(description, config={description.from_key: 0, description.till_key: 0})
     await ent.async_set_value("22:00-07:00")
-    assert ent.coordinator.async_set_config.await_args_list == [
+    assert ent.coordinator.client.set_config.await_args_list == [
         ((description.from_key, 1320),),
         ((description.till_key, 420),),
     ]
+    # Exactly ONE refresh, after BOTH halves: refreshing between them publishes a half-applied
+    # window ("22:30-07:15" briefly rendering "22:30-00:00" on a live feeder), which reads as a
+    # bug to anyone watching the entity.
+    assert ent.coordinator.async_request_refresh.await_count == 1
 
 
 # --- (3) availability: unavailable when either backing key is missing --------------------------

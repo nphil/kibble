@@ -199,7 +199,16 @@ class KibbleHourRangeText(KibbleEntity, TextEntity):
             raise_agent_action_failed(f"Set {self.entity_description.key}", err)
         description = self.entity_description
         try:
-            await self.coordinator.async_set_config(description.from_key, from_minutes)
-            await self.coordinator.async_set_config(description.till_key, till_minutes)
+            # Both halves are written through the client directly, with ONE refresh afterwards,
+            # rather than two `async_set_config` calls that each refresh: the interim refresh
+            # publishes a half-applied window (setting "22:30-07:15" briefly rendered
+            # "22:30-00:00" on a live feeder, because the `till` write had not landed yet), which
+            # reads as a bug even though it settles a moment later. A failure on the second write
+            # still surfaces -- and still leaves the window half-applied on the device, which is
+            # why the error names the whole range rather than one key.
+            await self.coordinator.client.set_config(description.from_key, from_minutes)
+            await self.coordinator.client.set_config(description.till_key, till_minutes)
         except KibbleError as err:
             raise_agent_action_failed(f"Set {self.entity_description.key}", err)
+        finally:
+            await self.coordinator.async_request_refresh()
