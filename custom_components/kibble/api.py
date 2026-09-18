@@ -68,6 +68,30 @@ class KibbleNotFoundError(KibbleError):
 
 
 @dataclass(frozen=True, slots=True)
+class KeyEvent:
+    """The feeder's most recent physical-button event, as reported by `GET /state`'s
+    `last_key` (LibreFeed-only -- the vendor stack never populates this key; see
+    `FeederState.raw`). `node` identifies which of the three buttons: `3` pairing/reset,
+    `2` button "1" (hopper 1), `1` button "2" (hopper 2). `event` is the MCU's own code:
+    `4` press, `1` short release, `3` long-press threshold reached (~2s held), `5` release
+    after a long press. `at_ms` is milliseconds since the agent's own process start
+    (monotonic, not wall-clock) -- only useful to tell two reports apart, never to compute
+    an absolute time."""
+
+    node: int
+    event: int
+    at_ms: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> KeyEvent:
+        return cls(
+            node=int(data.get("node") or 0),
+            event=int(data.get("event") or 0),
+            at_ms=int(data.get("at_ms") or 0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FeederState:
     """One snapshot of the feeder, as reported by `GET /state`."""
 
@@ -103,6 +127,9 @@ class FeederState:
     agent_starts: int
     agent_last_start: int | None
     agent_last_exit_code: int | None
+    #: The feeder's most recent physical-button event (`GET /state`'s `last_key`), `None` if
+    #: the feeder has never reported one this boot -- LibreFeed-only, see `KeyEvent`.
+    last_key: KeyEvent | None
     raw: dict[str, Any]
 
     @classmethod
@@ -141,6 +168,7 @@ class FeederState:
             agent_starts=int(data.get("kibbled_start_count") or 0),
             agent_last_start=int(last_start) if isinstance(last_start, (int, float)) else None,
             agent_last_exit_code=int(exit_code) if isinstance(exit_code, (int, float)) else None,
+            last_key=KeyEvent.from_json(last_key) if (last_key := data.get("last_key")) else None,
             raw=data,
         )
 

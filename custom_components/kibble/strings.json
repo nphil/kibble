@@ -101,6 +101,44 @@
         "name": "Cancel feed"
       }
     },
+    "event": {
+      "button_pairing": {
+        "name": "Pairing button",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "press": "Press",
+              "long_press": "Long press",
+              "release": "Release"
+            }
+          }
+        }
+      },
+      "button_1": {
+        "name": "Button 1",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::press%]",
+              "long_press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::long_press%]",
+              "release": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::release%]"
+            }
+          }
+        }
+      },
+      "button_2": {
+        "name": "Button 2",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::press%]",
+              "long_press": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::long_press%]",
+              "release": "[%key:component::kibble::entity::event::button_pairing::state_attributes::event_type::state::release%]"
+            }
+          }
+        }
+      }
+    },
     "image": {
       "pending_face": {
         "name": "Pending face"
