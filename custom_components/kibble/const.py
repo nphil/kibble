@@ -150,9 +150,9 @@ ATTR_SECONDS = "seconds"
 
 # `media_player.*.volume_level` is HA's own 0.0-1.0 (shown as 0-100% in the UI); the device's
 # own writable range is `agent/src/settings.rs`'s "volume" setting (`Kind::Int{min:0,max:9}`),
-# the exact same `config["volume"]` number.py's `KibbleVolumeNumber` already reads/writes
-# through `POST /config`. Not `GET /state`'s own (different config_shm offset, currently
-# unused by this integration) `volume` field.
+# the exact same `config["volume"]` `media_player.py`'s `KibbleSpeaker.volume_level` already
+# reads/writes through `POST /config`. Not `GET /state`'s own (different config_shm offset,
+# currently unused by this integration) `volume` field.
 MAX_DEVICE_VOLUME = 9
 
 # A "clip" is a short prompt/announcement, not a recording -- bounds `record_clip`'s capture

@@ -88,14 +88,13 @@ below: `sensor.vendor_last_seen_pet`.
 | microphone | KibbleSettingSwitch | POST /config → microphone (writable) | CONFIG | No | microphone |
 | cloud | KibbleCloudSwitch | POST /cloud → enabled (writable) | CONFIG | Yes | cloud-off-outline |
 
-### number.py (4 entities)
+### number.py (3 entities)
 
 | Translation Key | Entity Class | Endpoint/Field | Mode | Min | Max | Step | Category | Default | Icon |
 |---|---|---|---|---|---|---|---|---|---|
 | feed_amount | KibbleFeedAmount | HA RestoreEntity (local state) | BOX | 1 | 20 | 1 | — | 1 | counter |
 | feed_amount_hopper_1 | KibbleFeedAmount | HA RestoreEntity (local state) | BOX | 1 | 20 | 1 | — | 1 | numeric-1-box-outline |
 | feed_amount_hopper_2 | KibbleFeedAmount | HA RestoreEntity (local state) | BOX | 1 | 20 | 1 | — | 1 | numeric-2-box-outline |
-| volume | KibbleVolumeNumber | POST /config → volume (0-9 scaled 0.0-1.0) | BOX | 0 | 9 | 1 | CONFIG | No | volume-high |
 
 ### button.py (4 entities)
 

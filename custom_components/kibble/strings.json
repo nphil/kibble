@@ -178,9 +178,6 @@
       },
       "feed_amount_hopper_2": {
         "name": "Feed amount hopper 2"
-      },
-      "volume": {
-        "name": "Volume"
       }
     },
     "sensor": {

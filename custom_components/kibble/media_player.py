@@ -80,8 +80,8 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
 
     @property
     def volume_level(self) -> float | None:
-        """The device's own `config["volume"]` (0-9 -- the exact setting `number.py`'s
-        `KibbleVolumeNumber` already reads/writes), scaled to HA's 0.0-1.0."""
+        """The device's own `config["volume"]` (0-9, the only writable integer setting in
+        `agent/src/settings.rs`'s table), scaled to HA's 0.0-1.0."""
         value = self.coordinator.data.config.get("volume")
         return None if value is None else value / MAX_DEVICE_VOLUME
 

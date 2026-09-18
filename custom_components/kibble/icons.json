@@ -125,9 +125,6 @@
       },
       "feed_amount_hopper_2": {
         "default": "mdi:numeric-2-box-outline"
-      },
-      "volume": {
-        "default": "mdi:volume-high"
       }
     },
     "sensor": {
