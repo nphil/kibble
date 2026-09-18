@@ -1,13 +1,17 @@
-// Wire shape of one entry from `GET /events` / `GET /events/stream?since=N` on the Kibble agent
-// (kibbled), exactly as produced by `agent/src/ai.rs`'s `Detection::to_json()`. Keep this in sync
-// with that function's field list, not with what would be convenient here -- the whole point of
-// this plugin is to report what the agent actually says, not a nicer-looking guess.
+// Wire shape of one entry from `GET /events` / `GET /events/stream?since=N` on the feeder's
+// agent (LibreFeed's `librefeedd`, still `kibbled`-shaped on this route -- see
+// `librefeed/daemon/src/vision.rs`'s `Track::to_json()`, which deliberately mirrors the vendor
+// `kibbled`'s own `Detection::to_json()` field list). Keep this in sync with that function's
+// field list, not with what would be convenient here -- the whole point of this plugin is to
+// report what the agent actually says, not a nicer-looking guess.
 //
-// `score`, `box` and `pet_id` are *always* `null` today: that data lives only inside a private
-// vendor message queue (`ctrl`'s own `/msg_dispatch_1`) that `docs/24-onboard-ai.md` documents in
-// full but that Kibble deliberately does not tap (a POSIX mqueue has exactly one reader, and
-// stealing `ctrl`'s messages would be a real behavioural change to a vendor process). `class`,
-// `image` (a filename, see below) and `cat` are real.
+// `box` and `pet_id` are *always* `null` on this stack: no vendor tracker exists here at all
+// (`vision.rs`'s own module doc, "Split" section) -- the vendor's private-mqueue tracker data
+// `docs/24-onboard-ai.md` describes belongs to a different, unrelated firmware this plugin does
+// not talk to. `score` and `total_score` are the *identification* confidence for `cat`, honestly
+// `null` whenever naming is off (the feeder's current `/vision` config) or nothing was matched --
+// never a fabricated number. `class`, `image`, `cat`, `vomit`, `image_before`, `image_after` are
+// real, live values.
 export interface RawDetection {
     seq: number;
     ts: number;
@@ -15,17 +19,29 @@ export interface RawDetection {
     score: number | null;
     box: [number, number, number, number] | null;
     pet_id: number | null;
-    /**
-     * A filename under the agent's own `/opt/kibble/events/` directory -- NOT a URL and NOT
-     * fetchable over HTTP. `agent/src/main.rs` never wires a route that serves this directory
-     * (confirmed by reading its full route table); only `class: "face"` crops are *also* written
-     * to `faces::PENDING_DIR`, which the agent's `/faces/current`/`/faces/pending/<name>` GETs do
-     * serve. See `KibbleDetectionFeed`'s doc comment for exactly how this plugin works around that
-     * real gap instead of pretending the field is directly usable.
-     */
+    /** A filename under the agent's own events directory, fetchable via `GET /events/<file>`
+     * (added upstream after this plugin's own earlier draft flagged the gap -- see `mixin.ts`'s
+     * `tryFetchCrop` and the README's "A real gap this plugin found" section). `null` when the
+     * event has no crop of its own (e.g. an `eat` closed with no fresh frame). */
     image: string | null;
-    /** Kibble's own nearest-centroid classifier's opinion at capture time, or `null`. */
+    /** The feeder's own nearest-centroid classifier's opinion for this specific track, at
+     * capture time, or `null` (identification/naming off, or no confident match). Distinct from
+     * `GET /identify`'s always-freshest live opinion (`IdentifyResponse` below) -- this is what
+     * the track itself was identified as when it happened. */
     cat: string | null;
+    /** The vendor's own per-visit tracking score (`state::TrackEntry::value` on vendor
+     * firmware) -- a sum over qualifying frames, not a probability, and unrelated to `score`
+     * above. Always `null` on this stack (see the module doc); kept for vendor-firmware parity. */
+    total_score: number | null;
+    /** Extra frames LibreFeed's vision stack captures bracketing an `eat` close (before/after
+     * the bowl visit), same fetch mechanism as `image`. `null` when not captured. Not currently
+     * surfaced by this plugin -- see `mixin.ts`. */
+    image_before: string | null;
+    image_after: string | null;
+    /** `true` once any frame during this track reported vomiting behaviour above the feeder's
+     * own threshold (LibreFeed-only; sticky for the whole track, like `class: "eat"`). Always
+     * `false` unless `/vision`'s `vomit` detector is enabled. */
+    vomit: boolean;
 }
 
 /** Agent connection settings, read live off the provider's `StorageSettings` on every use so a

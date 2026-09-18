@@ -22,9 +22,11 @@ const POLL_GAP_MS = 5_000;
 /** `GET /events` is an instant in-memory read; this is a sanity ceiling, not an expected wait. */
 const REQUEST_TIMEOUT_MS = 5_000;
 const RETRY_DELAY_MS = 10_000;
-/** LibreFeed serves no `/events` (the vision stack is vendor-only until its stage 4), so a 404
- * is a stack answer, not a fault: re-check at this gap so a switch back to the vendor stack is
- * picked up, and say so once rather than every retry. */
+/** A 404 on `/events` is a stack answer, not a fault, for a feeder running a build that
+ * predates LibreFeed's vision stack (Stage 4) or a vendor build that never had it -- not the
+ * common case now that the vision stack has shipped, but still a real one worth handling rather
+ * than treating as an error. Re-check at this gap so a later upgrade to a vision-enabled build
+ * is picked up, and say so once rather than every retry. */
 const NOT_SERVED_RECHECK_MS = 60_000;
 
 export class KibbleDetectionFeed {

@@ -63,7 +63,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
     }
 
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
-        const classes = new Set(['face', 'visit', 'eat']);
+        const classes = new Set(['face', 'visit', 'eat', 'vomit']);
         if (this.getConfig().secondPassEnabled) {
             this.secondPassDetector ??= findSecondPassDetector();
             if (this.secondPassDetector) {
@@ -168,11 +168,26 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
                 if (identify.score !== null)
                     onDevice.labelScore = identify.score;
             }
+        } else if (raw.cat) {
+            // LibreFeed's `visit`/`eat` rows carry the track's own identification directly (no
+            // separate `/identify` round trip, unlike the vendor `face` path above) -- `null`
+            // whenever naming is off or nothing was matched, per `types.ts`. Mirrored as-is,
+            // never invented.
+            onDevice.label = raw.cat;
+            if (raw.score !== null)
+                onDevice.labelScore = raw.score;
         }
 
         // See the module doc comment on `HonestDetectionResult` for why this cast, and only this
         // one field, is missing rather than fabricated.
         const results: ObjectDetectionResult[] = [onDevice as ObjectDetectionResult];
+        if (raw.vomit) {
+            // Same track, same crop (if any) -- a second detection entry rather than a second
+            // event, so a consumer that only looks at `class` still sees the vomit independently
+            // of whether this track also carries a `visit`/`eat` label above.
+            const vomit: HonestDetectionResult = { className: 'vomit' };
+            results.push(vomit as ObjectDetectionResult);
+        }
         if (crop && config.secondPassEnabled)
             results.push(...await this.trySecondPass(crop));
 
