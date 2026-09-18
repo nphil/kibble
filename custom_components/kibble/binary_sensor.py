@@ -57,54 +57,17 @@ def vomit_is_fresh(detected_at: int | None, now: datetime) -> bool:
     return detected_at is not None and now - dt_util.utc_from_timestamp(detected_at) < VOMIT_FRESH_WINDOW
 
 
-# Every boolean setting `agent/src/settings.rs` marks read-only. The writable booleans
-# (`light`, `night`, `microphone`, `vomit_detection`) are controls instead -- see `switch.py`.
-# `move_track_enable` is skipped: it has no `cjson_key` of its own (an undocumented neighbour
-# of `move_detection`) and is not independently user-controllable, so it carries no dedicated
-# entity.
+# Every boolean setting still without a writable plumbed key. `light`, `night`, `microphone`,
+# `vomit_detection`, `pet_detection`, `move_detection`, `eat_detection`, `feed_picture`,
+# `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode` are controls
+# instead -- see `switch.py`. What's left here is out of scope for the batch that plumbed
+# those: `sound_enable`/`system_sound_enable`/`feed_sound` need sound-gating/clip-selection
+# plumbing first, `manual_lock`'s MCU protocol is still undecoded, and `smart_frame`
+# (auto-framing) needs the IVPS crop-follows-body work -- see LibreFeed's own
+# `docs/06-entity-audit.md`. `move_track_enable` is skipped entirely: it has no `cjson_key` of
+# its own (an undocumented neighbour of `move_detection`) and is not independently
+# user-controllable, so it carries no dedicated entity.
 SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
-    BinarySensorEntityDescription(
-        key="time_display",
-        translation_key="time_display",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="camera",
-        translation_key="camera",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="move_detection",
-        translation_key="move_detection",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="pet_detection",
-        translation_key="pet_detection",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="eat_detection",
-        translation_key="eat_detection",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="feed_picture",
-        translation_key="feed_picture",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="eat_video",
-        translation_key="eat_video",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
     BinarySensorEntityDescription(
         key="sound_enable",
         translation_key="sound_enable",
@@ -120,24 +83,6 @@ SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
     BinarySensorEntityDescription(
         key="feed_sound",
         translation_key="feed_sound",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="food_warn",
-        translation_key="food_warn",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="light_mode",
-        translation_key="light_mode",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="tone_mode",
-        translation_key="tone_mode",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),

@@ -194,3 +194,26 @@ MIN_DESICCANT_DAYS_LEFT = 0
 MAX_DESICCANT_DAYS_LEFT = 365
 MIN_DESICCANT_INTERVAL_DAYS = 1
 MAX_DESICCANT_INTERVAL_DAYS = 365
+
+# `pet_sensitivity`/`move_sensitivity`/`eat_sensitivity`'s own writable range -- LibreFeed's
+# `/config` contract: 0-100, higher means more sensitive. Not the vendor's original 1-9
+# Localkit scale (`docs/appendix-localkit.md`'s harvested app schema); LibreFeed owns this
+# config now and defines its own.
+MIN_SENSITIVITY = 0
+MAX_SENSITIVITY = 100
+
+# `detect_interval`'s own writable range, in seconds. The vendor's own Localkit-harvested
+# schema (`docs/appendix-localkit.md`) documents the same key as "int, 0-300, Min seconds
+# between detections" -- LibreFeed's daemon keeps that bound for the same reason the vendor
+# had it: above a few minutes the body/eat/motion detectors are effectively disabled, so a
+# wider range would just be dead UI.
+MIN_DETECT_INTERVAL_S = 0
+MAX_DETECT_INTERVAL_S = 300
+
+# Minutes since local midnight -- the device's own encoding for every schedule pair
+# (`detect_range_from/_till`, `light_range_from/_till`, `tone_range_from/_till`). `from ==
+# till` means "always active"; `from > till` is a legitimate overnight window (the vendor's
+# own `toneMultiRange` documents exactly this: "1320-360 wraps midnight"), so nothing here
+# enforces `from <= till`.
+MIN_MINUTES_OF_DAY = 0
+MAX_MINUTES_OF_DAY = 1439

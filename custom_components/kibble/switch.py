@@ -1,8 +1,14 @@
 """Switches for the feeder's writable boolean settings.
 
-Of `agent/src/settings.rs`'s 37 device settings, four booleans are confirmed writable
-(`light`, `night`, `microphone`, `vomit_detection` -- the same keys `POST /config` accepts).
-Every other boolean setting is read-only and lives in `binary_sensor.py` instead, so this
+`light`, `night`, `microphone`, `vomit_detection` were the original writable set (the same
+keys the vendor's own `agent/src/settings.rs` also marked writable). kibbled deliberately left
+every other boolean setting read-only rather than risk writing the vendor's `config_shm`
+directly (see `binary_sensor.py`). LibreFeed owns its own `/config` now, so that caution no
+longer applies -- this batch adds ten more vision.json- and settings.json-backed booleans real
+feeder features gate on: `pet_detection`, `move_detection`, `eat_detection`, `feed_picture`,
+`eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode` (see LibreFeed's
+own `docs/06-entity-audit.md`, the `writable-after-plumbing` table). Every setting still
+missing a plumbed key stays read-only and lives in `binary_sensor.py` instead, so this
 platform never exposes a control surface the agent would reject.
 """
 
@@ -47,6 +53,66 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
     SwitchEntityDescription(
         key="vomit_detection",
         translation_key="vomit_detection",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="pet_detection",
+        translation_key="pet_detection",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="move_detection",
+        translation_key="move_detection",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="eat_detection",
+        translation_key="eat_detection",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="feed_picture",
+        translation_key="feed_picture",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="eat_video",
+        translation_key="eat_video",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="food_warn",
+        translation_key="food_warn",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="time_display",
+        translation_key="time_display",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="camera",
+        translation_key="camera",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="light_mode",
+        translation_key="light_mode",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    SwitchEntityDescription(
+        key="tone_mode",
+        translation_key="tone_mode",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),

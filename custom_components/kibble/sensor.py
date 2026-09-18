@@ -116,11 +116,16 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
 )
 
 
-# Every integer setting `agent/src/settings.rs` marks read-only, minus `c_time`: that
-# field's own description says it is "folded into the schedule surface rather than getting
-# its own HA entity" -- it is the same value `KibbleScheduleSensor` below already reports as
-# its `last_modified` attribute, so a second, disabled-by-default duplicate here would add
-# nothing.
+# Every integer setting still without a writable plumbed key, minus `c_time`: that field's
+# own description says it is "folded into the schedule surface rather than getting its own HA
+# entity" -- it is the same value `KibbleScheduleSensor` below already reports as its
+# `last_modified` attribute, so a second, disabled-by-default duplicate here would add
+# nothing. `move_sensitivity`/`pet_sensitivity`/`eat_sensitivity`/`detect_interval`/
+# `detect_range_from`/`detect_range_till`/`light_range_from`/`light_range_till`/
+# `tone_range_from`/`tone_range_till` are writable `number` entities instead -- see
+# `number.py`'s `SETTING_NUMBERS`. What's left here (`selected_sound`, `factor1`, `factor2`,
+# `surplus_control`, `surplus_standard`) is out of scope for the batch that moved those: see
+# LibreFeed's own `docs/06-entity-audit.md`.
 #
 # `selected_sound` and `surplus_control` are plain integers here, not `select`: neither has
 # a confirmed option list. settings.rs says so directly -- `selected_sound`'s "valid id range
@@ -128,43 +133,6 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
 # in Localkit's own app schema. A `select` needs a real option list to render; these don't
 # have one.
 SETTING_SENSORS: tuple[SensorEntityDescription, ...] = (
-    SensorEntityDescription(
-        key="move_sensitivity",
-        translation_key="move_sensitivity",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="pet_sensitivity",
-        translation_key="pet_sensitivity",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="eat_sensitivity",
-        translation_key="eat_sensitivity",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="detect_interval",
-        translation_key="detect_interval",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="detect_range_from",
-        translation_key="detect_range_from",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="detect_range_till",
-        translation_key="detect_range_till",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
     SensorEntityDescription(
         key="selected_sound",
         translation_key="selected_sound",
@@ -180,30 +148,6 @@ SETTING_SENSORS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
         key="factor2",
         translation_key="factor2",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="light_range_from",
-        translation_key="light_range_from",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="light_range_till",
-        translation_key="light_range_till",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="tone_range_from",
-        translation_key="tone_range_from",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="tone_range_till",
-        translation_key="tone_range_till",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),

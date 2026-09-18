@@ -32,13 +32,13 @@ def _fake_setting_sensor(cls, key: str, *, config: dict, last_update_success: bo
 
 
 def test_setting_sensor_is_unavailable_when_its_key_is_absent_from_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingSensor, "eat_sensitivity", config={"light": 1})
+    ent = _fake_setting_sensor(KibbleSettingSensor, "surplus_control", config={"light": 1})
     assert ent.available is False
     assert ent.native_value is None
 
 
 def test_setting_sensor_is_available_when_its_key_is_present_in_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingSensor, "eat_sensitivity", config={"eat_sensitivity": 3})
+    ent = _fake_setting_sensor(KibbleSettingSensor, "surplus_control", config={"surplus_control": 3})
     assert ent.available is True
     assert ent.native_value == 3
 
@@ -53,18 +53,18 @@ def test_setting_sensor_unavailable_even_with_a_falsy_value_present() -> None:
 
 def test_setting_sensor_unreachable_feeder_overrides_a_present_key() -> None:
     ent = _fake_setting_sensor(
-        KibbleSettingSensor, "eat_sensitivity", config={"eat_sensitivity": 3}, last_update_success=False
+        KibbleSettingSensor, "surplus_control", config={"surplus_control": 3}, last_update_success=False
     )
     assert ent.available is False
 
 
 def test_setting_binary_sensor_is_unavailable_when_its_key_is_absent_from_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "pet_detection", config={"microphone": 1})
+    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "smart_frame", config={"microphone": 1})
     assert ent.available is False
     assert ent.is_on is None
 
 
 def test_setting_binary_sensor_is_available_when_its_key_is_present_in_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "pet_detection", config={"pet_detection": 0})
+    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "smart_frame", config={"smart_frame": 0})
     assert ent.available is True
     assert ent.is_on is False

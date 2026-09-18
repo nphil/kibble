@@ -38,27 +38,6 @@
       "hopper_2_empty": {
         "name": "Hopper 2 empty"
       },
-      "time_display": {
-        "name": "Video timestamp overlay"
-      },
-      "camera": {
-        "name": "Camera stream"
-      },
-      "move_detection": {
-        "name": "Motion detection"
-      },
-      "pet_detection": {
-        "name": "Pet detection"
-      },
-      "eat_detection": {
-        "name": "Eating detection"
-      },
-      "feed_picture": {
-        "name": "Photo on feed"
-      },
-      "eat_video": {
-        "name": "Video on eating detection"
-      },
       "sound_enable": {
         "name": "Feed voice prompt"
       },
@@ -67,15 +46,6 @@
       },
       "feed_sound": {
         "name": "Feed-complete sound"
-      },
-      "food_warn": {
-        "name": "Low-food warning"
-      },
-      "light_mode": {
-        "name": "Status LED schedule"
-      },
-      "tone_mode": {
-        "name": "Do-not-disturb"
       },
       "manual_lock": {
         "name": "Child lock"
@@ -178,6 +148,36 @@
       },
       "feed_amount_hopper_2": {
         "name": "Feed amount hopper 2"
+      },
+      "pet_sensitivity": {
+        "name": "Pet detection sensitivity"
+      },
+      "move_sensitivity": {
+        "name": "Motion detection sensitivity"
+      },
+      "eat_sensitivity": {
+        "name": "Eating detection sensitivity"
+      },
+      "detect_interval": {
+        "name": "Detection interval"
+      },
+      "detect_range_from": {
+        "name": "Detection active hours start"
+      },
+      "detect_range_till": {
+        "name": "Detection active hours end"
+      },
+      "light_range_from": {
+        "name": "Status LED active hours start"
+      },
+      "light_range_till": {
+        "name": "Status LED active hours end"
+      },
+      "tone_range_from": {
+        "name": "Do-not-disturb hours start"
+      },
+      "tone_range_till": {
+        "name": "Do-not-disturb hours end"
       }
     },
     "sensor": {
@@ -210,24 +210,6 @@
         "name": "Hopper 2 level",
         "state": {"empty": "Empty", "low": "Low", "ok": "OK"}
       },
-      "move_sensitivity": {
-        "name": "Motion detection sensitivity"
-      },
-      "pet_sensitivity": {
-        "name": "Pet detection sensitivity"
-      },
-      "eat_sensitivity": {
-        "name": "Eating detection sensitivity"
-      },
-      "detect_interval": {
-        "name": "Detection interval"
-      },
-      "detect_range_from": {
-        "name": "Detection active hours start"
-      },
-      "detect_range_till": {
-        "name": "Detection active hours end"
-      },
       "selected_sound": {
         "name": "Selected notification sound"
       },
@@ -236,18 +218,6 @@
       },
       "factor2": {
         "name": "Hopper 2 calibration factor"
-      },
-      "light_range_from": {
-        "name": "Status LED active hours start"
-      },
-      "light_range_till": {
-        "name": "Status LED active hours end"
-      },
-      "tone_range_from": {
-        "name": "Do-not-disturb hours start"
-      },
-      "tone_range_till": {
-        "name": "Do-not-disturb hours end"
       },
       "surplus_control": {
         "name": "Leftover food detection state"
@@ -311,6 +281,36 @@
       },
       "vomit_detection": {
         "name": "Vomit detection"
+      },
+      "pet_detection": {
+        "name": "Pet detection"
+      },
+      "move_detection": {
+        "name": "Motion detection"
+      },
+      "eat_detection": {
+        "name": "Eating detection"
+      },
+      "feed_picture": {
+        "name": "Photo on feed"
+      },
+      "eat_video": {
+        "name": "Video on eating detection"
+      },
+      "food_warn": {
+        "name": "Low-food warning"
+      },
+      "time_display": {
+        "name": "Video timestamp overlay"
+      },
+      "camera": {
+        "name": "Camera stream"
+      },
+      "light_mode": {
+        "name": "Status LED schedule"
+      },
+      "tone_mode": {
+        "name": "Do-not-disturb"
       },
       "cloud": {
         "name": "Petkit cloud"

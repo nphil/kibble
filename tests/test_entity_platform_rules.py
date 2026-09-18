@@ -102,6 +102,8 @@ def _all_facts() -> list[EntityFact]:
         facts.append(_fact_from_description("switch", desc))
     for desc in number.AMOUNTS:
         facts.append(_fact_from_description("number", desc))
+    for desc in number.SETTING_NUMBERS:
+        facts.append(_fact_from_description("number", desc))
     for desc in button.FEEDS:
         facts.append(_fact_from_description("button", desc))
     for desc in image.DISH_IMAGES:

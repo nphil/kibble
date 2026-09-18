@@ -31,27 +31,6 @@
           "on": "mdi:food-drumstick-off"
         }
       },
-      "time_display": {
-        "default": "mdi:clock-outline"
-      },
-      "camera": {
-        "default": "mdi:cctv"
-      },
-      "move_detection": {
-        "default": "mdi:run"
-      },
-      "pet_detection": {
-        "default": "mdi:cat"
-      },
-      "eat_detection": {
-        "default": "mdi:silverware-fork-knife"
-      },
-      "feed_picture": {
-        "default": "mdi:camera-outline"
-      },
-      "eat_video": {
-        "default": "mdi:video-outline"
-      },
       "sound_enable": {
         "default": "mdi:bullhorn-outline"
       },
@@ -60,15 +39,6 @@
       },
       "feed_sound": {
         "default": "mdi:music-note-outline"
-      },
-      "food_warn": {
-        "default": "mdi:alert-outline"
-      },
-      "light_mode": {
-        "default": "mdi:led-variant-outline"
-      },
-      "tone_mode": {
-        "default": "mdi:volume-off"
       },
       "manual_lock": {
         "default": "mdi:lock-outline"
@@ -128,6 +98,36 @@
       },
       "feed_amount_hopper_2": {
         "default": "mdi:numeric-2-box-outline"
+      },
+      "pet_sensitivity": {
+        "default": "mdi:cat"
+      },
+      "move_sensitivity": {
+        "default": "mdi:run"
+      },
+      "eat_sensitivity": {
+        "default": "mdi:silverware-fork-knife"
+      },
+      "detect_interval": {
+        "default": "mdi:timer-outline"
+      },
+      "detect_range_from": {
+        "default": "mdi:clock-start"
+      },
+      "detect_range_till": {
+        "default": "mdi:clock-end"
+      },
+      "light_range_from": {
+        "default": "mdi:clock-start"
+      },
+      "light_range_till": {
+        "default": "mdi:clock-end"
+      },
+      "tone_range_from": {
+        "default": "mdi:clock-start"
+      },
+      "tone_range_till": {
+        "default": "mdi:clock-end"
       }
     },
     "sensor": {
@@ -149,24 +149,6 @@
       "schedule_card_state": {
         "default": "mdi:calendar-text-outline"
       },
-      "move_sensitivity": {
-        "default": "mdi:run"
-      },
-      "pet_sensitivity": {
-        "default": "mdi:cat"
-      },
-      "eat_sensitivity": {
-        "default": "mdi:silverware-fork-knife"
-      },
-      "detect_interval": {
-        "default": "mdi:timer-outline"
-      },
-      "detect_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "detect_range_till": {
-        "default": "mdi:clock-end"
-      },
       "selected_sound": {
         "default": "mdi:music-note"
       },
@@ -175,18 +157,6 @@
       },
       "factor2": {
         "default": "mdi:scale-balance"
-      },
-      "light_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "light_range_till": {
-        "default": "mdi:clock-end"
-      },
-      "tone_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "tone_range_till": {
-        "default": "mdi:clock-end"
       },
       "surplus_control": {
         "default": "mdi:food-off-outline"
@@ -293,6 +263,36 @@
         "state": {
           "on": "mdi:emoticon-sick"
         }
+      },
+      "pet_detection": {
+        "default": "mdi:cat"
+      },
+      "move_detection": {
+        "default": "mdi:run"
+      },
+      "eat_detection": {
+        "default": "mdi:silverware-fork-knife"
+      },
+      "feed_picture": {
+        "default": "mdi:camera-outline"
+      },
+      "eat_video": {
+        "default": "mdi:video-outline"
+      },
+      "food_warn": {
+        "default": "mdi:alert-outline"
+      },
+      "time_display": {
+        "default": "mdi:clock-outline"
+      },
+      "camera": {
+        "default": "mdi:cctv"
+      },
+      "light_mode": {
+        "default": "mdi:led-variant-outline"
+      },
+      "tone_mode": {
+        "default": "mdi:volume-off"
       }
     }
   },
