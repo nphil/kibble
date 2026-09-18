@@ -81,7 +81,7 @@ class KibbleStatusLight(KibbleEntity, LightEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         led = self.coordinator.data.led
-        return {} if led is None else {"green": bool(led.green)}
+        return {} if led is None else {"green": bool(led.green), "camera": led.camera}
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         effect = kwargs.get(ATTR_EFFECT)

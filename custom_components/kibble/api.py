@@ -245,17 +245,21 @@ class LedState:
     """The feeder's status LED, as reported by `GET /led` (LibreFeed-only -- the vendor stack
     doesn't serve this route; see `_request`'s `not_found_is_missing`). `white` is either the
     device's own automatic policy (`"auto"`) or a forced override: `0` off, `1` on, `2` blink,
-    `3` fast blink. `green` is the second LED element, plain on/off."""
+    `3` fast blink. `green` is the second LED element, plain on/off. `camera` is the front
+    camera-indicator LED: `"auto"` (on while a stream is being watched) or forced `0`/`1`."""
 
     white: str | int
     green: int
+    camera: str | int
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> LedState:
         white = data.get("white", "auto")
+        camera = data.get("camera", "auto")
         return cls(
             white=white if white == "auto" else int(white),
             green=int(data.get("green") or 0),
+            camera=camera if camera == "auto" else int(camera),
         )
 
 @dataclass(frozen=True, slots=True)
