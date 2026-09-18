@@ -239,6 +239,25 @@ class StackState:
             librefeed_installed=bool(data.get("librefeed_installed", False)),
         )
 
+
+@dataclass(frozen=True, slots=True)
+class LedState:
+    """The feeder's status LED, as reported by `GET /led` (LibreFeed-only -- the vendor stack
+    doesn't serve this route; see `_request`'s `not_found_is_missing`). `white` is either the
+    device's own automatic policy (`"auto"`) or a forced override: `0` off, `1` on, `2` blink,
+    `3` fast blink. `green` is the second LED element, plain on/off."""
+
+    white: str | int
+    green: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> LedState:
+        white = data.get("white", "auto")
+        return cls(
+            white=white if white == "auto" else int(white),
+            green=int(data.get("green") or 0),
+        )
+
 @dataclass(frozen=True, slots=True)
 class WifiNetwork:
     """One scanned Wi-Fi network, as reported by `GET /wifi/scan` -- already deduplicated by
@@ -679,6 +698,21 @@ class KibbleClient:
         `coordinator.py`'s `async_set_mode` does not refresh afterwards for the same reason.
         A 400 with `{"error": ...}` means LibreFeed isn't installed to switch to."""
         return await self._request("POST", "/mode", {"mode": mode})
+
+    async def led(self) -> LedState:
+        return LedState.from_json(await self._request("GET", "/led", not_found_is_missing=True))
+
+    async def set_led(self, *, white: str | int | None = None, green: int | None = None) -> LedState:
+        """Write one or both of the status LED's fields. The agent 400s for a bad `white`/
+        `green` value; a 404 here means the vendor stack is running (LibreFeed-only route --
+        `not_found_is_missing` on `led()` above, not here: a write that 404s is a real failure,
+        not an optional read to fall back on)."""
+        payload: dict[str, Any] = {}
+        if white is not None:
+            payload["white"] = white
+        if green is not None:
+            payload["green"] = green
+        return LedState.from_json(await self._request("POST", "/led", payload))
 
     async def wifi(self) -> WifiState:
         return WifiState.from_json(await self._request("GET", "/wifi"))

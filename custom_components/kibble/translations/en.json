@@ -115,6 +115,11 @@
         "name": "Last detection"
       }
     },
+    "light": {
+      "status_light": {
+        "name": "Status light"
+      }
+    },
     "media_player": {
       "speaker": {
         "name": "Speaker"

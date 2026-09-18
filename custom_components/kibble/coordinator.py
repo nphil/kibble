@@ -113,6 +113,7 @@ from .api import (
     KibbleError,
     KibbleMediaError,
     KibbleNotFoundError,
+    LedState,
     ReviewFace,
     ScheduleState,
     StackState,
@@ -235,6 +236,9 @@ class KibbleData:
     vendor_sightings: tuple[VendorSighting, ...]
     #: `None` on agents that predate `GET /mode` (the stack select is unavailable then).
     stack: StackState | None = None
+    #: `None` on the vendor stack (`GET /led` is a LibreFeed-only route -- see `light.py`'s
+    #: `KibbleStatusLight.available`).
+    led: LedState | None = None
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -469,6 +473,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             # single missing route on an old agent is not the "confirmed down" signal
             # `_async_update_data`'s own `KibbleError` handling exists for.
             stack = None
+        led = await _optional(self.client.led(), None)
         wifi = await self.client.wifi()
         wifi_scan = tuple(await _optional(self.client.wifi_scan(), ()))
         cats = tuple(await _optional(self.client.cats(), ()))
@@ -486,6 +491,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             config=config,
             cloud=cloud,
             stack=stack,
+            led=led,
             wifi=wifi,
             wifi_scan=wifi_scan,
             cats=cats,
@@ -707,6 +713,14 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         tolerance for a few failed cycles, see the module docstring -- picks the new state
         back up once the reboot completes."""
         await self.client.set_mode(mode)
+
+    async def async_set_led(
+        self, *, white: str | int | None = None, green: int | None = None
+    ) -> None:
+        """Write the status LED, then refresh so the new value reflects immediately. Mirrors
+        `async_set_config`: unlike `async_set_mode`, there is no reboot to race here."""
+        await self.client.set_led(white=white, green=green)
+        await self.async_request_refresh()
 
     async def async_wifi_connect(self, ssid: str, password: str | None = None) -> None:
         """Fail-safe Wi-Fi switch (`agent/src/wifi.rs`) -- always refreshes, even when
