@@ -135,6 +135,7 @@ mod rtsp;
 mod schedule;
 mod scheduler;
 mod settings;
+mod stack;
 mod sha1;
 mod state;
 mod wifi;
@@ -350,6 +351,8 @@ fn route(
             },
         ),
         ("GET", "/streams") => Response::Json(rtsp::streams_json(feeds)),
+        ("GET", "/mode") => Response::Json(stack::status_json()),
+        ("POST", "/mode") => mode_write(req),
         ("GET", "/cloud") => Response::Json(cloud::status_json()),
         ("POST", "/cloud") => cloud_write(req),
         ("GET", "/schedule") => Response::Json(schedule_status_json(schedule, scheduler_enabled, tz)),
@@ -830,6 +833,17 @@ fn cloud_write(req: &Request) -> Response {
     match result {
         Ok(_) => Response::Json(cloud::status_json()),
         Err(e) => Response::Error(e.to_string()),
+    }
+}
+
+fn mode_write(req: &Request) -> Response {
+    let mode = match json_field(&req.body_str(), "mode") {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => return Response::BadRequest(r#""mode" is required"#.into()),
+    };
+    match stack::set(&mode) {
+        Ok(()) => Response::Json(format!(r#"{{"ok":true,"next":"{mode}","rebooting":true}}"#)),
+        Err(e) => Response::BadRequest(e),
     }
 }
 
