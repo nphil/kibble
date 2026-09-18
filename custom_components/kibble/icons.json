@@ -31,15 +31,6 @@
           "on": "mdi:food-drumstick-off"
         }
       },
-      "sound_enable": {
-        "default": "mdi:bullhorn-outline"
-      },
-      "system_sound_enable": {
-        "default": "mdi:account-voice"
-      },
-      "feed_sound": {
-        "default": "mdi:music-note-outline"
-      },
       "manual_lock": {
         "default": "mdi:lock-outline"
       },
@@ -128,6 +119,9 @@
       },
       "tone_range_till": {
         "default": "mdi:clock-end"
+      },
+      "surplus_standard": {
+        "default": "mdi:food-off-outline"
       }
     },
     "sensor": {
@@ -149,20 +143,11 @@
       "schedule_card_state": {
         "default": "mdi:calendar-text-outline"
       },
-      "selected_sound": {
-        "default": "mdi:music-note"
-      },
       "factor1": {
         "default": "mdi:scale-balance"
       },
       "factor2": {
         "default": "mdi:scale-balance"
-      },
-      "surplus_control": {
-        "default": "mdi:food-off-outline"
-      },
-      "surplus_standard": {
-        "default": "mdi:food-off-outline"
       },
       "cloud_connection": {
         "default": "mdi:cloud-question-outline",
@@ -240,6 +225,12 @@
       },
       "label_face": {
         "default": "mdi:tag-outline"
+      },
+      "selected_sound": {
+        "default": "mdi:music-note"
+      },
+      "surplus_control": {
+        "default": "mdi:food-off-outline"
       }
     },
     "switch": {
@@ -293,6 +284,15 @@
       },
       "tone_mode": {
         "default": "mdi:volume-off"
+      },
+      "sound_enable": {
+        "default": "mdi:bullhorn-outline"
+      },
+      "feed_sound": {
+        "default": "mdi:music-note-outline"
+      },
+      "system_sound_enable": {
+        "default": "mdi:account-voice"
       }
     }
   },

@@ -100,6 +100,8 @@ def _all_facts() -> list[EntityFact]:
         facts.append(_fact_from_description("binary_sensor", desc))
     for desc in switch.SWITCHES:
         facts.append(_fact_from_description("switch", desc))
+    for desc in select.SETTING_SELECTS:
+        facts.append(_fact_from_description("select", desc))
     for desc in number.AMOUNTS:
         facts.append(_fact_from_description("number", desc))
     for desc in number.SETTING_NUMBERS:

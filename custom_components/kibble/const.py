@@ -217,3 +217,12 @@ MAX_DETECT_INTERVAL_S = 300
 # enforces `from <= till`.
 MIN_MINUTES_OF_DAY = 0
 MAX_MINUTES_OF_DAY = 1439
+
+# `surplus_standard`'s own writable range -- LibreFeed's `/config` contract: a bowl-fill
+# percentage (0-100) above which food counts as "leftover". This is LibreFeed's own defined
+# semantics, not vendor parity: the vendor's `surplusControl`/`surplusStandard` fields were
+# never recovered with confidence (`kibble/docs/07-config.md`), and a later study
+# (`34-bowl-fill-surplus.md`) found their real on-device meaning is an unrelated BLE-report
+# throttle, not a feed-skip threshold.
+MIN_SURPLUS_STANDARD = 0
+MAX_SURPLUS_STANDARD = 100

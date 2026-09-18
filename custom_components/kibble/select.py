@@ -1,11 +1,13 @@
-"""Wi-Fi network selection, cat-face labelling, and feeder-userland switching for Kibble."""
+"""Wi-Fi network selection, cat-face labelling, feeder-userland switching, and (this batch)
+writable small-integer device settings rendered as real option labels for Kibble."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.persistent_notification import async_create
-from homeassistant.components.select import SelectEntity
+from homeassistant.components.select import SelectEntity, SelectEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
@@ -34,13 +36,13 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities(
-        [
-            KibbleWifiSelect(coordinator),
-            KibbleLabelFaceSelect(coordinator),
-            KibbleStackSelect(coordinator),
-        ]
-    )
+    entities: list[SelectEntity] = [
+        KibbleWifiSelect(coordinator),
+        KibbleLabelFaceSelect(coordinator),
+        KibbleStackSelect(coordinator),
+    ]
+    entities.extend(KibbleSettingSelect(coordinator, d) for d in SETTING_SELECTS)
+    async_add_entities(entities)
 
 
 class KibbleWifiSelect(KibbleEntity, SelectEntity):
@@ -188,3 +190,90 @@ class KibbleStackSelect(KibbleEntity, SelectEntity):
             await self.coordinator.async_set_mode(option)
         except KibbleError as err:
             raise_agent_action_failed("Set stack", err)
+
+
+@dataclass(frozen=True, kw_only=True)
+class KibbleSettingSelectDescription(SelectEntityDescription):
+    """A writable small-integer device setting (`/config`), rendered as a select with real
+    human labels -- `select_options[i]` is the device's integer value `i`. Named
+    `select_options`, not `options`: `test_entity_platform_rules.py`'s generic
+    `getattr(desc, "options", None)` check pairs a bare `options` field with
+    `SensorDeviceClass.ENUM`, a sensor-only rule this select-domain field must never trip.
+    """
+
+    select_options: tuple[str, ...]
+
+
+# `selected_sound`: which of `speaker.rs`'s `CHIME_PATTERNS` a chime plays -- labels describe
+# the actual synthesized tone pattern (this batch's own report has the full evidence trail on
+# why a synthesized chime, not the vendor's `/audio` AAC clips or the MCU buzzer), in the exact
+# index order the daemon's own `speaker::CHIME_PATTERNS`/`compat.rs`'s `selected_sound`
+# `SettingDef` use -- index 0 is `CHIME_PATTERNS[0]`, and so on. `surplus_control`: LibreFeed's
+# own leftover-food mode (`docs/06-entity-audit.md`; explicitly NOT vendor parity -- see
+# `const.py`'s `MIN_SURPLUS_STANDARD` doc for why).
+SETTING_SELECTS: tuple[KibbleSettingSelectDescription, ...] = (
+    KibbleSettingSelectDescription(
+        key="selected_sound",
+        translation_key="selected_sound",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+        select_options=(
+            "Single beep",
+            "Rising two-tone",
+            "Falling two-tone",
+            "Three-note chime",
+            "Long tone",
+        ),
+    ),
+    KibbleSettingSelectDescription(
+        key="surplus_control",
+        translation_key="surplus_control",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+        select_options=("Off", "Warn only", "Skip feed"),
+    ),
+)
+
+
+class KibbleSettingSelect(KibbleEntity, SelectEntity):
+    """One writable small-integer device setting (`/config`), rendered as a select with real
+    human labels -- `entity_description.select_options[i]` <-> the device's integer value `i`.
+    Unlike `KibbleWifiSelect`'s dynamically scanned list, this option list is fixed and known
+    ahead of time; unlike `KibbleStackSelect`'s string-valued `/mode`, the device's own value
+    here is a plain 0-based integer index, so a write round-trips through that index rather
+    than the option string itself.
+
+    Unavailable, rather than a bare `unknown`, when this setting's key is missing from `GET
+    /config` altogether, or its persisted value is out of range for the option list -- mirrors
+    `switch.py`'s `KibbleSettingSwitch.available`.
+    """
+
+    entity_description: KibbleSettingSelectDescription
+
+    def __init__(self, coordinator: KibbleCoordinator, description: KibbleSettingSelectDescription) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+        self._attr_options = list(description.select_options)
+
+    def _index(self) -> int | None:
+        value = self.coordinator.data.config.get(self.entity_description.key)
+        options = self.entity_description.select_options
+        if value is None or not (0 <= value < len(options)):
+            return None
+        return value
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._index() is not None
+
+    @property
+    def current_option(self) -> str | None:
+        index = self._index()
+        return None if index is None else self.entity_description.select_options[index]
+
+    async def async_select_option(self, option: str) -> None:
+        index = self.entity_description.select_options.index(option)
+        try:
+            await self.coordinator.async_set_config(self.entity_description.key, index)
+        except KibbleError as err:
+            raise_agent_action_failed(f"Set {self.entity_description.key}", err)

@@ -59,33 +59,14 @@ def vomit_is_fresh(detected_at: int | None, now: datetime) -> bool:
 
 # Every boolean setting still without a writable plumbed key. `light`, `night`, `microphone`,
 # `vomit_detection`, `pet_detection`, `move_detection`, `eat_detection`, `feed_picture`,
-# `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode` are controls
-# instead -- see `switch.py`. What's left here is out of scope for the batch that plumbed
-# those: `sound_enable`/`system_sound_enable`/`feed_sound` need sound-gating/clip-selection
-# plumbing first, `manual_lock`'s MCU protocol is still undecoded, and `smart_frame`
+# `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode`, `sound_enable`,
+# `feed_sound`, `system_sound_enable` are controls instead -- see `switch.py`. What's left here
+# is still out of scope: `manual_lock`'s MCU protocol is still undecoded, and `smart_frame`
 # (auto-framing) needs the IVPS crop-follows-body work -- see LibreFeed's own
 # `docs/06-entity-audit.md`. `move_track_enable` is skipped entirely: it has no `cjson_key` of
 # its own (an undocumented neighbour of `move_detection`) and is not independently
 # user-controllable, so it carries no dedicated entity.
 SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
-    BinarySensorEntityDescription(
-        key="sound_enable",
-        translation_key="sound_enable",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="system_sound_enable",
-        translation_key="system_sound_enable",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="feed_sound",
-        translation_key="feed_sound",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
     BinarySensorEntityDescription(
         key="manual_lock",
         translation_key="manual_lock",

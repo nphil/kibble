@@ -47,10 +47,12 @@ from .const import (
     MAX_DETECT_INTERVAL_S,
     MAX_MINUTES_OF_DAY,
     MAX_SENSITIVITY,
+    MAX_SURPLUS_STANDARD,
     MIN_AMOUNT,
     MIN_DETECT_INTERVAL_S,
     MIN_MINUTES_OF_DAY,
     MIN_SENSITIVITY,
+    MIN_SURPLUS_STANDARD,
 )
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
@@ -223,6 +225,17 @@ SETTING_NUMBERS: tuple[KibbleSettingNumberDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         hhmm_attribute=True,
+    ),
+    KibbleSettingNumberDescription(
+        key="surplus_standard",
+        translation_key="surplus_standard",
+        native_min_value=MIN_SURPLUS_STANDARD,
+        native_max_value=MAX_SURPLUS_STANDARD,
+        native_step=1,
+        native_unit_of_measurement=PERCENTAGE,
+        mode=NumberMode.BOX,
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
     ),
 )
 

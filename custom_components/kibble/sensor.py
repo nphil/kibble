@@ -122,23 +122,13 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
 # `last_modified` attribute, so a second, disabled-by-default duplicate here would add
 # nothing. `move_sensitivity`/`pet_sensitivity`/`eat_sensitivity`/`detect_interval`/
 # `detect_range_from`/`detect_range_till`/`light_range_from`/`light_range_till`/
-# `tone_range_from`/`tone_range_till` are writable `number` entities instead -- see
-# `number.py`'s `SETTING_NUMBERS`. What's left here (`selected_sound`, `factor1`, `factor2`,
-# `surplus_control`, `surplus_standard`) is out of scope for the batch that moved those: see
-# LibreFeed's own `docs/06-entity-audit.md`.
-#
-# `selected_sound` and `surplus_control` are plain integers here, not `select`: neither has
-# a confirmed option list. settings.rs says so directly -- `selected_sound`'s "valid id range
-# not recovered by this study" and `surplus_control`'s own state values are undocumented even
-# in Localkit's own app schema. A `select` needs a real option list to render; these don't
-# have one.
+# `tone_range_from`/`tone_range_till`/`surplus_standard` are writable `number` entities instead
+# -- see `number.py`'s `SETTING_NUMBERS`. `selected_sound`/`surplus_control` are writable
+# `select` entities instead -- see `select.py`'s `SETTING_SELECTS`. What's left here
+# (`factor1`/`factor2`) stays out of scope: the vendor's grams-per-calibration-unit formula was
+# never recovered (`docs/06-entity-audit.md`'s "Not possible, and why"), so the key can round-trip
+# but has no defined effect worth exposing as a control.
 SETTING_SENSORS: tuple[SensorEntityDescription, ...] = (
-    SensorEntityDescription(
-        key="selected_sound",
-        translation_key="selected_sound",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
     SensorEntityDescription(
         key="factor1",
         translation_key="factor1",
@@ -148,19 +138,6 @@ SETTING_SENSORS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
         key="factor2",
         translation_key="factor2",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="surplus_control",
-        translation_key="surplus_control",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    SensorEntityDescription(
-        key="surplus_standard",
-        translation_key="surplus_standard",
-        native_unit_of_measurement=PERCENTAGE,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),

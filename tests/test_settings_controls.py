@@ -1,19 +1,24 @@
-"""Write-path, availability, and bounds tests for the batch of settings entities converted
-from read-only sensors/binary_sensors into real controls: `switch.py`'s ten new
+"""Write-path, availability, and bounds tests for the batches of settings entities converted
+from read-only sensors/binary_sensors into real controls: `switch.py`'s
 `SwitchEntityDescription`s (`pet_detection`, `move_detection`, `eat_detection`,
 `feed_picture`, `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`,
-`tone_mode`) and `number.py`'s ten `SETTING_NUMBERS` (three sensitivities, one cadence, six
-schedule-pair minutes). Same duck-typed, `object.__new__`-constructed style as
-`test_vomit_detection.py`/`test_vendor_only_config_availability.py`.
+`tone_mode`, and -- sound settings batch -- `sound_enable`, `feed_sound`,
+`system_sound_enable`), `number.py`'s `SETTING_NUMBERS` (three sensitivities, one cadence, six
+schedule-pair minutes, and -- sound/surplus batch -- `surplus_standard`), and `select.py`'s
+`SETTING_SELECTS` (`selected_sound`, `surplus_control`). Same duck-typed,
+`object.__new__`-constructed style as `test_vomit_detection.py`/
+`test_vendor_only_config_availability.py`.
 
-Deliberately does not re-test `KibbleSettingSwitch.available`/`is_on`/generic toggle mechanics,
-or the CONFIG-category/disabled-by-default rules, here -- those are the same shared class and
-the same `test_entity_platform_rules.py` parametrization (which now also walks
-`number.SETTING_NUMBERS`) that already cover every entry in `SWITCHES`/`SETTING_NUMBERS`
-regardless of which key is plugged in. What *is* new and worth pinning per key: the exact
-`/config` key/value pair each control writes (twenty hand-typed key strings are exactly where
-a copy-paste typo would silently wire a control to the wrong setting) and the two behaviours
-`KibbleSettingNumber` itself introduces (the HH:MM attribute, and unit-of-work availability).
+Deliberately does not re-test `KibbleSettingSwitch`/`KibbleSettingSelect`'s
+`available`/generic mechanics, or the CONFIG-category/disabled-by-default rules, here -- those
+are the same shared classes and the same `test_entity_platform_rules.py` parametrization
+(which walks `switch.SWITCHES`/`number.SETTING_NUMBERS`/`select.SETTING_SELECTS`) that already
+cover every entry regardless of which key is plugged in. What *is* new and worth pinning per
+key: the exact `/config` key/value pair each control writes (hand-typed key strings are
+exactly where a copy-paste typo would silently wire a control to the wrong setting), the two
+behaviours `KibbleSettingNumber` itself introduces (the HH:MM attribute, and unit-of-work
+availability), and -- for the two new selects -- the exact option-list content/order (a
+swapped pair of options would silently send the wrong device value for a user's selection).
 """
 
 from __future__ import annotations
@@ -26,14 +31,17 @@ from kibble.const import (
     MAX_DETECT_INTERVAL_S,
     MAX_MINUTES_OF_DAY,
     MAX_SENSITIVITY,
+    MAX_SURPLUS_STANDARD,
     MIN_DETECT_INTERVAL_S,
     MIN_MINUTES_OF_DAY,
     MIN_SENSITIVITY,
+    MIN_SURPLUS_STANDARD,
 )
 from kibble.number import SETTING_NUMBERS, KibbleSettingNumber, _minutes_to_hhmm
+from kibble.select import SETTING_SELECTS, KibbleSettingSelect
 from kibble.switch import SWITCHES, KibbleSettingSwitch
 
-# The ten booleans this batch turned from a read-only binary_sensor into a real switch.
+# The booleans converted from a read-only binary_sensor into a real switch, across both batches.
 NEW_SWITCH_KEYS = (
     "pet_detection",
     "move_detection",
@@ -45,10 +53,13 @@ NEW_SWITCH_KEYS = (
     "camera",
     "light_mode",
     "tone_mode",
+    "sound_enable",
+    "feed_sound",
+    "system_sound_enable",
 )
 
-# The ten integers this batch turned from a read-only sensor into a real number, and each
-# one's contract bounds -- the assignment's own Contract section, not invented here.
+# The integers converted from a read-only sensor into a real number, across both batches, and
+# each one's contract bounds -- the assignment's own Contract section, not invented here.
 NEW_NUMBER_BOUNDS = {
     "pet_sensitivity": (MIN_SENSITIVITY, MAX_SENSITIVITY),
     "move_sensitivity": (MIN_SENSITIVITY, MAX_SENSITIVITY),
@@ -60,7 +71,12 @@ NEW_NUMBER_BOUNDS = {
     "light_range_till": (MIN_MINUTES_OF_DAY, MAX_MINUTES_OF_DAY),
     "tone_range_from": (MIN_MINUTES_OF_DAY, MAX_MINUTES_OF_DAY),
     "tone_range_till": (MIN_MINUTES_OF_DAY, MAX_MINUTES_OF_DAY),
+    "surplus_standard": (MIN_SURPLUS_STANDARD, MAX_SURPLUS_STANDARD),
 }
+
+# The integers converted from a read-only sensor into a real select (sound/surplus batch).
+NEW_SELECT_KEYS = ("selected_sound", "surplus_control")
+
 
 # The six minutes-since-midnight pairs that render an HH:MM attribute; the three sensitivities
 # plus detect_interval are plain magnitudes and must not.
@@ -86,7 +102,13 @@ def test_every_new_number_key_is_actually_registered() -> None:
     assert set(NEW_NUMBER_BOUNDS) == {d.key for d in SETTING_NUMBERS}
 
 
-# --- switch.KibbleSettingSwitch write path (the ten new booleans) -------------------------------
+def test_every_new_select_key_is_actually_registered() -> None:
+    """Same exactness as the number check above: `SETTING_SELECTS` has no pre-existing members
+    either."""
+    assert set(NEW_SELECT_KEYS) == {d.key for d in SETTING_SELECTS}
+
+
+# --- switch.KibbleSettingSwitch write path -------------------------------------------------
 
 
 def _fake_switch(description, *, config: dict) -> SimpleNamespace:
@@ -114,7 +136,7 @@ async def test_turn_off_writes_the_exact_key_with_value_0(key: str) -> None:
     ent.coordinator.async_set_config.assert_awaited_once_with(key, 0)
 
 
-# --- number.KibbleSettingNumber write path + bounds (the ten new settings numbers) --------------
+# --- number.KibbleSettingNumber write path + bounds -----------------------------------------
 
 
 def _fake_number(description, *, config: dict, last_update_success: bool = True) -> SimpleNamespace:
@@ -231,3 +253,77 @@ def test_from_equal_to_till_is_a_valid_combination_meaning_always_active() -> No
     assert ent_from.available is True
     assert ent_till.available is True
     assert ent_from.native_value == ent_till.native_value == 480.0
+
+
+# --- select.KibbleSettingSelect write path + availability (selected_sound, surplus_control) -----
+
+
+def _fake_select(description, *, config: dict, last_update_success: bool = True) -> SimpleNamespace:
+    ent = object.__new__(KibbleSettingSelect)
+    ent.entity_description = description
+    ent.coordinator = SimpleNamespace(
+        data=SimpleNamespace(config=config),
+        last_update_success=last_update_success,
+        async_set_config=AsyncMock(),
+    )
+    return ent
+
+
+@pytest.mark.parametrize("key", NEW_SELECT_KEYS)
+async def test_select_option_writes_the_exact_index_for_the_chosen_option(key: str) -> None:
+    """Selecting the option at index 1 must write exactly `(key, 1)` -- proves the
+    option-string -> integer-index mapping round-trips through the real `select_options` list
+    for each key, not a hardcoded guess that happens to work for one of them."""
+    description = next(d for d in SETTING_SELECTS if d.key == key)
+    ent = _fake_select(description, config={key: 0})
+    await ent.async_select_option(description.select_options[1])
+    ent.coordinator.async_set_config.assert_awaited_once_with(key, 1)
+
+
+@pytest.mark.parametrize("key", NEW_SELECT_KEYS)
+def test_select_is_available_and_reflects_the_config_value_when_the_key_is_present(key: str) -> None:
+    description = next(d for d in SETTING_SELECTS if d.key == key)
+    ent = _fake_select(description, config={key: 0})
+    assert ent.available is True
+    assert ent.current_option == description.select_options[0]
+
+
+@pytest.mark.parametrize("key", NEW_SELECT_KEYS)
+def test_select_is_unavailable_when_its_key_is_absent_from_config(key: str) -> None:
+    """The daemon slice that serves this key hasn't shipped -- absent, not present-and-zero."""
+    description = next(d for d in SETTING_SELECTS if d.key == key)
+    ent = _fake_select(description, config={"light": 1})
+    assert ent.available is False
+    assert ent.current_option is None
+
+
+@pytest.mark.parametrize("key", NEW_SELECT_KEYS)
+def test_select_is_unavailable_when_the_persisted_value_is_out_of_range(key: str) -> None:
+    """A daemon-side option-list shrink (or a hand-edited settings.json) must never index-error
+    into `select_options` -- unavailable, not a crash or a fabricated option."""
+    description = next(d for d in SETTING_SELECTS if d.key == key)
+    out_of_range = len(description.select_options)
+    ent = _fake_select(description, config={key: out_of_range})
+    assert ent.available is False
+    assert ent.current_option is None
+
+
+def test_select_is_unavailable_when_the_feeder_is_unreachable_even_with_a_present_key() -> None:
+    description = next(d for d in SETTING_SELECTS if d.key == "surplus_control")
+    ent = _fake_select(description, config={"surplus_control": 0}, last_update_success=False)
+    assert ent.available is False
+
+
+def test_surplus_control_has_exactly_the_three_documented_modes_in_order() -> None:
+    """Pins `surplus_control`'s option list content AND order against the assignment's own
+    contract (0 off / 1 warn / 2 skip) -- a swapped pair here would silently send "skip" when
+    the user picked "warn only", or vice versa."""
+    description = next(d for d in SETTING_SELECTS if d.key == "surplus_control")
+    assert description.select_options == ("Off", "Warn only", "Skip feed")
+
+
+def test_selected_sound_has_at_least_two_genuinely_distinct_options() -> None:
+    """A select with fewer than two options is not a real choice."""
+    description = next(d for d in SETTING_SELECTS if d.key == "selected_sound")
+    assert len(description.select_options) >= 2
+    assert len(set(description.select_options)) == len(description.select_options), "no two options may share a label"
