@@ -1,18 +1,29 @@
 """Switches for the feeder's writable boolean settings.
 
-`light`, `night`, `microphone`, `vomit_detection` were the original writable set (the same
-keys the vendor's own `agent/src/settings.rs` also marked writable). kibbled deliberately left
-every other boolean setting read-only rather than risk writing the vendor's `config_shm`
-directly (see `binary_sensor.py`). LibreFeed owns its own `/config` now, so that caution no
-longer applies -- this platform's booleans now also include `pet_detection`, `move_detection`,
-`eat_detection`, `feed_picture`, `eat_video`, `food_warn`, `time_display`, `camera`,
-`light_mode`, `tone_mode` (see LibreFeed's own `docs/06-entity-audit.md`, the
-`writable-after-plumbing` table) and, this batch, the sound gates: `sound_enable` (master),
-`feed_sound` (dispense start/finish chime), `system_sound_enable` (media/mcu reconnect, a
-hopper going empty, a scheduled fire the MCU refused). Every setting still missing a plumbed
-key stays read-only and lives in `binary_sensor.py` instead, so this platform never exposes a
-control surface the agent would reject.
-"""
+`night`, `microphone`, `vomit_detection` were the original writable set (the same keys the
+vendor's own `agent/src/settings.rs` also marked writable) -- `light` was too, but it is gone
+from here now: it drove the exact same physical LED as `light.py`'s `KibbleStatusLight`
+through a strict subset of what that entity already does (plain on/off, via `POST /config`,
+versus the light's full on/off/blink/fast-blink/auto over `POST /led`), and having both was
+exactly the "a status LED and a Status light entity ... its not clear what the difference
+is" duplication a user flagged. `KibbleStatusLight` now falls back to this same `config`
+key itself when `/led` is unavailable (see that module's docstring), so there is exactly one
+entity for this LED again and it never needs a `SWITCHES` entry.
+
+kibbled deliberately left every other boolean setting read-only rather than risk writing the
+vendor's `config_shm` directly (see `binary_sensor.py`). LibreFeed owns its own `/config` now,
+so that caution no longer applies -- this platform's booleans now also include
+`pet_detection`, `move_detection`, `eat_detection`, `feed_picture`, `eat_video`, `food_warn`,
+`time_display`, `camera`, `light_mode`, `tone_mode` (see LibreFeed's own
+`docs/06-entity-audit.md`, the `writable-after-plumbing` table), the sound gates:
+`sound_enable` (master), `feed_sound` (dispense start/finish chime), `system_sound_enable`
+(media/mcu reconnect, a hopper going empty, a scheduled fire the MCU refused), and, this
+batch, `smart_frame` (auto-framing: the camera's sub-stream crops to follow the tracked cat,
+easing back to the full frame a few seconds after nothing is detected) -- previously a
+read-only `binary_sensor.py` entry, moved here now that the IVPS crop-follows-body work is
+plumbed and writable. Every setting still missing a plumbed key stays read-only and lives in
+`binary_sensor.py` instead, so this platform never exposes a control surface the agent would
+reject."""
 
 from __future__ import annotations
 
@@ -37,12 +48,6 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
     SwitchEntityDescription(
         key="night",
         translation_key="night",
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-    ),
-    SwitchEntityDescription(
-        key="light",
-        translation_key="light",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),
@@ -82,6 +87,14 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),
+    # `eat_video`: the vendor's own wire spelling (`agent/src/settings.rs`'s `cjson_key
+    # "eatVideo"`), kept unchanged as the `/config` key -- and on the vendor stack this
+    # setting really does gate a recorded video clip. LibreFeed records no clips at all;
+    # here it gates the same before/after *still-photo* capture `feed_picture` uses
+    # (`daemon/src/main.rs`'s `compat::setting_flag("eat_video")` feeds the identical
+    # `capture_if_enabled`/`capture_snapshot` gate as `feed_picture`'s dispense photos --
+    # `compat.rs`'s own doc comment on `capture_if_enabled`). The display name says so
+    # plainly; the key does not change, so the entity keeps its existing unique id.
     SwitchEntityDescription(
         key="eat_video",
         translation_key="eat_video",
@@ -133,6 +146,16 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
     SwitchEntityDescription(
         key="system_sound_enable",
         translation_key="system_sound_enable",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
+    # `smart_frame`: auto-framing -- the camera's sub-stream crops to follow the tracked
+    # cat's body box, easing back to the full frame a few seconds after the tracker loses
+    # it. Previously read-only in `binary_sensor.py`'s `SETTING_SENSORS`; moved here, its old
+    # entry removed, once the IVPS crop-follows-body write path was plumbed.
+    SwitchEntityDescription(
+        key="smart_frame",
+        translation_key="smart_frame",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),
@@ -225,3 +248,4 @@ class KibbleCloudSwitch(KibbleEntity, SwitchEntity):
             await self.coordinator.async_set_cloud(enabled)
         except KibbleError as err:
             raise_agent_action_failed("Set Petkit cloud", err)
+

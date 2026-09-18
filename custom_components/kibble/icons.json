@@ -34,9 +34,6 @@
       "manual_lock": {
         "default": "mdi:lock-outline"
       },
-      "smart_frame": {
-        "default": "mdi:crop-free"
-      },
       "cat_present": {
         "default": "mdi:cat"
       }
@@ -96,29 +93,11 @@
       "move_sensitivity": {
         "default": "mdi:run"
       },
-      "eat_sensitivity": {
-        "default": "mdi:silverware-fork-knife"
+      "eating_hold": {
+        "default": "mdi:timer-sand"
       },
       "detect_interval": {
         "default": "mdi:timer-outline"
-      },
-      "detect_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "detect_range_till": {
-        "default": "mdi:clock-end"
-      },
-      "light_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "light_range_till": {
-        "default": "mdi:clock-end"
-      },
-      "tone_range_from": {
-        "default": "mdi:clock-start"
-      },
-      "tone_range_till": {
-        "default": "mdi:clock-end"
       },
       "surplus_standard": {
         "default": "mdi:food-off-outline"
@@ -231,6 +210,14 @@
       },
       "surplus_control": {
         "default": "mdi:food-off-outline"
+      },
+      "camera_indicator": {
+        "default": "mdi:cctv-off",
+        "state": {
+          "auto": "mdi:cctv",
+          "on": "mdi:cctv",
+          "off": "mdi:cctv-off"
+        }
       }
     },
     "switch": {
@@ -242,9 +229,6 @@
       },
       "night": {
         "default": "mdi:weather-night"
-      },
-      "light": {
-        "default": "mdi:led-on"
       },
       "microphone": {
         "default": "mdi:microphone"
@@ -268,7 +252,7 @@
         "default": "mdi:camera-outline"
       },
       "eat_video": {
-        "default": "mdi:video-outline"
+        "default": "mdi:image-outline"
       },
       "food_warn": {
         "default": "mdi:alert-outline"
@@ -293,6 +277,20 @@
       },
       "system_sound_enable": {
         "default": "mdi:account-voice"
+      },
+      "smart_frame": {
+        "default": "mdi:crop-free"
+      }
+    },
+    "text": {
+      "detection_hours": {
+        "default": "mdi:clock-time-eight-outline"
+      },
+      "status_led_hours": {
+        "default": "mdi:clock-time-eight-outline"
+      },
+      "do_not_disturb_hours": {
+        "default": "mdi:clock-time-eight-outline"
       }
     }
   },

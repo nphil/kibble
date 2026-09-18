@@ -16,16 +16,23 @@ says and the two per-hopper amounts as advisory until someone refits the divider
 
 `SETTING_NUMBERS`, by contrast, are real device settings: writable integers read from and
 written to the feeder's shared config through the agent's `/config` endpoint, the same
-round trip `switch.py`'s `KibbleSettingSwitch` already uses for booleans. Three are
-sensitivities (0-100, higher means more sensitive), one is a cadence in seconds, and six are
-time-of-day minutes-since-midnight pairs (`from`/`till`, equal means "always active") --
-see LibreFeed's own `docs/06-entity-audit.md`.
+round trip `switch.py`'s `KibbleSettingSwitch` already uses for booleans. Two are genuinely
+continuous percentages (`pet_sensitivity`/`move_sensitivity` -- NanoDet confidence and the
+luma-delta motion bar), one is a cadence in seconds. The three time-of-day
+minutes-since-midnight `from`/`till` pairs that used to live here (`detect_range_from/_till`,
+`light_range_from/_till`, `tone_range_from/_till`) are gone: each pair is now one `text.py`
+entity (`"HH:MM-HH:MM"`, `text.KibbleHourRangeText`), not two number entities that could
+independently drift out of sync with each other between writes -- see that module's own
+docstring. `eat_sensitivity` is also gone from here as a percentage: only 10 distinct
+eat-hold times exist behind its 0..100 wire range, so a percentage implied false precision --
+see `KibbleEatHoldNumber`'s own docstring for the honest seconds control that replaced it
+(same wire key, converted both ways). See LibreFeed's own `docs/06-entity-audit.md` for the
+rest.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from homeassistant.components.number import (
     NumberDeviceClass,
@@ -45,12 +52,10 @@ from .const import (
     HOPPER_BOTH,
     MAX_AMOUNT,
     MAX_DETECT_INTERVAL_S,
-    MAX_MINUTES_OF_DAY,
     MAX_SENSITIVITY,
     MAX_SURPLUS_STANDARD,
     MIN_AMOUNT,
     MIN_DETECT_INTERVAL_S,
-    MIN_MINUTES_OF_DAY,
     MIN_SENSITIVITY,
     MIN_SURPLUS_STANDARD,
 )
@@ -88,19 +93,7 @@ AMOUNTS: tuple[KibbleAmountDescription, ...] = (
 class KibbleSettingNumberDescription(NumberEntityDescription):
     """A writable integer device setting read from and written to the feeder's shared config
     through the agent's `/config` endpoint. Mirrors `switch.py`'s `SwitchEntityDescription`
-    use for booleans.
-
-    `hhmm_attribute` renders the value as a human `HH:MM` extra-state attribute -- for the six
-    schedule pairs below, whose value is minutes since local midnight, not a plain magnitude.
-    """
-
-    hhmm_attribute: bool = False
-
-
-def _minutes_to_hhmm(minutes: int) -> str:
-    """`645` -> `"10:45"` -- the device's own minutes-since-midnight encoding for its three
-    schedule pairs, rendered so a dashboard can show a time instead of a raw integer."""
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    use for booleans."""
 
 
 SETTING_NUMBERS: tuple[KibbleSettingNumberDescription, ...] = (
@@ -127,17 +120,6 @@ SETTING_NUMBERS: tuple[KibbleSettingNumberDescription, ...] = (
         entity_registry_enabled_default=False,
     ),
     KibbleSettingNumberDescription(
-        key="eat_sensitivity",
-        translation_key="eat_sensitivity",
-        native_min_value=MIN_SENSITIVITY,
-        native_max_value=MAX_SENSITIVITY,
-        native_step=1,
-        native_unit_of_measurement=PERCENTAGE,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-    ),
-    KibbleSettingNumberDescription(
         key="detect_interval",
         translation_key="detect_interval",
         native_min_value=MIN_DETECT_INTERVAL_S,
@@ -147,84 +129,6 @@ SETTING_NUMBERS: tuple[KibbleSettingNumberDescription, ...] = (
         mode=NumberMode.BOX,
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
-    ),
-    KibbleSettingNumberDescription(
-        key="detect_range_from",
-        translation_key="detect_range_from",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
-    ),
-    KibbleSettingNumberDescription(
-        key="detect_range_till",
-        translation_key="detect_range_till",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
-    ),
-    KibbleSettingNumberDescription(
-        key="light_range_from",
-        translation_key="light_range_from",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
-    ),
-    KibbleSettingNumberDescription(
-        key="light_range_till",
-        translation_key="light_range_till",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
-    ),
-    KibbleSettingNumberDescription(
-        key="tone_range_from",
-        translation_key="tone_range_from",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
-    ),
-    KibbleSettingNumberDescription(
-        key="tone_range_till",
-        translation_key="tone_range_till",
-        native_min_value=MIN_MINUTES_OF_DAY,
-        native_max_value=MAX_MINUTES_OF_DAY,
-        native_step=1,
-        device_class=NumberDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        hhmm_attribute=True,
     ),
     KibbleSettingNumberDescription(
         key="surplus_standard",
@@ -250,6 +154,7 @@ async def async_setup_entry(
         KibbleFeedAmount(coordinator, description) for description in AMOUNTS
     ]
     entities.extend(KibbleSettingNumber(coordinator, d) for d in SETTING_NUMBERS)
+    entities.append(KibbleEatHoldNumber(coordinator))
     async_add_entities(entities)
 
 
@@ -310,15 +215,76 @@ class KibbleSettingNumber(KibbleEntity, NumberEntity):
         value = self.coordinator.data.config.get(self.entity_description.key)
         return None if value is None else float(value)
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        if not self.entity_description.hhmm_attribute:
-            return None
-        value = self.coordinator.data.config.get(self.entity_description.key)
-        return {"time": _minutes_to_hhmm(int(value)) if value is not None else None}
-
     async def async_set_native_value(self, value: float) -> None:
         try:
             await self.coordinator.async_set_config(self.entity_description.key, int(value))
         except KibbleError as err:
             raise_agent_action_failed(f"Set {self.entity_description.key}", err)
+
+
+def eat_sensitivity_to_hold_s(sensitivity: int) -> int:
+    """`/config`'s `eat_sensitivity` (0..100, higher = more sensitive) -> the eat-hold time in
+    seconds (1..10, shorter = more sensitive). Mirrors the daemon's own authoritative
+    `daemon/src/vision.rs::eat_sensitivity_to_hold_s` -- verified against Rust's `f32::round()`
+    (round-half-away-from-zero) across the whole 0..100 domain, including the one exact .5
+    tie (`sensitivity == 50`), so plain `round()` here is not a divergent reimplementation."""
+    clamped = max(0, min(100, sensitivity))
+    return max(1, min(10, round(10 - clamped * 9 / 100)))
+
+
+def eat_hold_s_to_eat_sensitivity(hold_s: int) -> int:
+    """Inverse of `eat_sensitivity_to_hold_s`, mirroring the daemon's own
+    `eat_hold_s_to_eat_sensitivity`. Exact at both mappings' shared boundaries (`0<->10`,
+    `100<->1`) and at the shared default (`78<->3`) -- not every one of `eat_sensitivity`'s
+    101 values is recoverable from `eat_hold_s`'s 10, see `KibbleEatHoldNumber`'s own
+    docstring for why the control is honestly seconds, not a percentage."""
+    clamped = max(1, min(10, hold_s))
+    return max(0, min(100, round((10 - clamped) * 100 / 9)))
+
+
+class KibbleEatHoldNumber(KibbleEntity, NumberEntity):
+    """How many continuous seconds a body must overlap the bowl ROI before the eat state
+    machine latches "eating" (`daemon/src/vision.rs`'s `VisionConfig::eat_hold_s`). The wire
+    key stays `/config`'s `eat_sensitivity` -- LibreFeed's `/config` contract is 0..100, and
+    reusing the vendor's own key/range avoids inventing a second, redundant setting for the
+    same underlying knob -- but the control surface here is seconds, not a percentage: only
+    10 distinct hold times exist behind that 0..100 range (`eat_sensitivity_to_hold_s`'s
+    domain), so a percentage slider (as this used to be, `SETTING_NUMBERS`' old
+    `eat_sensitivity` entry) implied 101 levels of precision the device does not have --
+    `eat_sensitivity` 74 through 78 are all literally the same 3-second hold, and a percentage
+    could not say so. Unlike `pet_sensitivity`/`move_sensitivity`, whose 0..100 percentage
+    really is continuous (NanoDet confidence and the luma-delta motion bar), this one is not,
+    so it gets an honest seconds control instead, not a data-driven `SETTING_NUMBERS` entry
+    (those pass the wire value straight through; this one converts both ways).
+
+    Unavailable, rather than a bare `unknown`, when `eat_sensitivity` is missing from `GET
+    /config` altogether. Mirrors `KibbleSettingNumber.available`."""
+
+    _attr_translation_key = "eating_hold"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_native_min_value = 1
+    _attr_native_max_value = 10
+    _attr_native_step = 1
+    _attr_device_class = NumberDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "eating_hold")
+
+    @property
+    def available(self) -> bool:
+        return super().available and "eat_sensitivity" in self.coordinator.data.config
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.coordinator.data.config.get("eat_sensitivity")
+        return None if value is None else float(eat_sensitivity_to_hold_s(int(value)))
+
+    async def async_set_native_value(self, value: float) -> None:
+        sensitivity = eat_hold_s_to_eat_sensitivity(int(value))
+        try:
+            await self.coordinator.async_set_config("eat_sensitivity", sensitivity)
+        except KibbleError as err:
+            raise_agent_action_failed("Set eating_hold", err)

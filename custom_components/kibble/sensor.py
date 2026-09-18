@@ -120,11 +120,13 @@ SENSORS: tuple[KibbleSensorDescription, ...] = (
 # own description says it is "folded into the schedule surface rather than getting its own HA
 # entity" -- it is the same value `KibbleScheduleSensor` below already reports as its
 # `last_modified` attribute, so a second, disabled-by-default duplicate here would add
-# nothing. `move_sensitivity`/`pet_sensitivity`/`eat_sensitivity`/`detect_interval`/
-# `detect_range_from`/`detect_range_till`/`light_range_from`/`light_range_till`/
-# `tone_range_from`/`tone_range_till`/`surplus_standard` are writable `number` entities instead
-# -- see `number.py`'s `SETTING_NUMBERS`. `selected_sound`/`surplus_control` are writable
-# `select` entities instead -- see `select.py`'s `SETTING_SELECTS`. What's left here
+# `move_sensitivity`/`pet_sensitivity`/`detect_interval`/`surplus_standard` are writable
+# `number` entities instead -- see `number.py`'s `SETTING_NUMBERS`; `eat_sensitivity` is also
+# a writable `number` (`number.py`'s `KibbleEatHoldNumber`) but converted to a seconds hold
+# time, not passed through as a raw percentage -- see that class's own docstring.
+# `detect_range_from/_till`/`light_range_from/_till`/`tone_range_from/_till` are writable
+# `text` entities instead -- see `text.py`'s `HOUR_RANGES`. `selected_sound`/`surplus_control`
+# are writable `select` entities instead -- see `select.py`'s `SETTING_SELECTS`. What's left
 # (`factor1`/`factor2`) stays out of scope: the vendor's grams-per-calibration-unit formula was
 # never recovered (`docs/06-entity-audit.md`'s "Not possible, and why"), so the key can round-trip
 # but has no defined effect worth exposing as a control.

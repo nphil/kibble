@@ -210,14 +210,6 @@ MAX_SENSITIVITY = 100
 MIN_DETECT_INTERVAL_S = 0
 MAX_DETECT_INTERVAL_S = 300
 
-# Minutes since local midnight -- the device's own encoding for every schedule pair
-# (`detect_range_from/_till`, `light_range_from/_till`, `tone_range_from/_till`). `from ==
-# till` means "always active"; `from > till` is a legitimate overnight window (the vendor's
-# own `toneMultiRange` documents exactly this: "1320-360 wraps midnight"), so nothing here
-# enforces `from <= till`.
-MIN_MINUTES_OF_DAY = 0
-MAX_MINUTES_OF_DAY = 1439
-
 # `surplus_standard`'s own writable range -- LibreFeed's `/config` contract: a bowl-fill
 # percentage (0-100) above which food counts as "leftover". This is LibreFeed's own defined
 # semantics, not vendor parity: the vendor's `surplusControl`/`surplusStandard` fields were

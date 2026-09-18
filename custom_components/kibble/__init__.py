@@ -112,6 +112,7 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
+    Platform.TEXT,
 ]
 
 # Config-entry-only integration; `async_setup` below still exists to register the process-

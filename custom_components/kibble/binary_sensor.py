@@ -60,22 +60,15 @@ def vomit_is_fresh(detected_at: int | None, now: datetime) -> bool:
 # Every boolean setting still without a writable plumbed key. `light`, `night`, `microphone`,
 # `vomit_detection`, `pet_detection`, `move_detection`, `eat_detection`, `feed_picture`,
 # `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode`, `sound_enable`,
-# `feed_sound`, `system_sound_enable` are controls instead -- see `switch.py`. What's left here
-# is still out of scope: `manual_lock`'s MCU protocol is still undecoded, and `smart_frame`
-# (auto-framing) needs the IVPS crop-follows-body work -- see LibreFeed's own
-# `docs/06-entity-audit.md`. `move_track_enable` is skipped entirely: it has no `cjson_key` of
-# its own (an undocumented neighbour of `move_detection`) and is not independently
-# user-controllable, so it carries no dedicated entity.
+# `feed_sound`, `system_sound_enable`, `smart_frame` are controls instead -- see `switch.py`.
+# What's left here is still out of scope: `manual_lock`'s MCU protocol is still undecoded --
+# see LibreFeed's own `docs/06-entity-audit.md`. `move_track_enable` is skipped entirely: it
+# has no `cjson_key` of its own (an undocumented neighbour of `move_detection`) and is not
+# independently user-controllable, so it carries no dedicated entity.
 SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
     BinarySensorEntityDescription(
         key="manual_lock",
         translation_key="manual_lock",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="smart_frame",
-        translation_key="smart_frame",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),

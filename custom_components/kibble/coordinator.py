@@ -739,11 +739,15 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.client.set_mode(mode)
 
     async def async_set_led(
-        self, *, white: str | int | None = None, green: int | None = None
+        self,
+        *,
+        white: str | int | None = None,
+        green: int | None = None,
+        camera: str | int | None = None,
     ) -> None:
         """Write the status LED, then refresh so the new value reflects immediately. Mirrors
         `async_set_config`: unlike `async_set_mode`, there is no reboot to race here."""
-        await self.client.set_led(white=white, green=green)
+        await self.client.set_led(white=white, green=green, camera=camera)
         await self.async_request_refresh()
 
     async def async_beep(

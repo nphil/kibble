@@ -59,12 +59,12 @@ def test_setting_sensor_unreachable_feeder_overrides_a_present_key() -> None:
 
 
 def test_setting_binary_sensor_is_unavailable_when_its_key_is_absent_from_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "smart_frame", config={"microphone": 1})
+    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "manual_lock", config={"microphone": 1})
     assert ent.available is False
     assert ent.is_on is None
 
 
 def test_setting_binary_sensor_is_available_when_its_key_is_present_in_config() -> None:
-    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "smart_frame", config={"smart_frame": 0})
+    ent = _fake_setting_sensor(KibbleSettingBinarySensor, "manual_lock", config={"manual_lock": 0})
     assert ent.available is True
     assert ent.is_on is False

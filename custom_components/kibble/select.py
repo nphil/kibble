@@ -1,5 +1,6 @@
-"""Wi-Fi network selection, cat-face labelling, feeder-userland switching, and (this batch)
-writable small-integer device settings rendered as real option labels for Kibble."""
+"""Wi-Fi network selection, cat-face labelling, feeder-userland switching, the camera-indicator
+LED's three-way policy, and (this batch) writable small-integer device settings rendered as
+real option labels for Kibble."""
 
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ async def async_setup_entry(
         KibbleWifiSelect(coordinator),
         KibbleLabelFaceSelect(coordinator),
         KibbleStackSelect(coordinator),
+        KibbleCameraIndicatorSelect(coordinator),
     ]
     entities.extend(KibbleSettingSelect(coordinator, d) for d in SETTING_SELECTS)
     async_add_entities(entities)
@@ -190,6 +192,48 @@ class KibbleStackSelect(KibbleEntity, SelectEntity):
             await self.coordinator.async_set_mode(option)
         except KibbleError as err:
             raise_agent_action_failed("Set stack", err)
+
+
+_CAMERA_BY_OPTION = {"auto": "auto", "on": 1, "off": 0}
+_OPTION_BY_CAMERA = {"auto": "auto", 1: "on", 0: "off"}
+
+
+class KibbleCameraIndicatorSelect(KibbleEntity, SelectEntity):
+    """The feeder's camera-in-use indicator LED (`GET`/`POST /led`'s `camera` field,
+    LibreFeed-only -- unavailable, not a bare `unknown`, on the vendor stack where `/led`
+    404s; see `light.py`'s `KibbleStatusLight.available`, the same `coordinator.data.led is
+    None` check). `"auto"` is the device's own policy -- lit while a stream is actively being
+    watched -- and the two forced states (`"on"`, `"off"`) override it; modelled as three
+    real options, not a boolean, so `"auto"` is never collapsed into (and indistinguishable
+    from) whichever state it happens to be showing right now.
+
+    This is the privacy-relevant half of `/led`: it is what lights up while someone is
+    watching the camera stream, so unlike the plain device settings in `KibbleSettingSelect`
+    below it is CONFIG but ships enabled by default -- the same visible-by-default reasoning
+    `switch.py`'s `KibbleCloudSwitch` uses for the other privacy control this integration
+    exposes."""
+
+    _attr_translation_key = "camera_indicator"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = ["auto", "on", "off"]
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "camera_indicator")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.led is not None
+
+    @property
+    def current_option(self) -> str | None:
+        led = self.coordinator.data.led
+        return None if led is None else _OPTION_BY_CAMERA.get(led.camera)
+
+    async def async_select_option(self, option: str) -> None:
+        try:
+            await self.coordinator.async_set_led(camera=_CAMERA_BY_OPTION[option])
+        except KibbleError as err:
+            raise_agent_action_failed("Set camera indicator", err)
 
 
 @dataclass(frozen=True, kw_only=True)

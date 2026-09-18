@@ -779,16 +779,24 @@ class KibbleClient:
     async def led(self) -> LedState:
         return LedState.from_json(await self._request("GET", "/led", not_found_is_missing=True))
 
-    async def set_led(self, *, white: str | int | None = None, green: int | None = None) -> LedState:
-        """Write one or both of the status LED's fields. The agent 400s for a bad `white`/
-        `green` value; a 404 here means the vendor stack is running (LibreFeed-only route --
-        `not_found_is_missing` on `led()` above, not here: a write that 404s is a real failure,
-        not an optional read to fall back on)."""
+    async def set_led(
+        self,
+        *,
+        white: str | int | None = None,
+        green: int | None = None,
+        camera: str | int | None = None,
+    ) -> LedState:
+        """Write one or more of the status LED's fields. The agent 400s for a bad `white`/
+        `green`/`camera` value; a 404 here means the vendor stack is running (LibreFeed-only
+        route -- `not_found_is_missing` on `led()` above, not here: a write that 404s is a real
+        failure, not an optional read to fall back on)."""
         payload: dict[str, Any] = {}
         if white is not None:
             payload["white"] = white
         if green is not None:
             payload["green"] = green
+        if camera is not None:
+            payload["camera"] = camera
         return LedState.from_json(await self._request("POST", "/led", payload))
 
     async def beep(self, *, count: int = 2, on_ms: int = 100, off_ms: int = 100) -> dict:
