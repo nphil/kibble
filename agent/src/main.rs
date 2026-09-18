@@ -190,6 +190,19 @@ fn main() {
     // Shared, not leaked: the request-handling closure below borrows it for the life of the
     // (never-returning) `http::serve` call, and the reconciler owns its own clone of the `Arc`.
     let shm = Arc::new(shm);
+    // LibreFeed (the alternate userland, /opt/librefeed) cannot read the vendor's encrypted
+    // config, but the HA integration keys every entity on the device serial, so both stacks
+    // must report the same one. Hand it over once per boot; only a change touches UBIFS.
+    {
+        let serial = shm.snapshot().serial;
+        if !serial.is_empty() && std::fs::read_to_string("/opt/librefeed/serial").map(|s| s.trim() != serial).unwrap_or(true) {
+            if std::fs::metadata("/opt/librefeed").is_ok() {
+                if let Err(e) = std::fs::write("/opt/librefeed/serial", &serial) {
+                    eprintln!("kibbled: cannot write /opt/librefeed/serial: {e}");
+                }
+            }
+        }
+    }
     let ble = Sender::open(Peer::Ble, SRC_AS_CTRL)
         .unwrap_or_else(|e| die(&format!("open ble queue: {e}")));
     let ble_adv = advertise::BleAdv::spawn()
