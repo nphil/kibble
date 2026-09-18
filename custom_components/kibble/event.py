@@ -1,14 +1,14 @@
-"""Physical button events for the feeder (`GET /state`'s `last_key`, LibreFeed-only -- see
-`api.py`'s `KeyEvent` and `FeederState.last_key`; the vendor stack never populates this key,
-so these entities go unavailable on it rather than reporting nothing ever happened).
+"""Physical button events for the feeder (`GET /state`'s `keys` ring, LibreFeed-only -- see
+`api.py`'s `KeyEvent` and `FeederState.keys`; the vendor stack never populates it, so these
+entities go unavailable on it rather than reporting nothing ever happened).
 
 The feeder has three physical buttons: the recessed pairing/reset button, and one labelled
-button per hopper. `kibbled` only ever remembers the *most recent* one -- `last_key` is a
-single slot, overwritten on every press -- so a poll interval that lands between a short
-press's press-and-release (both well under the 45s scan interval) only ever observes the
-final state, never both edges. That is an accepted limitation (see this integration's
-`event.py` assignment notes), not a bug: this module fires whatever `last_key` reports the
-moment it changes, once per change, and never replays a value already seen.
+button per hopper. LibreFeed's MCU daemon keeps the last 16 key events (oldest first) and
+also the newest one as `last_key`; a poll interval that lands between a short press's
+press-and-release, or between two buttons, would lose events if only `last_key` were read.
+Each entity therefore diffs the ring against the last snapshot it saw and fires every event
+for its own node it has not fired yet, in order. Events are identified by `(event, at_ms)`,
+never by position, so a reboot (at_ms restarts) or the ring wrapping cannot replay or skip.
 """
 
 from __future__ import annotations
@@ -61,13 +61,11 @@ async def async_setup_entry(
 
 
 class KibbleButtonEvent(KibbleEntity, EventEntity):
-    """One physical button, tracked by `last_key.node`.
+    """One physical button, tracked by `node` inside the shared `keys` ring.
 
-    `last_key` is one slot shared by all three buttons, so every instance of this class sees
-    every poll's value and only reacts to the ones naming its own `node`. `_last_seen` starts
-    at whatever `last_key` already held at construction time (not `None`) specifically so the
-    first coordinator update after startup -- which re-delivers that same unchanged value --
-    never fires a stale event for something that happened before HA was watching.
+    `_seen` starts as whatever the ring already held for this node at construction time
+    specifically so the first coordinator update after startup -- which re-delivers those same
+    events -- never fires anything that happened before HA was watching.
     """
 
     _attr_device_class = EventDeviceClass.BUTTON
@@ -77,27 +75,25 @@ class KibbleButtonEvent(KibbleEntity, EventEntity):
         super().__init__(coordinator, key)
         self._attr_translation_key = key
         self._node = node
-        self._last_seen = self._current_for_node()
+        self._seen = set(self._events_for_node())
 
-    def _current_for_node(self) -> tuple[int, int, int] | None:
-        last_key = self.coordinator.data.state.last_key
-        if last_key is None or last_key.node != self._node:
-            return None
-        return (last_key.node, last_key.event, last_key.at_ms)
+    def _events_for_node(self) -> list[tuple[int, int]]:
+        """`(event, at_ms)` for this node, oldest first."""
+        return [(k.event, k.at_ms) for k in self.coordinator.data.state.keys if k.node == self._node]
 
     @property
     def available(self) -> bool:
-        return super().available and "last_key" in self.coordinator.data.state.raw
+        raw = self.coordinator.data.state.raw
+        return super().available and ("keys" in raw or "last_key" in raw)
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        # A miss (another button's node, or no button pressed yet this boot) leaves
-        # `_last_seen` untouched -- it only ever tracks the last snapshot that actually named
-        # this entity's own node, never "nothing" from an unrelated update.
-        current = self._current_for_node()
-        if current is not None and current != self._last_seen:
-            event_type = _EVENT_TYPE_BY_CODE.get(current[1])
+        current = self._events_for_node()
+        for event_code, at_ms in current:
+            if (event_code, at_ms) in self._seen:
+                continue
+            event_type = _EVENT_TYPE_BY_CODE.get(event_code)
             if event_type is not None:
-                self._trigger_event(event_type, {"at_ms": current[2]})
-            self._last_seen = current
+                self._trigger_event(event_type, {"at_ms": at_ms})
+        self._seen = set(current)
         super()._handle_coordinator_update()

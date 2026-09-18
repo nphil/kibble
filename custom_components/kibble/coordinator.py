@@ -722,6 +722,18 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.client.set_led(white=white, green=green)
         await self.async_request_refresh()
 
+    async def async_beep(
+        self, *, count: int = 2, on_ms: int = 100, off_ms: int = 100
+    ) -> dict:
+        """Plays the MCU buzzer. Refreshes on any outcome -- same "always reconcile" shape as
+        `async_speak`: there is no "is beeping" flag in `GET /state` either, and a 404 (vendor
+        stack) or 400 (out-of-range) still deserves a fresh poll. Propagates `KibbleError` to
+        the caller uncaught, same as every other `async_*` write here."""
+        try:
+            return await self.client.beep(count=count, on_ms=on_ms, off_ms=off_ms)
+        finally:
+            await self.async_request_refresh()
+
     async def async_wifi_connect(self, ssid: str, password: str | None = None) -> None:
         """Fail-safe Wi-Fi switch (`agent/src/wifi.rs`) -- always refreshes, even when
         `wifi_connect` raises, so a rollback's `last_error` and the (unchanged) live SSID

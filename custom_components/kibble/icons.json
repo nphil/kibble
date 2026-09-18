@@ -89,6 +89,9 @@
       },
       "cancel_feed": {
         "default": "mdi:stop-circle-outline"
+      },
+      "beep": {
+        "default": "mdi:bell-ring-outline"
       }
     },
     "image": {
@@ -305,6 +308,7 @@
     "identify": "mdi:magnify-scan",
     "save_clip": "mdi:content-save-outline",
     "record_clip": "mdi:microphone-outline",
-    "play_clip": "mdi:play-circle-outline"
+    "play_clip": "mdi:play-circle-outline",
+    "beep": "mdi:bell-ring"
   }
 }

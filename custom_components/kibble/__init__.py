@@ -22,6 +22,7 @@ from .const import (
     ATTR_CAT,
     ATTR_CAT_NAME,
     ATTR_CLIP_NAME,
+    ATTR_COUNT,
     ATTR_CROP_ID,
     ATTR_CROP_NAME,
     ATTR_ENABLED,
@@ -36,23 +37,35 @@ from .const import (
     ATTR_JPEG_B64,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MINUTE,
+    ATTR_OFF_MS,
+    ATTR_ON_MS,
     ATTR_PASSWORD,
     ATTR_SECONDS,
     ATTR_SSID,
     ATTR_TIME,
     CONF_HOST,
     CONF_PORT,
+    DEFAULT_BEEP_COUNT,
+    DEFAULT_BEEP_OFF_MS,
+    DEFAULT_BEEP_ON_MS,
     DOMAIN,
     HOPPER_BOTH,
     HOPPERS,
     MAX_AMOUNT,
+    MAX_BEEP_COUNT,
+    MAX_BEEP_OFF_MS,
+    MAX_BEEP_ON_MS,
     MAX_CLIP_SECONDS,
     MAX_SCHEDULE_AMOUNT,
     MAX_SCHEDULE_ENTRIES,
     MIN_AMOUNT,
+    MIN_BEEP_COUNT,
+    MIN_BEEP_OFF_MS,
+    MIN_BEEP_ON_MS,
     MIN_CLIP_SECONDS,
     MIN_SCHEDULE_AMOUNT,
     SERVICE_ADD_CAT,
+    SERVICE_BEEP,
     SERVICE_CANCEL_FEED,
     SERVICE_DELETE_CAT,
     SERVICE_FEED,
@@ -279,6 +292,21 @@ RECORD_CLIP_SCHEMA = vol.Schema(
 
 PLAY_CLIP_SCHEMA = vol.Schema(
     {vol.Required("device_id"): cv.string, vol.Required(ATTR_CLIP_NAME): cv.string}
+)
+
+BEEP_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        vol.Optional(ATTR_COUNT, default=DEFAULT_BEEP_COUNT): vol.All(
+            vol.Coerce(int), vol.Range(min=MIN_BEEP_COUNT, max=MAX_BEEP_COUNT)
+        ),
+        vol.Optional(ATTR_ON_MS, default=DEFAULT_BEEP_ON_MS): vol.All(
+            vol.Coerce(int), vol.Range(min=MIN_BEEP_ON_MS, max=MAX_BEEP_ON_MS)
+        ),
+        vol.Optional(ATTR_OFF_MS, default=DEFAULT_BEEP_OFF_MS): vol.All(
+            vol.Coerce(int), vol.Range(min=MIN_BEEP_OFF_MS, max=MAX_BEEP_OFF_MS)
+        ),
+    }
 )
 
 
@@ -607,6 +635,17 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Play clip", err)
 
+    async def handle_beep(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_beep(
+                count=call.data[ATTR_COUNT],
+                on_ms=call.data[ATTR_ON_MS],
+                off_ms=call.data[ATTR_OFF_MS],
+            )
+        except KibbleError as err:
+            raise_agent_action_failed("Beep", err)
+
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
     hass.services.async_register(
@@ -669,6 +708,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_RECORD_CLIP, handle_record_clip, RECORD_CLIP_SCHEMA
     )
     hass.services.async_register(DOMAIN, SERVICE_PLAY_CLIP, handle_play_clip, PLAY_CLIP_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_BEEP, handle_beep, BEEP_SCHEMA)
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: KibbleConfigEntry) -> None:

@@ -1,8 +1,9 @@
-"""Feed and cancel buttons.
+"""Feed, cancel and beep buttons.
 
 One feed button per auger plus a combined one. The augers are independent motors — the feed
 payload carries a separate amount byte for each — so they are separately controllable regardless
-of whether the physical hopper divider is fitted.
+of whether the physical hopper divider is fitted. The beep button (LibreFeed-only, see
+`light.py`'s `KibbleStatusLight`) plays the MCU buzzer once with the agent's own defaults.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     entities: list[ButtonEntity] = [KibbleFeedButton(coordinator, d) for d in FEEDS]
     entities.append(KibbleCancelButton(coordinator))
+    entities.append(KibbleBeepButton(coordinator))
     async_add_entities(entities)
 
 
@@ -109,3 +111,25 @@ class KibbleCancelButton(KibbleEntity, ButtonEntity):
             await self.coordinator.async_cancel_feed()
         except KibbleError as err:
             raise_agent_action_failed("Cancel", err)
+
+
+class KibbleBeepButton(KibbleEntity, ButtonEntity):
+    """Play the MCU buzzer once, with the agent's own default count/timing (`POST /beep`,
+    LibreFeed-only -- unavailable, not broken, on the vendor stack, same `led`-presence
+    marker `light.py`'s `KibbleStatusLight` uses: the buzzer has no polled state of its own
+    to gate on)."""
+
+    _attr_translation_key = "beep"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "beep")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.led is not None
+
+    async def async_press(self) -> None:
+        try:
+            await self.coordinator.async_beep()
+        except KibbleError as err:
+            raise_agent_action_failed("Beep", err)

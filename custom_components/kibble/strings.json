@@ -99,6 +99,9 @@
       },
       "cancel_feed": {
         "name": "Cancel feed"
+      },
+      "beep": {
+        "name": "Beep"
       }
     },
     "event": {
@@ -671,6 +674,28 @@
         "name": {
           "name": "Clip name",
           "description": "The stored clip's name, from sensor.cat_feeder_clips's attributes or GET /clips."
+        }
+      }
+    },
+    "beep": {
+      "name": "Beep",
+      "description": "Play the MCU buzzer once (LibreFeed-only).",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to beep."
+        },
+        "count": {
+          "name": "Count",
+          "description": "How many beeps to play."
+        },
+        "on_ms": {
+          "name": "Beep length",
+          "description": "How long each beep lasts, in milliseconds."
+        },
+        "off_ms": {
+          "name": "Gap length",
+          "description": "How long the silence between beeps lasts, in milliseconds."
         }
       }
     }

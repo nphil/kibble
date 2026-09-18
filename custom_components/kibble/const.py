@@ -164,3 +164,21 @@ MAX_CLIP_SECONDS = 30
 # CONSECUTIVE_FAILURES_FOR_UNAVAILABLE polls in a row -- see its module docstring for the
 # full availability policy this backs.
 ISSUE_FEEDER_UNRESPONSIVE = "feeder_unresponsive"
+
+SERVICE_BEEP = "beep"
+
+ATTR_COUNT = "count"
+ATTR_ON_MS = "on_ms"
+ATTR_OFF_MS = "off_ms"
+
+# The MCU buzzer's own writable ranges (`POST /beep` -- see `api.py`'s `KibbleClient.beep`);
+# the agent 400s outside them. Defaults mirror the agent's own when a field is omitted.
+MIN_BEEP_COUNT = 1
+MAX_BEEP_COUNT = 10
+DEFAULT_BEEP_COUNT = 2
+MIN_BEEP_ON_MS = 20
+MAX_BEEP_ON_MS = 2000
+DEFAULT_BEEP_ON_MS = 100
+MIN_BEEP_OFF_MS = 0
+MAX_BEEP_OFF_MS = 2000
+DEFAULT_BEEP_OFF_MS = 100

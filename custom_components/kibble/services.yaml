@@ -348,3 +348,35 @@ play_clip:
       required: true
       selector:
         text:
+
+beep:
+  fields:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: kibble
+    count:
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          mode: box
+    on_ms:
+      default: 100
+      selector:
+        number:
+          min: 20
+          max: 2000
+          step: 1
+          mode: box
+    off_ms:
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 1
+          mode: box

@@ -130,6 +130,12 @@ class FeederState:
     #: The feeder's most recent physical-button event (`GET /state`'s `last_key`), `None` if
     #: the feeder has never reported one this boot -- LibreFeed-only, see `KeyEvent`.
     last_key: KeyEvent | None
+    #: The feeder's key-event ring (`GET /state`'s `keys`, oldest first, LibreFeed-only) --
+    #: `event.py`'s `KibbleButtonEvent` diffs this against what it last saw so a poll interval
+    #: landing between two events never loses one, the way reading `last_key` alone could.
+    #: Falls back to a one-element tuple built from `last_key` for older LibreFeed builds that
+    #: don't yet report `keys`; empty when the feeder has reported neither.
+    keys: tuple[KeyEvent, ...]
     raw: dict[str, Any]
 
     @classmethod
@@ -169,6 +175,11 @@ class FeederState:
             agent_last_start=int(last_start) if isinstance(last_start, (int, float)) else None,
             agent_last_exit_code=int(exit_code) if isinstance(exit_code, (int, float)) else None,
             last_key=KeyEvent.from_json(last_key) if (last_key := data.get("last_key")) else None,
+            keys=(
+                tuple(KeyEvent.from_json(k) for k in raw_keys)
+                if (raw_keys := data.get("keys")) is not None
+                else (KeyEvent.from_json(last_key),) if last_key else ()
+            ),
             raw=data,
         )
 
@@ -745,6 +756,16 @@ class KibbleClient:
         if green is not None:
             payload["green"] = green
         return LedState.from_json(await self._request("POST", "/led", payload))
+
+    async def beep(self, *, count: int = 2, on_ms: int = 100, off_ms: int = 100) -> dict:
+        """`POST /beep`: plays `count` MCU buzzer beeps of `on_ms` each with `off_ms` gaps
+        (LibreFeed-only -- the agent 400s for a value outside its own writable range). A 404
+        here means the vendor stack is running; like `set_led`, this write is not passed
+        `not_found_is_missing` -- a 404 on a write is a real failure, not an optional read to
+        fall back on. Returns the agent's own `{"ok", "count", "on_ms", "off_ms"}` ack."""
+        return await self._request(
+            "POST", "/beep", {"count": count, "on_ms": on_ms, "off_ms": off_ms}
+        )
 
     async def wifi(self) -> WifiState:
         return WifiState.from_json(await self._request("GET", "/wifi"))
