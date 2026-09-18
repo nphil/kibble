@@ -42,11 +42,26 @@ PARALLEL_UPDATES = 0
 # no polling, no timers, no load -- so nothing is saved by going lower.
 PRESENCE_WINDOW = timedelta(seconds=DEFAULT_SCAN_INTERVAL * 2 + 30)
 
+# How long `KibbleVomitDetectedBinarySensor` treats a detection as "fresh" -- per the design
+# contract, `GET /state`'s `vomit_detected_at` is the last time the vendor behaviour
+# classifier's pose-history window crossed its own 0.9 threshold; the value itself never
+# clears, so this window is what makes the entity latch off again after a real event.
+VOMIT_FRESH_WINDOW = timedelta(minutes=10)
 
-# Every boolean setting `agent/src/settings.rs` marks read-only. The three writable booleans
-# (`light`, `night`, `microphone`) are controls instead -- see `switch.py`. `move_track_enable`
-# is skipped: it has no `cjson_key` of its own (an undocumented neighbour of `move_detection`)
-# and is not independently user-controllable, so it carries no dedicated entity.
+
+def vomit_is_fresh(detected_at: int | None, now: datetime) -> bool:
+    """Whether `detected_at` (`vomit_detected_at`, unix seconds or `None` if never this boot)
+    falls within [VOMIT_FRESH_WINDOW] of `now`. A free function, not a method, so the window
+    boundary is directly unit-testable with no entity or coordinator involved -- mirrors
+    `is_present` below."""
+    return detected_at is not None and now - dt_util.utc_from_timestamp(detected_at) < VOMIT_FRESH_WINDOW
+
+
+# Every boolean setting `agent/src/settings.rs` marks read-only. The writable booleans
+# (`light`, `night`, `microphone`, `vomit_detection`) are controls instead -- see `switch.py`.
+# `move_track_enable` is skipped: it has no `cjson_key` of its own (an undocumented neighbour
+# of `move_detection`) and is not independently user-controllable, so it carries no dedicated
+# entity.
 SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
     BinarySensorEntityDescription(
         key="time_display",
@@ -75,12 +90,6 @@ SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
     BinarySensorEntityDescription(
         key="eat_detection",
         translation_key="eat_detection",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    BinarySensorEntityDescription(
-        key="vomit_detection",
-        translation_key="vomit_detection",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
@@ -215,6 +224,7 @@ async def async_setup_entry(
         KibbleFeedingSensor(coordinator),
         KibbleEatingSensor(coordinator),
         KibbleReachableBinarySensor(coordinator),
+        KibbleVomitDetectedBinarySensor(coordinator),
     ]
     entities.extend(KibbleSettingBinarySensor(coordinator, d) for d in SETTING_SENSORS)
     entities.extend(KibbleHopperEmptySensor(coordinator, d) for d in HOPPER_EMPTY_SENSORS)
@@ -313,6 +323,44 @@ class KibbleReachableBinarySensor(KibbleEntity, BinarySensorEntity):
             "consecutive_failures": self.coordinator.consecutive_failures,
             "last_error": self.coordinator.last_error,
         }
+
+
+class KibbleVomitDetectedBinarySensor(KibbleEntity, BinarySensorEntity):
+    """Diagnostic readout for the vendor's own on-device behaviour classifier
+    (`CPetkitAlgoBehaviorRec`, kibble tools/VISION-ABI.md §21): on for [VOMIT_FRESH_WINDOW]
+    after `GET /state`'s `vomit_detected_at` last advanced, off otherwise. The underlying
+    signal is entirely the vendor's own classifier at its own hardcoded 0.9 threshold -- the
+    protocol exposes no sensitivity knob for it (unlike `eat`/`move`/`pet` detection, which do
+    have one), so this entity has no companion `number` entity and never will short of a new
+    protocol field.
+
+    Unavailable, rather than a bare `off`, when `vomit_detected_at` is missing from `GET
+    /state` altogether -- an agent old enough to predate this field never reports it, which is
+    a different fact from "reported, never yet detected" (`None`/`null`). Checks `state.raw`
+    directly for the same reason `event.py`'s `KibbleButtonEvent.available` does for
+    `keys`/`last_key`.
+    """
+
+    _attr_translation_key = "vomit_detected"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "vomit_detected")
+
+    @property
+    def available(self) -> bool:
+        return super().available and "vomit_detected_at" in self.coordinator.data.state.raw
+
+    @property
+    def is_on(self) -> bool:
+        return vomit_is_fresh(self.coordinator.data.state.vomit_detected_at, dt_util.utcnow())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        at = self.coordinator.data.state.vomit_detected_at
+        return {"vomit_detected_at": dt_util.utc_from_timestamp(at).isoformat() if at is not None else None}
 
 
 class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):

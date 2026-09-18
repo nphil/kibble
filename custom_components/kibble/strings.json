@@ -29,6 +29,9 @@
       "reachable": {
         "name": "Feeder reachable"
       },
+      "vomit_detected": {
+        "name": "Vomit detected"
+      },
       "hopper_1_empty": {
         "name": "Hopper 1 empty"
       },
@@ -49,9 +52,6 @@
       },
       "eat_detection": {
         "name": "Eating detection"
-      },
-      "vomit_detection": {
-        "name": "Vomit detection"
       },
       "feed_picture": {
         "name": "Photo on feed"
@@ -308,6 +308,9 @@
       },
       "microphone": {
         "name": "Microphone"
+      },
+      "vomit_detection": {
+        "name": "Vomit detection"
       },
       "cloud": {
         "name": "Petkit cloud"

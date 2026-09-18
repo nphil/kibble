@@ -1,9 +1,9 @@
 """Switches for the feeder's writable boolean settings.
 
-Of `agent/src/settings.rs`'s 37 device settings, three booleans are confirmed writable
-(`light`, `night`, `microphone` -- the same three keys `POST /config` accepts). Every other
-boolean setting is read-only and lives in `binary_sensor.py` instead, so this platform never
-exposes a control surface the agent would reject.
+Of `agent/src/settings.rs`'s 37 device settings, four booleans are confirmed writable
+(`light`, `night`, `microphone`, `vomit_detection` -- the same keys `POST /config` accepts).
+Every other boolean setting is read-only and lives in `binary_sensor.py` instead, so this
+platform never exposes a control surface the agent would reject.
 """
 
 from __future__ import annotations
@@ -44,6 +44,12 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),
+    SwitchEntityDescription(
+        key="vomit_detection",
+        translation_key="vomit_detection",
+        entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
+    ),
 )
 
 
@@ -60,13 +66,23 @@ async def async_setup_entry(
 
 class KibbleSettingSwitch(KibbleEntity, SwitchEntity):
     """One writable boolean device setting, read from and written to the feeder's shared
-    config through the agent's `/config` endpoint."""
+    config through the agent's `/config` endpoint.
+
+    Unavailable, rather than a bare `unknown`, when this setting's key is missing from `GET
+    /config` altogether -- e.g. `vomit_detection` on a daemon old enough to predate serving
+    it. Mirrors `light.py`'s `KibbleStatusLight.available`/`select.py`'s
+    `KibbleStackSelect.available`/`binary_sensor.py`'s
+    `KibbleSettingBinarySensor.available`."""
 
     entity_description: SwitchEntityDescription
 
     def __init__(self, coordinator, description: SwitchEntityDescription) -> None:
         super().__init__(coordinator, description.key)
         self.entity_description = description
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.entity_description.key in self.coordinator.data.config
 
     @property
     def is_on(self) -> bool | None:

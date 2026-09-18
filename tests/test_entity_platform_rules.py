@@ -121,6 +121,7 @@ def _all_facts() -> list[EntityFact]:
     facts.append(_fact_from_class("sensor", sensor.KibbleScheduleCardStateSensor))
     facts.append(_fact_from_class("binary_sensor", binary_sensor.KibbleFeedingSensor))
     facts.append(_fact_from_class("binary_sensor", binary_sensor.KibbleReachableBinarySensor))
+    facts.append(_fact_from_class("binary_sensor", binary_sensor.KibbleVomitDetectedBinarySensor))
     facts.append(_fact_from_class("binary_sensor", binary_sensor.KibbleCatPresentBinarySensor))
     facts.append(_fact_from_class("switch", switch.KibbleCloudSwitch))
     facts.append(_fact_from_class("button", button.KibbleCancelButton))
