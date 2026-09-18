@@ -221,6 +221,25 @@ class CloudState:
 
 
 @dataclass(frozen=True, slots=True)
+class StackState:
+    """Which feeder userland is running, as reported by `GET /mode` (the agent's counterpart
+    to `agent/src/mode.rs`'s boot-time stack selection): the vendor's own Petkit stack, or the
+    open LibreFeed replacement -- plus which one will be running after the next boot, and
+    whether LibreFeed is even installed to switch to."""
+
+    running: str
+    next: str
+    librefeed_installed: bool
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> StackState:
+        return cls(
+            running=str(data.get("running", "")),
+            next=str(data.get("next", "")),
+            librefeed_installed=bool(data.get("librefeed_installed", False)),
+        )
+
+@dataclass(frozen=True, slots=True)
 class WifiNetwork:
     """One scanned Wi-Fi network, as reported by `GET /wifi/scan` -- already deduplicated by
     SSID (strongest signal kept) and with hidden SSIDs omitted (`agent/src/wifi.rs`)."""
@@ -645,6 +664,18 @@ class KibbleClient:
         return CloudState.from_json(
             await self._request("POST", "/cloud", {"enabled": enabled})
         )
+
+    async def mode(self) -> StackState:
+        return StackState.from_json(await self._request("GET", "/mode"))
+
+    async def set_mode(self, mode: str) -> dict:
+        """Switch the running feeder userland (`"vendor"` or `"librefeed"`). The agent reboots
+        ~1s after acknowledging this (`agent/src/mode.rs`) -- unlike `set_cloud`/
+        `wifi_connect`, there is no rolled-back state to read back immediately, so this just
+        returns the agent's raw ack (`{"ok": true, "next": ..., "rebooting": true}`);
+        `coordinator.py`'s `async_set_mode` does not refresh afterwards for the same reason.
+        A 400 with `{"error": ...}` means LibreFeed isn't installed to switch to."""
+        return await self._request("POST", "/mode", {"mode": mode})
 
     async def wifi(self) -> WifiState:
         return WifiState.from_json(await self._request("GET", "/wifi"))

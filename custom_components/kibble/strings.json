@@ -276,6 +276,13 @@
       },
       "label_face": {
         "name": "Label face"
+      },
+      "stack": {
+        "name": "Stack",
+        "state": {
+          "vendor": "Petkit stack",
+          "librefeed": "LibreFeed"
+        }
       }
     }
   },

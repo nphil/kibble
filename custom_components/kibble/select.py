@@ -1,9 +1,12 @@
-"""Wi-Fi network selection and cat-face labelling for Kibble."""
+"""Wi-Fi network selection, cat-face labelling, and feeder-userland switching for Kibble."""
 
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.components.persistent_notification import async_create
 from homeassistant.components.select import SelectEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -31,7 +34,13 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities([KibbleWifiSelect(coordinator), KibbleLabelFaceSelect(coordinator)])
+    async_add_entities(
+        [
+            KibbleWifiSelect(coordinator),
+            KibbleLabelFaceSelect(coordinator),
+            KibbleStackSelect(coordinator),
+        ]
+    )
 
 
 class KibbleWifiSelect(KibbleEntity, SelectEntity):
@@ -133,3 +142,49 @@ class KibbleLabelFaceSelect(KibbleEntity, SelectEntity):
             await self.coordinator.async_label_face(review.name, cat_for_option(option))
         except KibbleError as err:
             raise_agent_action_failed("Label", err)
+
+
+class KibbleStackSelect(KibbleEntity, SelectEntity):
+    """Which feeder userland is running: the vendor's own Petkit stack, or the open LibreFeed
+    replacement (`GET /mode`, `agent/src/mode.rs`). Selecting the other option asks the agent
+    to switch and reboots the feeder ~1s later -- the switch is confirmed by the next poll
+    catching up once the reboot completes, not by anything this entity refreshes itself (see
+    `coordinator.py`'s `async_set_mode`).
+
+    Unavailable, rather than broken, on an agent old enough to predate `GET /mode`:
+    `coordinator.py`'s `_fetch_all` stores `None` for `data.stack` when that one fetch alone
+    fails, and this entity treats that as unavailable on top of the base coordinator-success
+    check.
+    """
+
+    _attr_translation_key = "stack"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = ["vendor", "librefeed"]
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "stack")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.stack is not None
+
+    @property
+    def current_option(self) -> str | None:
+        stack = self.coordinator.data.stack
+        return stack.running if stack is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stack = self.coordinator.data.stack
+        if stack is None:
+            return {}
+        return {"next": stack.next, "librefeed_installed": stack.librefeed_installed}
+
+    async def async_select_option(self, option: str) -> None:
+        stack = self.coordinator.data.stack
+        if stack is not None and option == stack.running:
+            return
+        try:
+            await self.coordinator.async_set_mode(option)
+        except KibbleError as err:
+            raise_agent_action_failed("Set stack", err)

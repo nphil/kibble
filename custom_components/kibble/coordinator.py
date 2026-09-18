@@ -114,6 +114,7 @@ from .api import (
     KibbleMediaError,
     ReviewFace,
     ScheduleState,
+    StackState,
     WifiNetwork,
     WifiState,
 )
@@ -193,16 +194,19 @@ def vendor_sightings(
 @dataclass(frozen=True, slots=True)
 class KibbleData:
     """Everything one poll cycle fetches: feeder telemetry, the schedule cache, the live
-    device-settings snapshot, the Petkit-cloud kill switch's status, the current Wi-Fi
-    association plus a fresh scan (`agent/src/wifi.rs`), every enrolled cat, the classifier's
-    current identification, the crop the pending-face image entity is showing
-    (`agent/src/faces.rs`'s `Gallery`/`review_target`/`identify_target`), every stored audio
-    clip, and every before/after dish-snapshot record (`agent/src/feed_capture.rs`)."""
+    device-settings snapshot, the Petkit-cloud kill switch's status, which feeder userland is
+    running (`GET /mode`; `None` on an agent old enough not to have that route -- see
+    `_fetch_all`), the current Wi-Fi association plus a fresh scan (`agent/src/wifi.rs`),
+    every enrolled cat, the classifier's current identification, the crop the pending-face
+    image entity is showing (`agent/src/faces.rs`'s `Gallery`/`review_target`/
+    `identify_target`), every stored audio clip, and every before/after dish-snapshot record
+    (`agent/src/feed_capture.rs`)."""
 
     state: FeederState
     schedule: ScheduleState
     config: dict[str, int]
     cloud: CloudState
+    stack: StackState | None
     wifi: WifiState
     wifi_scan: tuple[WifiNetwork, ...]
     cats: tuple[CatInfo, ...]
@@ -439,6 +443,14 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         schedule = await self.client.schedule()
         config = await self.client.config()
         cloud = await self.client.cloud()
+        try:
+            stack = await self.client.mode()
+        except KibbleError:
+            # An agent old enough to predate `GET /mode` -- the stack select goes unavailable
+            # (see `select.py`'s `KibbleStackSelect.available`), not the whole poll cycle: a
+            # single missing route on an old agent is not the "confirmed down" signal
+            # `_async_update_data`'s own `KibbleError` handling exists for.
+            stack = None
         wifi = await self.client.wifi()
         wifi_scan = tuple(await self.client.wifi_scan())
         cats = tuple(await self.client.cats())
@@ -455,6 +467,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             schedule=schedule,
             config=config,
             cloud=cloud,
+            stack=stack,
             wifi=wifi,
             wifi_scan=wifi_scan,
             cats=cats,
@@ -666,6 +679,16 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             await self.client.set_cloud(enabled)
         finally:
             await self.async_request_refresh()
+
+    async def async_set_mode(self, mode: str) -> None:
+        """Switch the running feeder userland (`"vendor"` or `"librefeed"`). Unlike
+        `async_set_cloud`/`async_wifi_connect`, this does not refresh afterwards: the agent
+        reboots ~1s after acknowledging the request (`agent/src/mode.rs`), so an immediate
+        refresh would just race the reboot and surface as a spurious poll failure instead of
+        the switch it actually is. The coordinator's normal poll cadence -- and its
+        tolerance for a few failed cycles, see the module docstring -- picks the new state
+        back up once the reboot completes."""
+        await self.client.set_mode(mode)
 
     async def async_wifi_connect(self, ssid: str, password: str | None = None) -> None:
         """Fail-safe Wi-Fi switch (`agent/src/wifi.rs`) -- always refreshes, even when
