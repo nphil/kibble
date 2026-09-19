@@ -110,9 +110,9 @@ class KibbleStatusLight(KibbleEntity, LightEntity):
 
     | Effect | Wire state |
     |---|---|
-    | `auto` / `white` / `white blink` / `white fast blink` | `{"white": auto\|1\|2\|3, "green": 0}` |
+    | `auto` / `white` / `white blink` / `white fast blink` | `{"white": auto or 1/2/3, "green": 0}` |
     | `green` | `{"white": 0, "green": 1}` |
-    | `green + auto` / `green + white` / `green + white blink` / `green + white fast blink` | `{"white": auto\|1\|2\|3, "green": 1}` |
+    | `green + auto` / `green + white` / `green + white blink` / `green + white fast blink` | `{"white": auto or 1/2/3, "green": 1}` |
 
     This was a `ColorMode.RGB` picker until 2026-09-19, which made HA render a colour wheel on
     a two-channel green-and-white LED: the quantiser behind it was honest, but the UI invited
