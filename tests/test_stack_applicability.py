@@ -64,7 +64,7 @@ def _fake_data(*, detected_stack: Stack | None, cats: tuple = ()) -> SimpleNames
         clips=(),
         feeds=(),
         events=(),
-        vendor_sightings=(),
+        sightings=(),
     )
 
 

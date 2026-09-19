@@ -186,27 +186,43 @@ type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 
 @dataclass(frozen=True, slots=True)
-class VendorSighting:
-    """One `track` detection resolved through the `vendor_pet_ids` option: the vendor's own
-    on-device identification of `pet_id`, at the vendor's own visit start time `ts`. `cat` is
-    the operator-assigned name, or `None` when the id is not in the option (surfaced raw,
-    never guessed into a name)."""
+class Sighting:
+    """One identification of a specific cat, from whichever stack made it.
+
+    On the **vendor** stack that is a `track` event: the feeder's own onboard identifier
+    naming a cloud `pet_id`, which the `vendor_pet_ids` option maps to an operator-assigned
+    name (`cat` is `None` when the id is not in the option -- surfaced raw, never guessed).
+
+    On **LibreFeed** it is any event row the classifier named (`cat` set, `pet_id` `None`) --
+    the same rows the timeline renders, so a cat tile and the timeline can never disagree
+    about when that cat was last here."""
 
     ts: int
-    pet_id: str
+    pet_id: str | None
     cat: str | None
     total_score: float | None
 
 
-def vendor_sightings(
+def sightings(
     events: Sequence[DetectionEvent], pet_ids: Mapping[str, str]
-) -> tuple[VendorSighting, ...]:
-    """Every `track` event, newest last, with its `pet_id` mapped to a cat name where the
-    option names it. Pure so it's testable without a coordinator."""
+) -> tuple[Sighting, ...]:
+    """Every identification in `events`, newest last, from either stack -- see [`Sighting`].
+
+    LibreFeed rows were missing here until 2026-09-19, which is why its cat tiles read "Last
+    here 17 hours ago" and "Not seen yet" while the feeder was identifying cats: the only
+    other input `last_seen` had was `GET /identify`, whose subject is the newest *pending
+    crop* (i.e. the last crop a human labelled), not a visit. A tile that says "last here"
+    must be fed by sightings, and nothing else.
+    """
     return tuple(
-        VendorSighting(ts=e.ts, pet_id=e.pet_id, cat=pet_ids.get(e.pet_id), total_score=e.total_score)
+        Sighting(
+            ts=e.ts,
+            pet_id=e.pet_id,
+            cat=pet_ids.get(e.pet_id) if e.cls == "track" else e.cat,
+            total_score=e.total_score,
+        )
         for e in sorted(events, key=lambda e: (e.ts, e.seq))
-        if e.cls == "track" and e.pet_id is not None
+        if (e.cls == "track" and e.pet_id is not None) or (e.cls != "track" and e.cat is not None)
     )
 
 
@@ -250,7 +266,7 @@ class KibbleData:
     clips: tuple[ClipInfo, ...]
     feeds: tuple[FeedRecord, ...]
     events: tuple[DetectionEvent, ...]
-    vendor_sightings: tuple[VendorSighting, ...]
+    sightings: tuple[Sighting, ...]
     #: `None` on agents that predate `GET /mode` (the stack select is unavailable then).
     stack: StackState | None = None
     #: `None` on the vendor stack (`GET /led` is a LibreFeed-only route -- see `light.py`'s
@@ -493,7 +509,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
         data = merge_frame(self.data, frame)
         if "events" in frame.fields:
-            data = replace(data, vendor_sightings=vendor_sightings(data.events, pet_ids))
+            data = replace(data, sightings=sightings(data.events, pet_ids))
         self._handle_poll_success()
         self.async_set_updated_data(data)
 
@@ -595,7 +611,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             clips=clips,
             feeds=feeds,
             events=events,
-            vendor_sightings=vendor_sightings(events, pet_ids),
+            sightings=sightings(events, pet_ids),
         )
 
     def _handle_poll_success(self) -> None:

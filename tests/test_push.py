@@ -86,7 +86,7 @@ def _data(**overrides) -> KibbleData:
         state=FeederState.from_json(STATE_JSON), schedule=object(), config={"volume": 1},
         cloud=object(), wifi=object(), wifi_scan=(), cats=(), identify=object(),
         review_face=object(), pending_face_count=0, clips=(), feeds=(), events=(),
-        vendor_sightings=(),
+        sightings=(),
     )
     base.update(overrides)
     return KibbleData(**base)

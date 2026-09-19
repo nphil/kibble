@@ -17,7 +17,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from kibble.api import DetectionEvent, IdentifyResult, KibbleError, ReviewFace
 from kibble.binary_sensor import PRESENCE_WINDOW, KibbleCatPresentBinarySensor, is_present, last_seen
 from kibble.const import parse_vendor_pet_ids
-from kibble.coordinator import KibbleCoordinator, VendorSighting, vendor_sightings
+from kibble.coordinator import KibbleCoordinator, Sighting, sightings
 from kibble.image import _image_url
 from kibble.select import KibbleLabelFaceSelect, cat_for_option
 
@@ -204,65 +204,49 @@ def _ts_seconds_ago(seconds: int) -> int:
     return int((_NOW.timestamp())) - seconds
 
 
-def test_is_present_true_for_a_recent_matching_identification() -> None:
-    identify = _identify("Rashy", _ts_seconds_ago(60))
-    assert is_present("Rashy", identify, (), _NOW) is True
+def _sighting(cat: str | None, ts: int, pet_id: str | None = "101320712") -> Sighting:
+    return Sighting(ts=ts, pet_id=pet_id, cat=cat, total_score=None)
+
+
+def test_is_present_true_for_a_recent_sighting() -> None:
+    assert is_present("Rashy", (_sighting("Rashy", _ts_seconds_ago(60)),), _NOW) is True
 
 
 def test_is_present_false_for_a_different_cat() -> None:
-    identify = _identify("Ghost", _ts_seconds_ago(60))
-    assert is_present("Rashy", identify, (), _NOW) is False
-
-
-def test_is_present_false_with_no_timestamp() -> None:
-    identify = _identify("Rashy", None)
-    assert is_present("Rashy", identify, (), _NOW) is False
+    assert is_present("Rashy", (_sighting("Ghost", _ts_seconds_ago(60)),), _NOW) is False
 
 
 def test_is_present_false_once_outside_the_presence_window() -> None:
-    identify = _identify("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 60))
-    assert is_present("Rashy", identify, (), _NOW) is False
+    old = _sighting("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 60))
+    assert is_present("Rashy", (old,), _NOW) is False
 
 
 def test_is_present_true_just_inside_the_presence_window_boundary() -> None:
-    identify = _identify("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) - 1))
-    assert is_present("Rashy", identify, (), _NOW) is True
-
-
-def _sighting(cat: str | None, ts: int, pet_id: str = "101320712") -> VendorSighting:
-    return VendorSighting(ts=ts, pet_id=pet_id, cat=cat, total_score=None)
-
-
-def test_is_present_true_from_a_recent_vendor_sighting_alone() -> None:
-    """The classifier has never seen this cat, but the vendor's own identifier has."""
-    identify = _identify("Ghost", _ts_seconds_ago(60))
-    sightings = (_sighting("Kitty", _ts_seconds_ago(90)),)
-    assert is_present("Kitty", identify, sightings, _NOW) is True
+    edge = _sighting("Rashy", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) - 1))
+    assert is_present("Rashy", (edge,), _NOW) is True
 
 
 def test_is_present_ignores_an_unmapped_vendor_sighting() -> None:
     """An id with no `vendor_pet_ids` entry names nobody, so it makes nobody present."""
-    identify = _identify(None, None)
-    sightings = (_sighting(None, _ts_seconds_ago(60)),)
-    assert is_present("Kitty", identify, sightings, _NOW) is False
+    assert is_present("Kitty", (_sighting(None, _ts_seconds_ago(60)),), _NOW) is False
 
 
-def test_is_present_false_once_a_vendor_sighting_ages_out() -> None:
-    identify = _identify(None, None)
-    old = _sighting("Kitty", _ts_seconds_ago(int(PRESENCE_WINDOW.total_seconds()) + 1))
-    assert is_present("Kitty", identify, (old,), _NOW) is False
+def test_presence_ignores_the_pending_crop_classifier_entirely() -> None:
+    """`GET /identify` describes the review queue, not a visit: a cat whose crop was just
+    labelled is not thereby "here", and that conflation is what put "Last here 17 hours ago"
+    on a cat nobody had seen (and "Not seen yet" on one that had just eaten)."""
+    assert is_present("Kitty", (), _NOW) is False
+    assert last_seen("Kitty", ()) is None
 
 
-
-def test_last_seen_is_the_newest_of_both_sources() -> None:
-    identify = _identify("Kitty", _ts_seconds_ago(600))
-    sightings = (_sighting("Kitty", _ts_seconds_ago(90)), _sighting("Pancake", _ts_seconds_ago(10)))
-    seen = last_seen("Kitty", identify, sightings)
+def test_last_seen_is_the_newest_sighting_of_that_cat() -> None:
+    seen = last_seen("Kitty", (_sighting("Kitty", _ts_seconds_ago(600)), _sighting("Kitty", _ts_seconds_ago(90)),
+                               _sighting("Pancake", _ts_seconds_ago(10))))
     assert seen is not None and (_NOW - seen).total_seconds() == pytest.approx(90, abs=1)
 
 
 def test_last_seen_none_when_never_identified() -> None:
-    assert last_seen("Kitty", _identify("Pancake", _ts_seconds_ago(5)), ()) is None
+    assert last_seen("Kitty", (_sighting("Pancake", _ts_seconds_ago(5)),)) is None
 
 
 def test_cat_present_last_seen_attribute_prefers_a_newer_live_sighting_over_restored() -> None:
@@ -271,7 +255,7 @@ def test_cat_present_last_seen_attribute_prefers_a_newer_live_sighting_over_rest
     sensor = SimpleNamespace(
         _cat_name="Kitty",
         _restored_last_seen=restored,
-        coordinator=SimpleNamespace(data=SimpleNamespace(identify=_identify(None, None), vendor_sightings=(live,))),
+        coordinator=SimpleNamespace(data=SimpleNamespace(sightings=(live,))),
     )
     sensor._live_last_seen = lambda: KibbleCatPresentBinarySensor._live_last_seen(sensor)
     attrs = KibbleCatPresentBinarySensor.extra_state_attributes.fget(sensor)
@@ -283,13 +267,13 @@ def test_cat_present_last_seen_attribute_falls_back_to_restored_with_no_live_sig
     sensor = SimpleNamespace(
         _cat_name="Kitty",
         _restored_last_seen=restored,
-        coordinator=SimpleNamespace(data=SimpleNamespace(identify=_identify(None, None), vendor_sightings=())),
+        coordinator=SimpleNamespace(data=SimpleNamespace(identify=_identify(None, None), sightings=())),
     )
     sensor._live_last_seen = lambda: KibbleCatPresentBinarySensor._live_last_seen(sensor)
     attrs = KibbleCatPresentBinarySensor.extra_state_attributes.fget(sensor)
     assert attrs["last_seen"] == restored.isoformat()
 
-# --- coordinator.vendor_sightings / const.parse_vendor_pet_ids --------------------------------
+# --- coordinator.sightings / const.parse_vendor_pet_ids --------------------------------
 
 
 def _event(seq: int, ts: int, cls: str, pet_id: str | None, total_score: float | None = None) -> DetectionEvent:
@@ -298,16 +282,28 @@ def _event(seq: int, ts: int, cls: str, pet_id: str | None, total_score: float |
     )
 
 
-def test_vendor_sightings_keeps_only_track_events_in_time_order_and_maps_names() -> None:
+def test_sightings_keeps_only_track_events_in_time_order_and_maps_names() -> None:
     events = (
         _event(3, 300, "track", "101320712", 1531.2),
         _event(1, 100, "visit", None),
         _event(2, 200, "track", "5"),
     )
-    got = vendor_sightings(events, {"101320712": "Kitty"})
+    got = sightings(events, {"101320712": "Kitty"})
     assert [s.ts for s in got] == [200, 300]
     assert got[0].cat is None and got[0].pet_id == "5"
     assert got[1].cat == "Kitty" and got[1].total_score == 1531.2
+
+
+def test_sightings_include_rows_the_librefeed_classifier_named() -> None:
+    """LibreFeed has no vendor `track` events at all -- it names the visit/eat row itself.
+    Those rows were dropped here until 2026-09-19, leaving the cat tiles with no sighting to
+    show however many cats the feeder identified."""
+    named = DetectionEvent(
+        seq=7, ts=700, cls="visit", image="x.jpg", cat="Pancake", score=0.71, pet_id=None, total_score=None
+    )
+    unnamed = _event(6, 600, "visit", None)
+    got = sightings((unnamed, named), {})
+    assert [(s.ts, s.cat, s.pet_id) for s in got] == [(700, "Pancake", None)]
 
 
 def test_parse_vendor_pet_ids_accepts_spaces_and_a_trailing_comma() -> None:

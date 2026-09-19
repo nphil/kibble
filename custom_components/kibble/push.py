@@ -210,7 +210,7 @@ class KibblePush:
 def merge_frame(current: Any, frame: Frame) -> Any:
     """Apply an `update`/`snapshot` frame to a `KibbleData`, returning the new one. `current`
     is typed loosely to keep this module free of a coordinator import; it is always
-    `KibbleData`. `vendor_sightings` is re-derived by the caller (it depends on the config
+    `KibbleData`. `sightings` is re-derived by the caller (it depends on the config
     entry's options, which this module does not see)."""
     parsed = parse_fields(frame.fields)
     return replace(current, **parsed) if parsed else current

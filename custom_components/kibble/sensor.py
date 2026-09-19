@@ -30,7 +30,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntry
 from .ble_fallback import CONTROL_PATHS
-from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
+from .coordinator import KibbleConfigEntry, KibbleCoordinator, Sighting
 from .entity import KibbleEntity
 from .stacks import applies_to
 

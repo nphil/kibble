@@ -20,7 +20,7 @@ from homeassistant.util import dt as dt_util, slugify
 
 from .api import IdentifyResult
 from .const import DEFAULT_SCAN_INTERVAL
-from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
+from .coordinator import KibbleConfigEntry, KibbleCoordinator, Sighting
 from .entity import KibbleEntity
 from .stacks import applies_to
 
@@ -78,31 +78,29 @@ HOPPER_EMPTY_SENSORS: tuple[KibbleHopperEmptyDescription, ...] = (
 
 def is_present(
     cat_name: str,
-    identify: IdentifyResult,
-    sightings: Sequence[VendorSighting],
+    sightings: Sequence[Sighting],
     now: datetime,
 ) -> bool:
-    """Whether `cat_name` was identified -- by Kibble's classifier as the most recent visitor,
-    or by the vendor's on-device identifier under its mapped pet id -- recently enough to
-    still call it present. A free function (not a method) so it's directly unit-testable with
-    no entity or coordinator involved."""
-    if identify.cat == cat_name and identify.ts is not None:
-        if now - dt_util.utc_from_timestamp(identify.ts) < PRESENCE_WINDOW:
-            return True
+    """Whether `cat_name` was identified as a visitor recently enough to still call it
+    present. A free function (not a method) so it's directly unit-testable with no entity or
+    coordinator involved."""
     return any(
         s.cat == cat_name and now - dt_util.utc_from_timestamp(s.ts) < PRESENCE_WINDOW
         for s in sightings
     )
 
 
-def last_seen(
-    cat_name: str, identify: IdentifyResult, sightings: Sequence[VendorSighting]
-) -> datetime | None:
-    """When `cat_name` was most recently identified, by either source, or None if never this
-    run. The same two inputs `is_present` latches on, so the two can never disagree."""
+def last_seen(cat_name: str, sightings: Sequence[Sighting]) -> datetime | None:
+    """When `cat_name` was most recently identified as a visitor, or None if never this run.
+    The same input `is_present` latches on, so the two can never disagree.
+
+    `GET /identify` used to be a second input here and was removed on 2026-09-19: its subject
+    is the newest *pending crop* -- i.e. whatever a human last labelled -- so it answered a
+    question about the review queue while the tile above it said "Last here". On a feeder
+    whose classifier was switched off it was the ONLY input, which is how a cat last seen days
+    ago showed a confident recent timestamp while the cat standing at the bowl showed "Not
+    seen yet". A sighting is the only thing that may move this."""
     candidates = [s.ts for s in sightings if s.cat == cat_name]
-    if identify.cat == cat_name and identify.ts is not None:
-        candidates.append(identify.ts)
     if not candidates:
         return None
     return dt_util.utc_from_timestamp(max(candidates))
@@ -253,10 +251,9 @@ class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEnti
     `GET /cats` reports new cats (`async_setup_entry` above).
 
     The `last_seen` attribute is what the dashboard's cat tiles show ("Last here 2 hours
-    ago"). The vendor's `track` sightings live only in the agent's memory, so after an agent
+    ago"). Sightings live only in the agent's in-memory event journal, so after an agent
     restart there is nothing to derive it from until the next visit; the last value is
-    restored across that gap via `RestoreEntity` and any newer live identification wins
-    over it."""
+    restored across that gap via `RestoreEntity` and any newer live sighting wins over it."""
 
     _attr_translation_key = "cat_present"
 
@@ -285,12 +282,12 @@ class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEnti
 
     def _live_last_seen(self) -> datetime | None:
         data = self.coordinator.data
-        return last_seen(self._cat_name, data.identify, data.vendor_sightings)
+        return last_seen(self._cat_name, data.sightings)
 
     @property
     def is_on(self) -> bool:
         data = self.coordinator.data
-        return is_present(self._cat_name, data.identify, data.vendor_sightings, dt_util.utcnow())
+        return is_present(self._cat_name, data.sightings, dt_util.utcnow())
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
