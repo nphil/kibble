@@ -13,7 +13,7 @@
     "bleak>=0.20.0",
     "bleak-retry-connector>=3.0.0"
   ],
-  "version": "0.11.0",
+  "version": "0.11.1",
   "dependencies": [
     "bluetooth",
     "ffmpeg",
