@@ -76,9 +76,16 @@ class KibbleOptionsFlow(OptionsFlow):
     """Video source, BLE fallback address, and the schedule-card write gate -- all filled in
     after initial setup.
 
-    `stream_url`: the feeder serves video to one consumer only (Scrypted); this is the
-    rebroadcast URL the camera entity consumes instead of hitting the device a second time.
-    Empty = use the device.
+    `stream_entity`: another camera entity that already carries this feeder's video -- one
+    published by Scrypted, Frigate, go2rtc, anything. Preferred over `stream_url` because HA
+    re-resolves it every time it is asked, so a rebroadcast port reassigned on restart is
+    picked up with no reconfiguration (a pinned URL is not: Scrypted's rebroadcast port is
+    ephemeral, and the camera went black exactly that way on 2026-09-19).
+
+    `stream_url`: a fixed RTSP URL, for a genuinely stable source.
+
+    Both empty is a first-class configuration, not a fallback for the unlucky: the camera then
+    streams straight from the feeder. **No video hub is required to use this integration.**
 
     `ble_address`: the feeder's BLE MAC, once a Bluetooth proxy has actually seen it advertise
     (`docs/25-ble-feed-frame.md`). Empty = `kibble.feed` reports "unreachable" instead of
@@ -97,6 +104,7 @@ class KibbleOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         if user_input is not None:
             url = (user_input.get(CONF_STREAM_URL) or "").strip()
+            stream_entity = (user_input.get(CONF_STREAM_ENTITY) or "").strip()
             address = (user_input.get(CONF_BLE_ADDRESS) or "").strip().upper()
             enable_schedule_writes = bool(user_input.get(CONF_ENABLE_SCHEDULE_WRITES, False))
             vendor_pet_ids = (user_input.get(CONF_VENDOR_PET_IDS) or "").strip()
@@ -112,11 +120,14 @@ class KibbleOptionsFlow(OptionsFlow):
             if errors:
                 return self.async_show_form(
                     step_id="init",
-                    data_schema=self._schema(url, address, enable_schedule_writes, vendor_pet_ids),
+                    data_schema=self._schema(
+                        url, stream_entity, address, enable_schedule_writes, vendor_pet_ids
+                    ),
                     errors=errors,
                 )
             return self.async_create_entry(
                 data={
+                    CONF_STREAM_ENTITY: stream_entity,
                     CONF_STREAM_URL: url,
                     CONF_BLE_ADDRESS: address,
                     CONF_ENABLE_SCHEDULE_WRITES: enable_schedule_writes,
