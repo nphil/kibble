@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.helpers import selector
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -18,6 +19,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import KibbleClient, KibbleConnectionError, KibbleError
 from .const import (
     CONF_BLE_ADDRESS,
+    CONF_STREAM_ENTITY,
     CONF_ENABLE_SCHEDULE_WRITES,
     CONF_HOST,
     CONF_PORT,
@@ -127,6 +129,7 @@ class KibbleOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=self._schema(
                 options.get(CONF_STREAM_URL, ""),
+                options.get(CONF_STREAM_ENTITY, ""),
                 options.get(CONF_BLE_ADDRESS, ""),
                 options.get(CONF_ENABLE_SCHEDULE_WRITES, False),
                 options.get(CONF_VENDOR_PET_IDS, ""),
@@ -135,10 +138,21 @@ class KibbleOptionsFlow(OptionsFlow):
 
     @staticmethod
     def _schema(
-        stream_url: str, ble_address: str, enable_schedule_writes: bool, vendor_pet_ids: str
+        stream_url: str,
+        stream_entity: str,
+        ble_address: str,
+        enable_schedule_writes: bool,
+        vendor_pet_ids: str,
     ) -> vol.Schema:
         return vol.Schema(
             {
+                # Entity first: it is the source that survives a video hub restarting, and the
+                # one most installs should use. `stream_url` stays for a genuinely fixed URL,
+                # and leaving BOTH empty is a first-class configuration -- the feeder's own
+                # stream, no hub required.
+                vol.Optional(CONF_STREAM_ENTITY, default=stream_entity): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="camera")
+                ),
                 vol.Optional(CONF_STREAM_URL, default=stream_url): str,
                 vol.Optional(CONF_BLE_ADDRESS, default=ble_address): str,
                 vol.Optional(

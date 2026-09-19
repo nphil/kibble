@@ -174,11 +174,19 @@
       },
       "hopper_1_level": {
         "name": "Hopper 1 level",
-        "state": {"empty": "Empty", "low": "Low", "ok": "OK"}
+        "state": {
+          "empty": "Empty",
+          "low": "Low",
+          "ok": "OK"
+        }
       },
       "hopper_2_level": {
         "name": "Hopper 2 level",
-        "state": {"empty": "Empty", "low": "Low", "ok": "OK"}
+        "state": {
+          "empty": "Empty",
+          "low": "Low",
+          "ok": "OK"
+        }
       },
       "factor1": {
         "name": "Hopper 1 calibration factor"
@@ -725,7 +733,8 @@
           "stream_url": "Rebroadcast RTSP URL",
           "ble_address": "Feeder BLE MAC address",
           "enable_schedule_writes": "Allow schedule card writes (unconfirmed encoding)",
-          "vendor_pet_ids": "Vendor pet ids (id=name, comma separated)"
+          "vendor_pet_ids": "Vendor pet ids (id=name, comma separated)",
+          "stream_entity": "Camera entity to stream from (optional)"
         }
       }
     },

@@ -7,6 +7,13 @@ DOMAIN = "kibble"
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_STREAM_URL = "stream_url"
+#: Another camera entity to take the live stream from -- typically the one a Scrypted (or
+#: Frigate, or go2rtc) integration already publishes for this same device. Preferred over
+#: `stream_url` because a rebroadcast URL is not stable: Scrypted assigns its RTSP rebroadcast
+#: an EPHEMERAL port, so a hardcoded url silently dies on the next Scrypted restart (observed
+#: 2026-09-19: the configured port simply stopped listening and the camera went black).
+#: Delegating to the entity lets HA resolve the current source every time it is asked.
+CONF_STREAM_ENTITY = "stream_entity"
 # The feeder's BLE MAC, once a Bluetooth proxy has actually seen it advertise
 # (docs/25-ble-feed-frame.md). Optional: with it unset, an unreachable agent simply reports
 # "unreachable" instead of trying a BLE fallback.
