@@ -106,6 +106,42 @@ def last_seen(cat_name: str, sightings: Sequence[Sighting]) -> datetime | None:
     return dt_util.utc_from_timestamp(max(candidates))
 
 
+class KibbleBowlEmptySensor(KibbleEntity, BinarySensorEntity):
+    """Whether the bowl is actually empty, per the feeder's own hysteretic verdict.
+
+    Exists because `sensor.*_bowl_fill` cannot answer the question an automation asks. That
+    number is a relative vision score, not a fraction of capacity: measured on the real device
+    (2026-09-19) an EMPTY bowl reads 0-8 rather than 0 -- the detector scores the bowl's own
+    texture and shadow -- while a small dispensed portion reads 15-21. Nothing has ever
+    measured what a full bowl scores, so the top of the range means nothing yet. Gating a
+    dispense on `bowl_fill < 10` therefore looks reasonable and is guesswork; this verdict is
+    the measured one, with a dead band and agreement across readings behind it, and it ignores
+    the 63-81 spikes a cat's head in the bowl produces.
+
+    `None` (unknown) until the feeder has taken an unobstructed reading. An automation that
+    dispenses food must require `is_state(..., 'on')` rather than `not is_state(..., 'off')`,
+    so that "do not know" never feeds the cat.
+    """
+
+    _attr_translation_key = "bowl_empty"
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "bowl_empty")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.state.bowl_empty is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.coordinator.data.state.bowl_empty
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data.state
+        return {"occluded": state.bowl_occluded, "fill_score": state.bowl_fill}
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
@@ -118,6 +154,8 @@ async def async_setup_entry(
         KibbleEatingSensor(coordinator),
         KibbleReachableBinarySensor(coordinator),
     ]
+    if applies_to(Platform.BINARY_SENSOR, "bowl_empty", stack):
+        entities.append(KibbleBowlEmptySensor(coordinator))
     entities.extend(
         KibbleHopperEmptySensor(coordinator, d)
         for d in HOPPER_EMPTY_SENSORS

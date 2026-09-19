@@ -107,6 +107,14 @@ class FeederState:
     #: `GET /state`'s `bowl_fill`: the feeder's own vision estimate of how full the bowl is
     #: (0-100), None while it has none. One reading for the whole bowl (kibble docs/34 Part 10).
     bowl_fill: int | None
+    #: `GET /state`'s `bowl_empty`: LibreFeed's hysteretic verdict on whether the bowl is
+    #: actually empty, as opposed to `bowl_fill` being a small number. `None` means the feeder
+    #: has not yet taken an unobstructed reading (or predates the field) -- which an automation
+    #: whose action is to dispense food must treat as "do not know", never as "empty".
+    bowl_empty: bool | None
+    #: True while an animal is over the bowl, so the two readings above are the last
+    #: unobstructed ones rather than live.
+    bowl_occluded: bool
     #: Per-hopper "is the food level at or below the vendor's own low-food threshold" flag --
     #: `GET /state`'s `hopper_empty`, `[hopper_1, hopper_2]`. `None` while the feeder has never
     #: reported a level for that hopper since its last boot (kibble docs/07-config.md).
@@ -158,6 +166,8 @@ class FeederState:
             feeding=bool(data.get("feeding")),
             eating=bool(data.get("eating")),
             bowl_fill=data.get("bowl_fill"),
+            bowl_empty=data.get("bowl_empty"),
+            bowl_occluded=bool(data.get("bowl_occluded")),
             hopper_empty=(
                 hopper_empty[0],
                 hopper_empty[1] if len(hopper_empty) > 1 else None,

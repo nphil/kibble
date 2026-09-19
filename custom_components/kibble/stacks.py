@@ -104,6 +104,8 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     # `detection_overlay`: unlike every row above, not merely `writable: false` on vendor --
     # the vendor's `agent/src/settings.rs` has no such key at all, since there is no vision
     # pipeline there to draw a card overlay from.
+    # `bowl_empty`: LibreFeed's own hysteretic verdict; the vendor firmware has no such field.
+    (Platform.BINARY_SENSOR, "bowl_empty"): _LIBREFEED_ONLY,
     (Platform.SWITCH, "detection_overlay"): _LIBREFEED_ONLY,
     (Platform.SWITCH, "detection_overlay_ignored"): _LIBREFEED_ONLY,
     # --- number.py -------------------------------------------------------------------------

@@ -23,6 +23,9 @@
       "feeding": {
         "name": "Feeding"
       },
+      "bowl_empty": {
+        "name": "Bowl empty"
+      },
       "eating": {
         "name": "Eating"
       },

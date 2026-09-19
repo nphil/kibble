@@ -53,3 +53,37 @@ def test_unknown_stays_unknown_with_neither_reading() -> None:
 
     assert BOWL_FILL.value(state) is None
     assert BOWL_FILL.attributes(state)["source"] == "kibble"
+
+
+# --- `bowl_empty`: the verdict an automation may act on -----------------------------------
+
+
+def test_bowl_empty_is_unknown_when_the_feeder_has_not_reported_it() -> None:
+    """The safety property. A feeder that has not taken an unobstructed reading (or predates
+    the field entirely) must leave this unknown, because the automation on the other end
+    dispenses food -- and `bowl_fill` being a small number is NOT the same fact: an empty bowl
+    measures 0-8 on this device, so a naive threshold and this verdict disagree precisely in
+    the band where it matters."""
+    from kibble.binary_sensor import KibbleBowlEmptySensor
+    from types import SimpleNamespace
+
+    state = _state(bowl_fill=5)
+    assert state.bowl_empty is None
+    ent = object.__new__(KibbleBowlEmptySensor)
+    ent.coordinator = SimpleNamespace(last_update_success=True, data=SimpleNamespace(state=state))
+    assert ent.is_on is None
+    assert ent.available is False
+
+
+def test_bowl_empty_reports_the_feeders_verdict_and_carries_the_raw_score() -> None:
+    from kibble.binary_sensor import KibbleBowlEmptySensor
+    from types import SimpleNamespace
+
+    state = _state(bowl_fill=5, bowl_empty=True, bowl_occluded=False)
+    ent = object.__new__(KibbleBowlEmptySensor)
+    ent.coordinator = SimpleNamespace(last_update_success=True, data=SimpleNamespace(state=state))
+    assert ent.available is True
+    assert ent.is_on is True
+    # The raw score rides along as an attribute so the thresholds stay auditable from HA
+    # without re-reading the daemon.
+    assert ent.extra_state_attributes == {"occluded": False, "fill_score": 5}
