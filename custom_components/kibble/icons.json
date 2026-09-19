@@ -187,6 +187,22 @@
           "low": "mdi:silo-outline",
           "ok": "mdi:silo"
         }
+      },
+      "bowl_fill_calibration_hopper_1": {
+        "default": "mdi:tune-variant",
+        "state": {
+          "measured": "mdi:check-circle-outline",
+          "inherited": "mdi:content-copy",
+          "uncalibrated": "mdi:help-circle-outline"
+        }
+      },
+      "bowl_fill_calibration_hopper_2": {
+        "default": "mdi:tune-variant",
+        "state": {
+          "measured": "mdi:check-circle-outline",
+          "inherited": "mdi:content-copy",
+          "uncalibrated": "mdi:help-circle-outline"
+        }
       }
     },
     "select": {

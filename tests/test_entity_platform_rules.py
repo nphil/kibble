@@ -94,6 +94,8 @@ def _all_facts() -> list[EntityFact]:
         facts.append(_fact_from_description("sensor", desc))
     for desc in sensor.SETTING_SENSORS:
         facts.append(_fact_from_description("sensor", desc))
+    for desc in sensor.CALIBRATION_SENSORS:
+        facts.append(_fact_from_description("sensor", desc))
     for desc in binary_sensor.HOPPER_EMPTY_SENSORS:
         facts.append(_fact_from_description("binary_sensor", desc))
     for desc in switch.SWITCHES:

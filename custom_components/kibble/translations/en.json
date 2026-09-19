@@ -236,6 +236,22 @@
       },
       "agent_starts": {
         "name": "Agent starts"
+      },
+      "bowl_fill_calibration_hopper_1": {
+        "name": "Bowl fill calibration hopper 1",
+        "state": {
+          "measured": "Measured",
+          "inherited": "Inherited",
+          "uncalibrated": "Uncalibrated"
+        }
+      },
+      "bowl_fill_calibration_hopper_2": {
+        "name": "Bowl fill calibration hopper 2",
+        "state": {
+          "measured": "Measured",
+          "inherited": "Inherited",
+          "uncalibrated": "Uncalibrated"
+        }
       }
     },
     "switch": {

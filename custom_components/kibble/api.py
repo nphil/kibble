@@ -52,6 +52,16 @@ class KibbleSpeakerBusyError(KibbleError):
     caller can give a clear, specific message instead of a generic `KibbleError`."""
 
 
+class KibbleCalibrationBusyError(KibbleError):
+    """`POST /calibration`'s `point` action 409s when it cannot trust the live bowl score
+    right now: an animal is over the bowl (the common case -- a reading taken through a cat
+    would poison the curve) or, more rarely, vision has not produced any bowl reading at all
+    yet. Raised distinctly from `KibbleSpeakerBusyError` (a completely unrelated 409, on
+    `/speak`/`/clips/<name>/play`) so a caller can show "wait for a clear bowl reading"
+    instead of a generic failure -- both cases are real, transient, retry-later conditions,
+    never a malformed request."""
+
+
 class KibbleMediaError(KibbleError):
     """A local failure resolving or converting HA media *before* ever reaching the agent --
     ffmpeg couldn't be started, timed out, or produced nothing; HA's own media-source
@@ -616,6 +626,7 @@ class KibbleClient:
         timeout: ClientTimeout | None = None,
         not_found_is_missing: bool = False,
         nullable: bool = False,
+        busy_error: type[KibbleError] = KibbleSpeakerBusyError,
     ) -> Any:
         """`payload` is sent as a JSON body; `data`, if given instead, is sent raw -- `/speak`
         and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
@@ -635,7 +646,14 @@ class KibbleClient:
         `nullable`: `GET /vision/last` is the one route whose 200 body is legitimately bare
         JSON `null` (no frame analysed yet) rather than always an object -- this keeps that
         `None` instead of falling into the empty-object substitution below, which exists only
-        to normalise the routes that are genuinely always an object."""
+        to normalise the routes that are genuinely always an object.
+
+        `busy_error`: which typed error a 409 raises. Defaults to `KibbleSpeakerBusyError` --
+        the speaker's exclusive-owner arbitration, on exactly `/speak` and
+        `/clips/<name>/play`. `calibration_action` passes `KibbleCalibrationBusyError`
+        instead: `POST /calibration`'s `point` action 409s for a completely unrelated reason
+        (an animal is over the bowl right now), and the two "busy, retry" conditions need to
+        stay tellable apart so a caller can show the right message for each."""
         async with self._lock:
             try:
                 async with self._session.request(
@@ -661,12 +679,14 @@ class KibbleClient:
                     body = await resp.json(content_type=None)
                     if resp.status >= 400:
                         detail = body.get("error", body) if isinstance(body, dict) else body
-                        # The speaker's exclusive-owner arbitration (`audioout.rs`'s
-                        # `SpeakerOwner`) surfaces as 409 on exactly `/speak` and
-                        # `/clips/<name>/play` -- distinct from every other rejected write so a
-                        # caller can tell "busy, retry" from "malformed request".
+                        # A 409 here is always some exclusive-resource arbitration rejecting a
+                        # write outright: the speaker's owner lock (`audioout.rs`'s
+                        # `SpeakerOwner`, on exactly `/speak` and `/clips/<name>/play`) by
+                        # default, or -- via `busy_error` -- `/calibration`'s "an animal is
+                        # over the bowl right now" refusal. Distinct from every other rejected
+                        # write so a caller can tell "busy, retry" from "malformed request".
                         if resp.status == 409:
-                            raise KibbleSpeakerBusyError(str(detail))
+                            raise busy_error(str(detail))
                         raise KibbleError(str(detail))
                     # `GET /wifi/scan` returns a bare JSON array, every other endpoint an
                     # object -- only substitute the empty-object default for a truly absent
@@ -1042,3 +1062,46 @@ class KibbleClient:
         through the coordinator (see that module's docstring), folds the resulting
         `KibbleNotFoundError` into the same `{"frame": None}` reply as a genuine empty frame."""
         return await self._request("GET", "/vision/last", not_found_is_missing=True, nullable=True)
+
+    async def calibration(self) -> dict:
+        """`GET /calibration`: both hoppers' bowl-fill calibration curves (LibreFeed-only --
+        `not_found_is_missing`, since this route is even newer than `/vision/last` and an
+        agent old enough to predate it 404s exactly the same way). Returned as the agent's raw
+        JSON (`{"hoppers": [hopper_or_null, hopper_or_null]}`) rather than a parsed dataclass:
+        `coordinator.py` caches it verbatim on `KibbleData.calibration`, and both the card
+        (`websocket.py`'s `kibble/calibration`) and the per-hopper sensors (`sensor.py`) read
+        it as plain JSON, so there is no intermediate Python shape anything here benefits
+        from -- unlike, say, `FeederState`, nothing needs to combine this with other fields or
+        recompute a derived value more than once per poll."""
+        return await self._request("GET", "/calibration", not_found_is_missing=True)
+
+    async def calibration_action(self, action: str, hopper: int, **fields: Any) -> dict:
+        """`POST /calibration`: one step of the bowl-fill calibration wizard --
+        `action="begin"` starts a fresh curve for `hopper` (discarding any previous one,
+        optional `note`), `action="point"` records the bowl's *current* vision score at
+        `portions` dispensed so far, `action="full"` marks an already-recorded `portions` as
+        the full point, `action="inherit"` copies the other hopper's finished curve
+        (`fields["from"]`), and `action="clear"` forgets this hopper's calibration outright.
+        `fields` passes straight through into the JSON body alongside `action`/`hopper` --
+        deliberately generic rather than one keyword per action, since the five actions above
+        share almost no fields and the agent itself is the single source of truth for which
+        combination a given `action` needs (400s for a wrong one, same as every other write
+        here).
+
+        This method -- and everything upstream of it, `coordinator.py`'s
+        `async_calibration_action` and `websocket.py`'s `kibble/calibration/action` -- never
+        dispenses food. Every `point` reading is of whatever the operator already put in the
+        bowl with their own, separate, deliberate `kibble.feed`/feed-control action; a
+        calibration step only ever reads the vision score or writes bookkeeping about it.
+
+        Raises `KibbleCalibrationBusyError` (409) if an animal is over the bowl right now --
+        `point`'s own refusal to record a reading taken through a cat, distinct from
+        `KibbleSpeakerBusyError`'s completely unrelated 409 (see `_request`'s `busy_error`). A
+        404 here is a real failure (an agent old enough to predate this route), not passed
+        `not_found_is_missing`: unlike the `GET` above, a deliberate wizard action that finds
+        no route to act on is not an optional read to quietly fall back on -- same reasoning
+        as `set_led`/`set_desiccant`."""
+        payload: dict[str, Any] = {"action": action, "hopper": hopper, **fields}
+        return await self._request(
+            "POST", "/calibration", payload, busy_error=KibbleCalibrationBusyError
+        )

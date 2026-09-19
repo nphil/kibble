@@ -148,6 +148,42 @@ SETTING_SENSORS: tuple[SensorEntityDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KibbleCalibrationDescription(SensorEntityDescription):
+    """A per-hopper bowl-fill calibration-state sensor and which slot of `GET /calibration`'s
+    `hoppers` array it reads."""
+
+    hopper: int
+
+
+CALIBRATION_STATES = ["measured", "inherited", "uncalibrated"]
+
+# Not `EntityCategory.DIAGNOSTIC`, and enabled by default: unlike `agent_starts`/`firmware`/
+# `ble_firmware` above, this is not forensic/maintenance data about the integration itself --
+# it is the fact that decides whether `bowl_fill`'s reading means anything for THIS hopper's
+# food right now, the same operational tier as `hopper_1_level`/`hopper_2_level` (also plain,
+# enabled-by-default sensors, not diagnostics). Hiding it behind the opt-in Diagnostics
+# section would bury exactly the signal an operator needs right after setup or a food change:
+# an uncalibrated hopper silently makes every portion-based reading of it meaningless, and
+# visibility outside the card and in automations is the whole reason this exists as a sensor.
+CALIBRATION_SENSORS: tuple[KibbleCalibrationDescription, ...] = (
+    KibbleCalibrationDescription(
+        key="bowl_fill_calibration_hopper_1",
+        translation_key="bowl_fill_calibration_hopper_1",
+        device_class=SensorDeviceClass.ENUM,
+        options=CALIBRATION_STATES,
+        hopper=0,
+    ),
+    KibbleCalibrationDescription(
+        key="bowl_fill_calibration_hopper_2",
+        translation_key="bowl_fill_calibration_hopper_2",
+        device_class=SensorDeviceClass.ENUM,
+        options=CALIBRATION_STATES,
+        hopper=1,
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
@@ -157,6 +193,11 @@ async def async_setup_entry(
     stack = coordinator.data.detected_stack
     entities: list[SensorEntity] = [KibbleSensor(coordinator, d) for d in SENSORS]
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
+    entities.extend(
+        KibbleCalibrationSensor(coordinator, d)
+        for d in CALIBRATION_SENSORS
+        if applies_to(Platform.SENSOR, d.key, stack)
+    )
     # One-off, non-description-driven sensors -- `(key, entity)` so every one of them still
     # goes through `applies_to`, the same as the data-driven lists above, per `stacks.py`'s
     # "no scattered `if stack == ...`" rule. Building each entity is cheap (no I/O), so nothing
@@ -722,3 +763,80 @@ class KibbleAgentStartsSensor(KibbleEntity, SensorEntity):
             else None,
             "last_exit_code": state.agent_last_exit_code,
         }
+
+
+# --- Bowl-fill calibration (LibreFeed-only) --------------------------------------------------
+
+
+def _calibration_state(hopper: dict[str, Any] | None) -> str:
+    """Classifies one hopper's `GET /calibration` entry (`coordinator.py`'s `KibbleData.
+    calibration`, the agent's raw `{"hoppers": [...]}` JSON) into this sensor's three-way
+    state.
+
+    `source` is either the literal string `"measured"` (this hopper recorded its own curve --
+    `begin` then one or more `point`s) or an object `{"inherited_from": N}` (copied wholesale
+    from hopper `N` via the `inherit` action) -- a parser that only checks `source ==
+    "measured"` and calls everything else "uncalibrated" silently mis-reports every inherited
+    hopper as never calibrated, exactly the bug this exists to avoid. `None` (the daemon's own
+    "this hopper has never been calibrated" marker) is `uncalibrated`."""
+    if hopper is None:
+        return "uncalibrated"
+    source = hopper.get("source")
+    if isinstance(source, dict) and "inherited_from" in source:
+        return "inherited"
+    return "measured"
+
+
+def _calibration_attributes(hopper: dict[str, Any] | None) -> dict[str, Any]:
+    """The wizard's own bookkeeping for one hopper -- empty while `hopper` is `None` (nothing
+    recorded yet, see `_calibration_state`)."""
+    if hopper is None:
+        return {}
+    return {
+        "full_portions": hopper.get("full_portions"),
+        "full_score": hopper.get("full_score"),
+        "points": len(hopper.get("points") or ()),
+        "measured_at": _iso_or_none(hopper.get("measured_at")),
+        "note": hopper.get("note"),
+    }
+
+
+class KibbleCalibrationSensor(KibbleEntity, SensorEntity):
+    """Whether hopper `entity_description.hopper`'s bowl-fill vision score has been calibrated
+    against real dispensed portions -- `measured` (this hopper ran its own curve), `inherited`
+    (copied from the other hopper), or `uncalibrated` (never run). The calibration wizard
+    behind `websocket.py`'s `kibble/calibration`/`kibble/calibration/action` is the only thing
+    that ever changes this; nothing here dispenses or reads the bowl on its own.
+
+    Unavailable, not merely `uncalibrated`, when the whole route is missing (`GET
+    /calibration` 404ing -- the vendor stack, or a LibreFeed build old enough to predate it):
+    that is "we don't know", a materially different fact from "we asked and nothing is
+    recorded yet". Mirrors `button.py`'s `KibbleReplaceDesiccantButton.available`."""
+
+    entity_description: KibbleCalibrationDescription
+
+    def __init__(
+        self, coordinator: KibbleCoordinator, description: KibbleCalibrationDescription
+    ) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+
+    def _hopper(self) -> dict[str, Any] | None:
+        calibration = self.coordinator.data.calibration
+        if calibration is None:
+            return None
+        hoppers = calibration.get("hoppers") or []
+        index = self.entity_description.hopper
+        return hoppers[index] if index < len(hoppers) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.calibration is not None
+
+    @property
+    def native_value(self) -> str:
+        return _calibration_state(self._hopper())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return _calibration_attributes(self._hopper())

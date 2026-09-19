@@ -1,20 +1,25 @@
 """Local-push companion for the dashboard cards: WebSocket commands over HA's own
 `websocket_api`, distinct from `push.py`'s channel to the agent.
 
-`kibble/timeline` and `kibble/cats` read straight off the coordinator's already-polled/pushed
-`KibbleData` -- no extra agent round trip. `kibble/faces/pending` and `kibble/faces/samples`
-call the agent on demand instead: pending-crop detail and a cat's full sample list are exactly
-the "training" job's data, looked at rarely and in bulk, not worth carrying in every poll cycle
-just so a WS read never has to await one. `kibble/vision/last` is on demand for the opposite
-reason: an open card polls it roughly once a second for its live detection overlay, far more
-often than a poll cycle, not less. Every command takes `entry_id`; `_resolve_coordinator` is
-the one place that turns a bad one into the right WS error instead of four copies of the same
-lookup.
+`kibble/timeline`, `kibble/cats`, and `kibble/calibration` read straight off the coordinator's
+already-polled/pushed `KibbleData` -- no extra agent round trip. `kibble/faces/pending` and
+`kibble/faces/samples` call the agent on demand instead: pending-crop detail and a cat's full
+sample list are exactly the "training" job's data, looked at rarely and in bulk, not worth
+carrying in every poll cycle just so a WS read never has to await one. `kibble/vision/last` is
+on demand for the opposite reason: an open card polls it roughly once a second for its live
+detection overlay, far more often than a poll cycle, not less. Every command takes `entry_id`;
+`_resolve_coordinator` is the one place that turns a bad one into the right WS error instead of
+four copies of the same lookup.
 
-`kibble/cats/delete`, `kibble/faces/upload`, and `kibble/faces/delete_sample` are the three
-mutations here: each forwards straight to a `KibbleCoordinator.async_*` write (which already
-refreshes on completion -- see `coordinator.py`'s face-store-write comment) and returns the
-agent's own JSON result unwrapped. `_send_agent_error` is their shared failure mapping.
+`kibble/cats/delete`, `kibble/faces/upload`, `kibble/faces/delete_sample`, and
+`kibble/calibration/action` are the mutations here: each forwards straight to a
+`KibbleCoordinator.async_*` write (which already refreshes on completion -- see
+`coordinator.py`'s face-store-write comment, and `async_calibration_action`'s own note on why
+it refreshes the same immediate way) and returns the agent's own JSON result unwrapped.
+`_send_agent_error` is their shared failure mapping. The calibration wizard never dispenses
+food through either command -- see `api.py`'s `calibration_action` docstring; a step here only
+ever reads or bookkeeps a vision score the operator's own separate feed action already put in
+the bowl.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from .api import (
     CatInfo,
     DetectionEvent,
     FeedRecord,
+    KibbleCalibrationBusyError,
     KibbleConnectionError,
     KibbleError,
     KibbleNotFoundError,
@@ -51,6 +57,10 @@ ERR_NOT_FOUND = "not_found"
 # Any other write the agent rejected outright (bad name, bad JPEG, ...): a real `KibbleError`
 # that is neither a connection failure nor a not-found.
 ERR_AGENT_REJECTED = "agent_rejected"
+# An animal is over the bowl right now (`KibbleCalibrationBusyError`, `POST /calibration`'s
+# own 409 on the `point` action) -- distinct from `agent_rejected` so the calibration wizard
+# can say "wait for the bowl to clear" instead of a generic failure.
+ERR_CALIBRATION_BUSY = "calibration_busy"
 
 # Mirrors the agent's own `GET /events/track/<ts>/image` pairing window exactly (eat preferred,
 # else visit, within `[ts - LOOKBACK, ts + LOOKAHEAD]`, closest wins). Computed here too, ahead
@@ -272,15 +282,20 @@ def cats_items(cats: Sequence[CatInfo], pet_ids: Mapping[str, str]) -> list[dict
 def _send_agent_error(
     connection: websocket_api.ActiveConnection, msg_id: int, err: KibbleError
 ) -> None:
-    """Maps a `KibbleError` from a cat/face mutation to the right WS error code: a connection
-    failure stays `feeder_unreachable` (the existing convention every other command already
-    uses); a named cat/sample the agent reports missing is `not_found`; anything else the agent
-    rejected outright (a bad name, an invalid JPEG, ...) is `agent_rejected` carrying the
-    agent's own message."""
+    """Maps a `KibbleError` from a cat/face/calibration mutation to the right WS error code: a
+    connection failure stays `feeder_unreachable` (the existing convention every other command
+    already uses); a named cat/sample the agent reports missing is `not_found`; an animal over
+    the bowl blocking a calibration point (`KibbleCalibrationBusyError`, `POST /calibration`'s
+    own 409) is `calibration_busy`, distinct enough from a generic rejection that the wizard
+    can say "wait for the bowl to clear" instead; anything else the agent rejected outright (a
+    bad name, an invalid JPEG, a malformed calibration step, ...) is `agent_rejected` carrying
+    the agent's own message."""
     if isinstance(err, KibbleConnectionError):
         connection.send_error(msg_id, ERR_FEEDER_UNREACHABLE, str(err))
     elif isinstance(err, KibbleNotFoundError):
         connection.send_error(msg_id, ERR_NOT_FOUND, str(err))
+    elif isinstance(err, KibbleCalibrationBusyError):
+        connection.send_error(msg_id, ERR_CALIBRATION_BUSY, str(err))
     else:
         connection.send_error(msg_id, ERR_AGENT_REJECTED, str(err))
 
@@ -497,6 +512,72 @@ async def ws_vision_last(
     connection.send_result(msg["id"], {"frame": frame})
 
 
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/calibration", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def ws_calibration(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """`GET /calibration` straight off the coordinator's already-polled `KibbleData.
+    calibration` -- small, and changed only by the wizard's own actions rather than on the
+    device's own clock, so this reads the poll cache exactly like `kibble/cats` above rather
+    than fetching on demand like `kibble/faces/pending`/`kibble/vision/last`.
+
+    `None` (an agent old enough to predate this route, or the vendor stack) reports as the
+    same `{"hoppers": [null, null]}` shape a fresh LibreFeed daemon gives for two hoppers it
+    has never calibrated -- the wizard has nothing to draw either way, so this is not a WS
+    error like a real connection failure would be."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    calibration = coordinator.data.calibration
+    connection.send_result(
+        msg["id"], calibration if calibration is not None else {"hoppers": [None, None]}
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/calibration/action",
+        vol.Required("entry_id"): str,
+        vol.Required("action"): str,
+        vol.Required("hopper"): int,
+        vol.Optional("portions"): int,
+        vol.Optional("from"): int,
+        vol.Optional("note"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_calibration_action(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """One calibration-wizard step (`action` is `begin`/`point`/`full`/`inherit`/`clear`),
+    forwarded to `POST /calibration` via `KibbleCoordinator.async_calibration_action` (which
+    refreshes immediately on success, so the follow-up `kibble/calibration` read every wizard
+    step makes never sees a stale curve -- see that method's own docstring). `portions`/
+    `from`/`note` are forwarded exactly when `msg` carries them; the daemon itself validates
+    which fields a given `action` needs and 400s for a wrong combination, the same trust-the-
+    agent shape `set_led`/`set_desiccant` already use rather than re-validating here.
+
+    `KibbleCalibrationBusyError` (409, an animal is over the bowl right now) maps to its own
+    `calibration_busy` WS error via `_send_agent_error`, distinct from a generic
+    `agent_rejected` so the wizard can tell "wait and retry" from "that step was wrong".
+
+    Never dispenses anything: the operator's own feed control/app already put whatever is in
+    the bowl there before calling this -- see `api.py`'s `calibration_action` docstring."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    fields = {key: msg[key] for key in ("portions", "from", "note") if key in msg}
+    try:
+        result = await coordinator.async_calibration_action(msg["action"], msg["hopper"], **fields)
+    except KibbleError as err:
+        _send_agent_error(connection, msg["id"], err)
+        return
+    connection.send_result(msg["id"], result)
+
+
 @callback
 def async_setup_websocket_api(hass: HomeAssistant) -> None:
     """Registers every `kibble/*` websocket command. Called once from `__init__.py`'s
@@ -510,3 +591,5 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_faces_upload)
     websocket_api.async_register_command(hass, ws_faces_delete_sample)
     websocket_api.async_register_command(hass, ws_vision_last)
+    websocket_api.async_register_command(hass, ws_calibration)
+    websocket_api.async_register_command(hass, ws_calibration_action)

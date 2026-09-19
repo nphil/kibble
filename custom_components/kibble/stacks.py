@@ -157,8 +157,12 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     # -- the current audible-silence gap is a separate, actively-being-fixed device bug, not a
     # missing route), so none of them need a row here.
     #
-    # sensor.py's one exception:
+    # sensor.py's exceptions:
     (Platform.SENSOR, "agent_starts"): _LIBREFEED_ONLY,  # `kibbled_start_count` -- kibbled's own restart counter
+    # `GET /calibration` (`calibration.rs`) is a LibreFeed-only route, same footing as `/led`/
+    # `/desiccant` above -- kibbled has no bowl-fill calibration concept at all.
+    (Platform.SENSOR, "bowl_fill_calibration_hopper_1"): _LIBREFEED_ONLY,
+    (Platform.SENSOR, "bowl_fill_calibration_hopper_2"): _LIBREFEED_ONLY,
 }
 
 

@@ -250,8 +250,9 @@ class KibbleData:
     `_fetch_all`), the current Wi-Fi association plus a fresh scan (`agent/src/wifi.rs`),
     every enrolled cat, the classifier's current identification, the crop the pending-face
     image entity is showing (`agent/src/faces.rs`'s `Gallery`/`review_target`/
-    `identify_target`), every stored audio clip, and every before/after dish-snapshot record
-    (`agent/src/feed_capture.rs`)."""
+    `identify_target`), every stored audio clip, every before/after dish-snapshot record
+    (`agent/src/feed_capture.rs`), and each hopper's bowl-fill calibration curve
+    (`GET /calibration`, LibreFeed-only -- see `calibration` below)."""
 
     state: FeederState
     schedule: ScheduleState
@@ -276,6 +277,14 @@ class KibbleData:
     #: equivalent counter is cloud-set, not agent-served; see `button.py`'s
     #: `KibbleReplaceDesiccantButton.available`).
     desiccant: DesiccantState | None = None
+    #: Both hoppers' bowl-fill calibration curves, as the agent's raw JSON (`{"hoppers":
+    #: [...]}`) -- `None` on the vendor stack, or a LibreFeed agent old enough to predate this
+    #: route (`GET /calibration` is LibreFeed-only -- see `sensor.py`'s
+    #: `KibbleCalibrationSensor.available`). Kept as the untyped dict `calibration()` returns,
+    #: not a parsed dataclass: `websocket.py`'s `kibble/calibration` forwards it to the card
+    #: unchanged, and `sensor.py`'s per-hopper state/attributes read it as plain JSON -- there
+    #: is no second consumer here that would benefit from an intermediate Python shape.
+    calibration: dict[str, Any] | None = None
     #: The feeder userland this snapshot's `stack`/`state.raw` identify, or `None` if neither
     #: signal does -- see `stacks.detect_stack`'s own doc for exactly how. Every platform's
     #: `async_setup_entry` gates entity creation on this (via `stacks.applies_to`), and
@@ -578,6 +587,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             stack = None
         led = await _optional(self.client.led(), None)
         desiccant = await _optional(self.client.desiccant(), None)
+        calibration = await _optional(self.client.calibration(), None)
         wifi = await self.client.wifi()
         wifi_scan = tuple(await _optional(self.client.wifi_scan(), ()))
         cats = tuple(await _optional(self.client.cats(), ()))
@@ -602,6 +612,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             detected_stack=detected_stack,
             led=led,
             desiccant=desiccant,
+            calibration=calibration,
             wifi=wifi,
             wifi_scan=wifi_scan,
             cats=cats,
@@ -985,3 +996,25 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             await self.client.play_clip(name)
         finally:
             await self.async_request_refresh()
+
+    async def async_calibration_action(self, action: str, hopper: int, **fields: Any) -> dict:
+        """One calibration-wizard step (`api.py`'s `calibration_action`), immediately
+        refreshed on success -- same `async_refresh` (not the debounced `async_request_
+        refresh`) as the face-store writes above, and for the identical reason: the wizard
+        re-queries `kibble/calibration` right after this resolves to show the just-recorded
+        point/curve, and a debounced refresh would still be serving the previous snapshot
+        when that read lands.
+
+        Unlike `async_beep`/`async_speak`/`async_wifi_connect`, this does NOT refresh in a
+        `finally` -- every failure mode here (`KibbleCalibrationBusyError`'s 409, a malformed-
+        step 400, an old agent's 404) is a clean no-op on the daemon's own side (`point`
+        "refuses rather than recording", per its own contract), unlike a Wi-Fi write that can
+        roll itself back mid-failure, so there is nothing for a refresh to reconcile when this
+        raises -- and skipping it means a cat wandering over the bowl mid-wizard doesn't also
+        force a full poll on every retry. Propagates `KibbleCalibrationBusyError`/`KibbleError`
+        to the caller uncaught, same as every other `async_*` write here.
+
+        Never dispenses food -- see `api.py`'s `calibration_action` docstring."""
+        result = await self.client.calibration_action(action, hopper, **fields)
+        await self.async_refresh()
+        return result
