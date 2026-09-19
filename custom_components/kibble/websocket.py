@@ -184,6 +184,10 @@ def _feed_item(record: FeedRecord) -> dict[str, Any]:
         "before": record.before,
         "after": record.after,
         "manual": record.manual,
+        # False when the feeder dispensed but its MCU never returned the completed record --
+        # the amount above is what was asked for, not what the hardware measured. The card
+        # says so on the row rather than presenting a guess as a fact.
+        "confirmed": record.confirmed,
     }
 
 

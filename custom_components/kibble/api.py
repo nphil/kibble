@@ -566,6 +566,11 @@ class FeedRecord:
     manual: bool
     before: str | None
     after: str | None
+    #: Whether the feeder's MCU confirmed this dispense with its own completed record.
+    #: `False` means the dispense demonstrably ran but its completion frame never arrived, so
+    #: the amounts are the ones commanded rather than the ones measured. Absent on records
+    #: from a feeder that predates the field, and those are all confirmed.
+    confirmed: bool = True
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> FeedRecord:
@@ -579,6 +584,7 @@ class FeedRecord:
             manual=bool(data.get("manual")),
             before=data.get("before"),
             after=data.get("after"),
+            confirmed=bool(data.get("confirmed", True)),
         )
 
 
