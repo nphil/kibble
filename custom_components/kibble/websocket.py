@@ -5,8 +5,10 @@
 `KibbleData` -- no extra agent round trip. `kibble/faces/pending` and `kibble/faces/samples`
 call the agent on demand instead: pending-crop detail and a cat's full sample list are exactly
 the "training" job's data, looked at rarely and in bulk, not worth carrying in every poll cycle
-just so a WS read never has to await one. Every command takes `entry_id`; `_resolve_coordinator`
-is the one place that turns a bad one into the right WS error instead of four copies of the same
+just so a WS read never has to await one. `kibble/vision/last` is on demand for the opposite
+reason: an open card polls it roughly once a second for its live detection overlay, far more
+often than a poll cycle, not less. Every command takes `entry_id`; `_resolve_coordinator` is
+the one place that turns a bad one into the right WS error instead of four copies of the same
 lookup.
 
 `kibble/cats/delete`, `kibble/faces/upload`, and `kibble/faces/delete_sample` are the three
@@ -464,6 +466,37 @@ async def ws_faces_delete_sample(
     connection.send_result(msg["id"], result)
 
 
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/vision/last", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def ws_vision_last(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """`GET /vision/last` straight from the agent, on demand -- like `kibble/faces/pending`/
+    `kibble/faces/samples` above, never through the coordinator's poll cycle, but for a
+    different reason: an open card polls this roughly once a second to keep its live
+    detection-box overlay in step with the video, far tighter than `DEFAULT_SCAN_INTERVAL`,
+    and caching a fetch this frequent in `KibbleData` would mean either slowing every other
+    entity's refresh to match or serving the overlay stale between polls.
+
+    `KibbleNotFoundError` -- an agent old enough to predate this brand-new route -- folds into
+    the same `{"frame": None}` reply as the agent's own "nothing analysed yet" `null`: the
+    card has nothing to draw either way, so this is not `ERR_FEEDER_UNREACHABLE` like a real
+    connection failure below."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        frame = await coordinator.client.vision_last()
+    except KibbleNotFoundError:
+        frame = None
+    except KibbleError as err:
+        connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
+        return
+    connection.send_result(msg["id"], {"frame": frame})
+
+
 @callback
 def async_setup_websocket_api(hass: HomeAssistant) -> None:
     """Registers every `kibble/*` websocket command. Called once from `__init__.py`'s
@@ -476,3 +509,4 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_faces_samples)
     websocket_api.async_register_command(hass, ws_faces_upload)
     websocket_api.async_register_command(hass, ws_faces_delete_sample)
+    websocket_api.async_register_command(hass, ws_vision_last)

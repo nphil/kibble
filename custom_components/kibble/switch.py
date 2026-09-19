@@ -21,9 +21,12 @@ so that caution no longer applies -- this platform's booleans now also include
 batch, `smart_frame` (auto-framing: the camera's sub-stream crops to follow the tracked cat,
 easing back to the full frame a few seconds after nothing is detected) -- previously a
 read-only `binary_sensor.py` entry, moved here now that the IVPS crop-follows-body work is
-plumbed and writable. Every setting still missing a plumbed key stays read-only and lives in
-`binary_sensor.py` instead, so this platform never exposes a control surface the agent would
-reject."""
+plumbed and writable, and `detection_overlay` (also this batch: the card's own live
+bounding-box overlay, drawn from this same vision pipeline's `GET /vision/last` verdicts --
+see its own comment in `SWITCHES` below for why it is enabled by default and LibreFeed-only,
+unlike every other setting here). Every setting still missing a plumbed key stays read-only
+and lives in `binary_sensor.py` instead, so this platform never exposes a control surface the
+agent would reject."""
 
 from __future__ import annotations
 
@@ -153,6 +156,20 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
         translation_key="smart_frame",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
+    ),
+    # `detection_overlay`: whether the card draws this same vision pipeline's own detection
+    # boxes + the open track's cat name over its live video (`websocket.py`'s
+    # `kibble/vision/last`, fed by `GET /vision/last`) -- LibreFeed-only in `stacks.py`, not
+    # merely `writable: false` there like every setting above: the vendor agent has no such
+    # key, or a vision pipeline for a card to draw from, at all. Deliberately no
+    # `entity_registry_enabled_default=False`, unlike every setting above: this is a thing the
+    # user actively watches and drives while the card is open, not a diagnostic knob left off
+    # by default (see `test_entity_platform_rules.py`'s `_ENABLED_BY_DEFAULT_EXCEPTIONS`, the
+    # same carve-out `KibbleCloudSwitch` already has below).
+    SwitchEntityDescription(
+        key="detection_overlay",
+        translation_key="detection_overlay",
+        entity_category=EntityCategory.CONFIG,
     ),
 )
 

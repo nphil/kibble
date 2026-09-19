@@ -149,6 +149,11 @@ _ENABLED_BY_DEFAULT_EXCEPTIONS = {
         "the privacy control the integration exists for; ships visible by design, "
         "documented in switch.py's KibbleCloudSwitch docstring"
     ),
+    "switch.detection_overlay": (
+        "the card's live detection-overlay toggle the user actively drives while watching "
+        "the feed, not a diagnostic knob; documented in switch.py's SWITCHES comment for "
+        "detection_overlay"
+    ),
 }
 
 

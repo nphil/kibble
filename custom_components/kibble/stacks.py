@@ -101,6 +101,10 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     (Platform.SWITCH, "feed_sound"): _LIBREFEED_ONLY,
     (Platform.SWITCH, "system_sound_enable"): _LIBREFEED_ONLY,
     (Platform.SWITCH, "smart_frame"): _LIBREFEED_ONLY,
+    # `detection_overlay`: unlike every row above, not merely `writable: false` on vendor --
+    # the vendor's `agent/src/settings.rs` has no such key at all, since there is no vision
+    # pipeline there to draw a card overlay from.
+    (Platform.SWITCH, "detection_overlay"): _LIBREFEED_ONLY,
     # --- number.py -------------------------------------------------------------------------
     # `feed_amount*` are local HA preferences with no device round trip at all -- both, and
     # absent below. Every `SETTING_NUMBERS`/`KibbleEatHoldNumber` entry reads a `/config` key

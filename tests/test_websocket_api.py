@@ -42,6 +42,7 @@ from kibble.websocket import (
     ws_faces_samples,
     ws_faces_upload,
     ws_timeline,
+    ws_vision_last,
 )
 
 
@@ -594,3 +595,25 @@ async def test_ws_faces_delete_sample_maps_an_unknown_sample_to_not_found() -> N
         hass, connection, {"id": 16, "entry_id": "e1", "cat": "Kitty", "name": "gone.jpg"}
     )
     assert connection.send_error.call_args.args[1] == ERR_NOT_FOUND
+
+
+# --- ws_vision_last: on-demand fetch, 404-from-an-old-daemon handling --------------------------
+
+
+async def test_ws_vision_last_maps_an_old_daemons_404_to_a_null_frame_not_an_error() -> None:
+    """`/vision/last` is brand new -- an agent old enough to predate it 404s exactly like any
+    other unimplemented route (`api.py`'s `vision_last`, `not_found_is_missing`). The card
+    polls this once a second purely to draw an overlay; there being nothing to draw yet is not
+    a feeder connectivity problem, so this must resolve as a null frame, like the agent's own
+    "nothing analysed yet" -- not `ERR_FEEDER_UNREACHABLE`."""
+    client = AsyncMock(
+        vision_last=AsyncMock(
+            side_effect=KibbleNotFoundError("/vision/last not supported by this agent version")
+        )
+    )
+    coordinator = _fake_coordinator(client=client)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+    await ws_vision_last.__wrapped__(hass, connection, {"id": 20, "entry_id": "e1"})
+    connection.send_result.assert_called_once_with(20, {"frame": None})
+    connection.send_error.assert_not_called()

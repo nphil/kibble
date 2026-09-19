@@ -278,6 +278,9 @@
       },
       "smart_frame": {
         "name": "Auto framing"
+      },
+      "detection_overlay": {
+        "name": "Detection overlay"
       }
     },
     "select": {

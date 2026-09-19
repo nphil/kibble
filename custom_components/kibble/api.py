@@ -605,6 +605,7 @@ class KibbleClient:
         data: bytes | None = None,
         timeout: ClientTimeout | None = None,
         not_found_is_missing: bool = False,
+        nullable: bool = False,
     ) -> Any:
         """`payload` is sent as a JSON body; `data`, if given instead, is sent raw -- `/speak`
         and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
@@ -619,7 +620,12 @@ class KibbleClient:
         this agent version" `KibbleError`, exactly like `_get_bytes` already does for crop
         fetches, so callers -- `coordinator.py`'s `_fetch_all` for the optional reads, and
         `websocket.py`'s WS error mapping for the by-id ones -- can tell "this route/
-        cat/sample doesn't exist" from "the agent is genuinely unreachable" apart."""
+        cat/sample doesn't exist" from "the agent is genuinely unreachable" apart.
+
+        `nullable`: `GET /vision/last` is the one route whose 200 body is legitimately bare
+        JSON `null` (no frame analysed yet) rather than always an object -- this keeps that
+        `None` instead of falling into the empty-object substitution below, which exists only
+        to normalise the routes that are genuinely always an object."""
         async with self._lock:
             try:
                 async with self._session.request(
@@ -655,8 +661,10 @@ class KibbleClient:
                     # `GET /wifi/scan` returns a bare JSON array, every other endpoint an
                     # object -- only substitute the empty-object default for a truly absent
                     # body, never for a legitimately empty array (`body or {}` would silently
-                    # turn `[]` into `{}`).
-                    return body if body is not None else {}
+                    # turn `[]` into `{}`) or, with `nullable`, a legitimately bare `null`.
+                    if body is None and not nullable:
+                        return {}
+                    return body
             except TimeoutError as err:
                 raise KibbleConnectionError(f"{self._base} timed out") from err
             except ClientError as err:
@@ -1008,3 +1016,19 @@ class KibbleClient:
         """`POST /clips/<name>/play`: plays an already-stored, already-encoded clip. Raises
         `KibbleSpeakerBusyError` (409) if the speaker already has a writer."""
         return await self._request("POST", f"/clips/{quote(name, safe='')}/play")
+
+    async def vision_last(self) -> dict[str, Any] | None:
+        """`GET /vision/last`: the daemon's most recently analysed frame -- already-deduplicated
+        frame-fraction detection boxes, the currently open track's cat identification, and the
+        `detection_overlay` config echo -- or `None` while nothing has been analysed yet (a
+        genuine bare JSON `null` body, not an absent one; `nullable` keeps `_request` from
+        coercing that into `{}` the way every other, always-an-object endpoint wants). The
+        body is returned unchanged -- this is straight passthrough for the card to render,
+        not a shape this integration otherwise understands.
+
+        `not_found_is_missing`: this route is brand new, so an agent old enough to predate it
+        404s outright, exactly like every other optional route -- `websocket.py`'s
+        `ws_vision_last`, which calls this directly on every card poll instead of going
+        through the coordinator (see that module's docstring), folds the resulting
+        `KibbleNotFoundError` into the same `{"frame": None}` reply as a genuine empty frame."""
+        return await self._request("GET", "/vision/last", not_found_is_missing=True, nullable=True)
