@@ -1,20 +1,21 @@
 // The mixin device itself: attached to the feeder camera (device 238, "Plant Room Feeder
 // Camera"), it adds `ObjectDetector` (backed by the agent's real `/events` feed, honestly
-// incomplete where the vendor's own data is unreachable -- see `types.ts`) and `Intercom`
-// (backed by a direct, transient RTSP connection to the agent's ONVIF-style backchannel --
-// `rtspBackchannel.ts`).
+// incomplete where the vendor's own data is unreachable -- see `types.ts`).
+//
+// Two-way audio used to live here too, over the agent's ONVIF-style RTSP backchannel. It moved
+// to the `camera-intercom` plugin's `onvif-backchannel` driver, which serves every camera in the
+// system from one place; the backchannel is the most generic of its drivers, so the feeder now
+// shares code with the rest rather than carrying its own copy. This plugin keeps only what is
+// genuinely feeder-specific: the detection feed.
 
 import type {
-    Camera, FFmpegInput, Intercom, MediaObject, MixinDeviceOptions,
+    Camera, MediaObject, MixinDeviceOptions,
     ObjectDetectionResult, ObjectDetectionTypes, ObjectDetector, ObjectsDetected,
     VideoCamera,
 } from '@scrypted/sdk';
-import { MixinDeviceBase, ScryptedInterface, ScryptedMimeTypes } from '@scrypted/sdk';
-import { sdk } from './sdkFix';
-import * as child_process from 'child_process';
+import { MixinDeviceBase, ScryptedInterface } from '@scrypted/sdk';
 import { agentGetBuffer, agentGetJson } from './agentClient';
 import { KibbleDetectionFeed } from './detectionFeed';
-import { RtspBackchannelClient } from './rtspBackchannel';
 import { findSecondPassDetector, runSecondPass, SecondPassDetector } from './secondPass';
 import { FeederConfig, IdentifyResponse, RawDetection } from './types';
 
@@ -22,10 +23,6 @@ import { FeederConfig, IdentifyResponse, RawDetection } from './types';
  * itself remembers detections for. */
 const MAX_CACHED_CROPS = 50;
 const SECOND_PASS_MIN_SCORE = 0.2;
-/** 20 ms of L16/16000 (16-bit signed big-endian PCM at the feeder's native 16 kHz): 320 samples,
- * 2 bytes each. Wideband end to end -- no G.711 companding or 8 kHz band-limit between the
- * caller's Opus and the feeder's AAC encoder. `agent/src/backchannel.rs`'s `PT_L16_16K`. */
-const L16_FRAME_BYTES = 640;
 
 /** `ObjectDetectionResult.score` is a required field in the SDK's own type, but the vendor's
  * confidence is genuinely unreachable (see `types.ts`). Building the honest, incomplete object
@@ -34,13 +31,11 @@ const L16_FRAME_BYTES = 640;
  * of the actual emitted object, not just in a comment. */
 type HonestDetectionResult = Omit<ObjectDetectionResult, 'score'> & { score?: number };
 
-export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> implements ObjectDetector, Intercom {
+export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> implements ObjectDetector {
     private feed: KibbleDetectionFeed;
     private crops = new Map<string, Buffer>();
     private cropOrder: string[] = [];
     private secondPassDetector?: SecondPassDetector;
-    private intercomClient?: RtspBackchannelClient;
-    private intercomFfmpeg?: child_process.ChildProcess;
 
     constructor(options: MixinDeviceOptions<VideoCamera & Camera>, private getConfig: () => FeederConfig) {
         super(options);
@@ -75,73 +70,8 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         return { classes: [...classes] };
     }
 
-    // ---- Intercom: direct-to-device ONVIF-style RTSP backchannel ----
-    // Scrypted's own Rebroadcast plugin only ever reads from the feeder, so returning audio has
-    // to open its own short-lived RTSP session straight to `kibbled` -- see rtspBackchannel.ts
-    // and the README for exactly what that costs against the "one video consumer" rule.
-
-    async startIntercom(media: MediaObject): Promise<void> {
-        await this.stopIntercom();
-        const config = this.getConfig();
-        const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
-
-        const client = new RtspBackchannelClient(config.host, config.rtspPort, config.rtspPath, this.console);
-        await client.connect();
-        const { offered } = await client.describeWithBackchannel();
-        if (!offered) {
-            client.close();
-            throw new Error('kibble: feeder did not offer an ONVIF backchannel section in its DESCRIBE response');
-        }
-        const setup = await client.setupBackchannel('tcp');
-        if (setup.code !== 200) {
-            client.close();
-            throw new Error(`kibble: SETUP trackID=2 (TCP) failed: ${setup.code} ${setup.reason}`);
-        }
-        const play = await client.play();
-        if (play.code !== 200) {
-            client.close();
-            throw new Error(`kibble: PLAY failed: ${play.code} ${play.reason}`);
-        }
-        this.intercomClient = client;
-        this.console.log('kibble: intercom backchannel negotiated and playing (RTP/AVP/TCP, interleaved 4-5, L16/16000)');
-
-        const ffmpegPath = await sdk.mediaManager.getFFmpegPath();
-        const inputArgs = ffmpegInput.inputArguments?.length ? ffmpegInput.inputArguments : ['-i', ffmpegInput.url!];
-        // Low-latency flags: no input probing/analysis delay, flush every packet.
-        const args = [
-            '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32', '-analyzeduration', '0',
-            ...inputArgs, '-vn', '-acodec', 'pcm_s16be', '-ar', '16000', '-ac', '1', '-f', 's16be', '-flush_packets', '1', 'pipe:1',
-        ];
-        this.console.log(`kibble: intercom ffmpeg: ${ffmpegPath} ${args.join(' ')}`);
-        const proc = child_process.spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        this.intercomFfmpeg = proc;
-        proc.stderr?.resume(); // ffmpeg logs to stderr even on a clean run; nothing here is actionable.
-        proc.on('exit', code => this.console.log(`kibble: intercom ffmpeg exited (code ${code})`));
-
-        let pending: Buffer = Buffer.alloc(0);
-        proc.stdout?.on('data', (chunk: Buffer) => {
-            pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-            while (pending.length >= L16_FRAME_BYTES) {
-                client.sendL16Frame(pending.subarray(0, L16_FRAME_BYTES));
-                pending = pending.subarray(L16_FRAME_BYTES);
-            }
-        });
-    }
-
-    async stopIntercom(): Promise<void> {
-        this.intercomFfmpeg?.kill('SIGTERM');
-        this.intercomFfmpeg = undefined;
-        if (this.intercomClient) {
-            const client = this.intercomClient;
-            this.intercomClient = undefined;
-            await client.teardown().catch(e => this.console.warn('kibble: intercom teardown failed:', e));
-            client.close();
-        }
-    }
-
     override release(): void {
         this.feed.stop();
-        this.stopIntercom().catch(e => this.console.warn('kibble: stopIntercom during release failed:', e));
         super.release();
     }
 
