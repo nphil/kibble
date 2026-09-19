@@ -9,7 +9,7 @@ from typing import Any
 
 from homeassistant.components.persistent_notification import async_create
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -25,6 +25,7 @@ from .const import (
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -37,13 +38,17 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
     entities: list[SelectEntity] = [
         KibbleWifiSelect(coordinator),
         KibbleLabelFaceSelect(coordinator),
         KibbleStackSelect(coordinator),
-        KibbleCameraIndicatorSelect(coordinator),
     ]
-    entities.extend(KibbleSettingSelect(coordinator, d) for d in SETTING_SELECTS)
+    if applies_to(Platform.SELECT, "camera_indicator", stack):
+        entities.append(KibbleCameraIndicatorSelect(coordinator))
+    entities.extend(
+        KibbleSettingSelect(coordinator, d) for d in SETTING_SELECTS if applies_to(Platform.SELECT, d.key, stack)
+    )
     async_add_entities(entities)
 
 

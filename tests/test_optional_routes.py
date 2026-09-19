@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from kibble.api import KibbleConnectionError, KibbleNotFoundError, ScheduleState
+from kibble.api import FeederState, KibbleConnectionError, KibbleNotFoundError, ScheduleState, StackState
 from kibble.coordinator import KibbleCoordinator
 
 
@@ -34,6 +34,7 @@ def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
     coord.data = None
     coord.consecutive_failures = 0
     coord.last_error = None
+    coord._last_confirmed_stack = None
     return coord
 
 
@@ -42,11 +43,11 @@ def _librefeed_client(**overrides: AsyncMock) -> AsyncMock:
     innocuous default; `overrides` replaces individual methods (typically with a
     `KibbleNotFoundError`/`KibbleConnectionError` `side_effect`) to set up one scenario."""
     client = AsyncMock(
-        state=AsyncMock(return_value=object()),
+        state=AsyncMock(return_value=FeederState.from_json({})),
         schedule=AsyncMock(return_value=ScheduleState.from_json({"entries": []})),
         config=AsyncMock(return_value={}),
         cloud=AsyncMock(return_value=object()),
-        mode=AsyncMock(return_value=object()),
+        mode=AsyncMock(return_value=StackState.from_json({"running": "librefeed"})),
         wifi=AsyncMock(return_value=object()),
         wifi_scan=AsyncMock(return_value=[]),
         cats=AsyncMock(return_value=[]),

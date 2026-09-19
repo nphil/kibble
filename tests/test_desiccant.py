@@ -11,7 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from kibble.api import DesiccantState, KibbleClient, KibbleNotFoundError
+from kibble.api import DesiccantState, FeederState, KibbleClient, KibbleNotFoundError, StackState
 from kibble.button import KibbleReplaceDesiccantButton
 from kibble.coordinator import KibbleCoordinator
 
@@ -111,14 +111,14 @@ def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
 
 
 async def test_get_desiccant_404_leaves_desiccant_none_while_the_rest_of_the_poll_still_updates() -> None:
-    state = object()
+    state = FeederState.from_json({})
     cloud = object()
     client = AsyncMock(
         state=AsyncMock(return_value=state),
         schedule=AsyncMock(return_value=object()),
         config=AsyncMock(return_value={}),
         cloud=AsyncMock(return_value=cloud),
-        mode=AsyncMock(return_value=object()),
+        mode=AsyncMock(return_value=StackState.from_json({"running": "vendor"})),
         led=AsyncMock(return_value=object()),
         desiccant=AsyncMock(side_effect=KibbleNotFoundError("not found")),
         wifi=AsyncMock(return_value=object()),

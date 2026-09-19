@@ -130,7 +130,7 @@ other row assumes poll-based propagation is sufficient but flags this as unconfi
 | `surplusControl` | Leftover-food detection state (read-only) | sensor.cat_feeder_leftover_food_state | config_shm `usr.app_conf.surplusControl` (Table A #130) + `state.dev_pro.leftover` (Table A #161, low-confidence `state.dev_pro` cluster). LOW confidence exact offsets, MEDIUM on cluster region. | N/A — Localkit's own doc marks this read-only (device-computed, not app-set). | No | DIAGNOSTIC |
 | `surplusStandard` | Leftover-food threshold | number.cat_feeder_leftover_threshold | config_shm `usr.app_conf.surplusStandard` (Table A #131), cluster region. LOW confidence. | UNKNOWN — presumed direct config_shm write, consumed by `CPetkitAlgoFoodDetect`'s food_model pipeline (STUDY-alg.md §1) which re-reads it per detection cycle (unconfirmed whether push or poll). | No | CONFIG |
 | `smartFrame` | Pet auto-tracking/framing in video | switch.cat_feeder_auto_tracking | config_shm `usr.app_conf.smartFrame` (Table A #132), cluster region. LOW confidence. | UNKNOWN — consumer likely `CPetkitSortTrack` (SORT tracker, STUDY-alg.md §1) framing decision; write path unconfirmed. | No | CONFIG |
-| `vomitDetection` | Vomit detection enable | switch.cat_feeder_vomit_detection | config_shm `usr.app_conf.vomit_det.algoEnable` (Table A #133), cluster region. LOW confidence. (No separate sensitivity field exists for this detector — confirmed absent from Table A, matching Localkit's own key list which likewise has no `vomitSensitivity`.) | UNKNOWN, same class as moveDetection. | No | CONFIG |
+| `vomitDetection` | Vomit detection enable | Implemented as `switch.<feeder>_vomit_detection` + a diagnostic `binary_sensor.<feeder>_vomit_detected`; removed 2026-09-18 — `librefeed-media` RSS measured 36.7 MB (6.9 MB `MemAvailable`) enabled vs. 26.5 MB (16.7 MB `MemAvailable`) disabled, on a 92 MB device. | config_shm `usr.app_conf.vomit_det.algoEnable` (Table A #133), cluster region. LOW confidence. (No separate sensitivity field exists for this detector — confirmed absent from Table A, matching Localkit's own key list which likewise has no `vomitSensitivity`.) | Implemented, then removed for the RSS cost above — see git history. | No | REMOVED |
 | `feedPicture` | Capture photo on feed | switch.cat_feeder_feed_photo | config_shm `usr.app_conf.feedPicture` (Table A #114), cluster region. LOW confidence. | UNKNOWN — presumed direct config_shm write; consumer is media's snapshot path (`/tmp/fPre_compStart.jpeg` etc., STUDY-app.md §10). | No | CONFIG |
 | `upload` | Cloud recording (kept for cloud config) | NOT EXPOSED | N/A | N/A | N/A | N/A |
 | `shareOpen` | Share device access (Petkit account sharing) | NOT EXPOSED | N/A | N/A | N/A | N/A |
@@ -669,7 +669,7 @@ rows in §3.3 and §7 than any single item in the write-queue below.
 
 ### Tier 2 — tuning/quality surfaces; sensible defaults work without these
 
-6. **Detection enable flags** — `moveDetection`, `petDetection`, `eatDetection`, `vomitDetection`
+6. **Detection enable flags** — `moveDetection`, `petDetection`, `eatDetection`
    (§1.3). Needed to let the user turn cat-ID/event generation off; defaults (presumably all-on from
    factory) work fine without a fix here.
 7. **Detection sensitivity mapping** — `moveSensitivity`, `petSensitivity`, `eatSensitivity` (§1.3).

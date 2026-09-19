@@ -208,7 +208,7 @@ async def test_successful_cycle_resets_failures_and_returns_fresh_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coord = _bare_coordinator(data=object(), consecutive_failures=2)
-    fresh = object()
+    fresh = SimpleNamespace(detected_stack=None)
     monkeypatch.setattr(coord, "_fetch_all", AsyncMock(return_value=fresh))
 
     result = await coord._async_update_data()

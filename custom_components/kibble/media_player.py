@@ -35,6 +35,7 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
     MediaType,
 )
+from homeassistant.const import Platform
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
@@ -44,6 +45,7 @@ from .const import MAX_DEVICE_VOLUME
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed, raise_speaker_busy
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -55,7 +57,8 @@ async def async_setup_entry(
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([KibbleSpeaker(entry.runtime_data)])
+    if applies_to(Platform.MEDIA_PLAYER, "speaker", entry.runtime_data.data.detected_stack):
+        async_add_entities([KibbleSpeaker(entry.runtime_data)])
 
 
 class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):

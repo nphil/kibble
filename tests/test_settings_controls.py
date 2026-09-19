@@ -7,7 +7,7 @@ from read-only sensors/binary_sensors into real controls: `switch.py`'s
 `surplus_standard`) plus its hand-written `KibbleEatHoldNumber` (the `eat_sensitivity` wire
 key, converted to/from a seconds hold time), and `select.py`'s `SETTING_SELECTS`
 (`selected_sound`, `surplus_control`). Same duck-typed, `object.__new__`-constructed style as
-`test_vomit_detection.py`/`test_vendor_only_config_availability.py`.
+`test_vendor_only_config_availability.py`.
 
 Deliberately does not re-test `KibbleSettingSwitch`/`KibbleSettingSelect`'s
 `available`/generic mechanics, or the CONFIG-category/disabled-by-default rules, here -- those

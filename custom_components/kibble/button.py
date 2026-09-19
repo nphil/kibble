@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -20,6 +21,7 @@ from .const import DOMAIN, HOPPER_1, HOPPER_2, HOPPER_BOTH, MAX_AMOUNT, MIN_AMOU
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -59,10 +61,13 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
     entities: list[ButtonEntity] = [KibbleFeedButton(coordinator, d) for d in FEEDS]
     entities.append(KibbleCancelButton(coordinator))
-    entities.append(KibbleBeepButton(coordinator))
-    entities.append(KibbleReplaceDesiccantButton(coordinator))
+    if applies_to(Platform.BUTTON, "beep", stack):
+        entities.append(KibbleBeepButton(coordinator))
+    if applies_to(Platform.BUTTON, "replace_desiccant", stack):
+        entities.append(KibbleReplaceDesiccantButton(coordinator))
     async_add_entities(entities)
 
 

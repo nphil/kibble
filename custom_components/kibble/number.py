@@ -40,7 +40,7 @@ from homeassistant.components.number import (
     NumberEntityDescription,
     NumberMode,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
+from homeassistant.const import PERCENTAGE, EntityCategory, Platform, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -62,6 +62,7 @@ from .const import (
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
@@ -150,11 +151,15 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
     entities: list[NumberEntity] = [
         KibbleFeedAmount(coordinator, description) for description in AMOUNTS
     ]
-    entities.extend(KibbleSettingNumber(coordinator, d) for d in SETTING_NUMBERS)
-    entities.append(KibbleEatHoldNumber(coordinator))
+    entities.extend(
+        KibbleSettingNumber(coordinator, d) for d in SETTING_NUMBERS if applies_to(Platform.NUMBER, d.key, stack)
+    )
+    if applies_to(Platform.NUMBER, "eating_hold", stack):
+        entities.append(KibbleEatHoldNumber(coordinator))
     async_add_entities(entities)
 
 

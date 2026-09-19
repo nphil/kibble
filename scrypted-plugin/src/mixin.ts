@@ -63,7 +63,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
     }
 
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
-        const classes = new Set(['face', 'visit', 'eat', 'vomit']);
+        const classes = new Set(['face', 'visit', 'eat']);
         if (this.getConfig().secondPassEnabled) {
             this.secondPassDetector ??= findSecondPassDetector();
             if (this.secondPassDetector) {
@@ -181,13 +181,6 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         // See the module doc comment on `HonestDetectionResult` for why this cast, and only this
         // one field, is missing rather than fabricated.
         const results: ObjectDetectionResult[] = [onDevice as ObjectDetectionResult];
-        if (raw.vomit) {
-            // Same track, same crop (if any) -- a second detection entry rather than a second
-            // event, so a consumer that only looks at `class` still sees the vomit independently
-            // of whether this track also carries a `visit`/`eat` label above.
-            const vomit: HonestDetectionResult = { className: 'vomit' };
-            results.push(vomit as ObjectDetectionResult);
-        }
         if (crop && config.secondPassEnabled)
             results.push(...await this.trySecondPass(crop));
 

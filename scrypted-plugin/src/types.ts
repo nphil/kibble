@@ -10,7 +10,7 @@
 // `docs/24-onboard-ai.md` describes belongs to a different, unrelated firmware this plugin does
 // not talk to. `score` and `total_score` are the *identification* confidence for `cat`, honestly
 // `null` whenever naming is off (the feeder's current `/vision` config) or nothing was matched --
-// never a fabricated number. `class`, `image`, `cat`, `vomit`, `image_before`, `image_after` are
+// never a fabricated number. `class`, `image`, `cat`, `image_before`, `image_after` are
 // real, live values.
 export interface RawDetection {
     seq: number;
@@ -38,10 +38,6 @@ export interface RawDetection {
      * surfaced by this plugin -- see `mixin.ts`. */
     image_before: string | null;
     image_after: string | null;
-    /** `true` once any frame during this track reported vomiting behaviour above the feeder's
-     * own threshold (LibreFeed-only; sticky for the whole track, like `class: "eat"`). Always
-     * `false` unless `/vision`'s `vomit` detector is enabled. */
-    vomit: boolean;
 }
 
 /** Agent connection settings, read live off the provider's `StorageSettings` on every use so a

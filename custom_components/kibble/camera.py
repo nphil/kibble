@@ -15,12 +15,14 @@ from __future__ import annotations
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.ffmpeg import async_get_image
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import CONF_HOST, CONF_STREAM_URL, DEFAULT_RTSP_PATH, DEFAULT_RTSP_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+from .stacks import applies_to
 
 # One coordinator-backed entity; the stream itself is Scrypted's/the device's RTSP, entirely
 # outside HA's own update cycle. See coordinator.py's module docstring and the
@@ -33,7 +35,8 @@ async def async_setup_entry(
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([KibbleCamera(entry)])
+    if applies_to(Platform.CAMERA, "camera", entry.runtime_data.data.detected_stack):
+        async_add_entities([KibbleCamera(entry)])
 
 
 class KibbleCamera(KibbleEntity, Camera):

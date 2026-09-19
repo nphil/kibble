@@ -12,7 +12,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -22,6 +22,7 @@ from .api import IdentifyResult
 from .const import DEFAULT_SCAN_INTERVAL
 from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
 from .entity import KibbleEntity
+from .stacks import applies_to
 
 # Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -42,38 +43,12 @@ PARALLEL_UPDATES = 0
 # no polling, no timers, no load -- so nothing is saved by going lower.
 PRESENCE_WINDOW = timedelta(seconds=DEFAULT_SCAN_INTERVAL * 2 + 30)
 
-# How long `KibbleVomitDetectedBinarySensor` treats a detection as "fresh" -- per the design
-# contract, `GET /state`'s `vomit_detected_at` is the last time the vendor behaviour
-# classifier's pose-history window crossed its own 0.9 threshold; the value itself never
-# clears, so this window is what makes the entity latch off again after a real event.
-VOMIT_FRESH_WINDOW = timedelta(minutes=10)
-
-
-def vomit_is_fresh(detected_at: int | None, now: datetime) -> bool:
-    """Whether `detected_at` (`vomit_detected_at`, unix seconds or `None` if never this boot)
-    falls within [VOMIT_FRESH_WINDOW] of `now`. A free function, not a method, so the window
-    boundary is directly unit-testable with no entity or coordinator involved -- mirrors
-    `is_present` below."""
-    return detected_at is not None and now - dt_util.utc_from_timestamp(detected_at) < VOMIT_FRESH_WINDOW
-
-
-# Every boolean setting still without a writable plumbed key. `light`, `night`, `microphone`,
-# `vomit_detection`, `pet_detection`, `move_detection`, `eat_detection`, `feed_picture`,
-# `eat_video`, `food_warn`, `time_display`, `camera`, `light_mode`, `tone_mode`, `sound_enable`,
-# `feed_sound`, `system_sound_enable`, `smart_frame` are controls instead -- see `switch.py`.
-# What's left here is still out of scope: `manual_lock`'s MCU protocol is still undecoded --
-# see LibreFeed's own `docs/06-entity-audit.md`. `move_track_enable` is skipped entirely: it
-# has no `cjson_key` of its own (an undocumented neighbour of `move_detection`) and is not
-# independently user-controllable, so it carries no dedicated entity.
-SETTING_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
-    BinarySensorEntityDescription(
-        key="manual_lock",
-        translation_key="manual_lock",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-)
-
+# `light`, `night`, `microphone`, `pet_detection`, `move_detection`,
+# `eat_detection`, `feed_picture`, `eat_video`, `food_warn`, `time_display`, `camera`,
+# `light_mode`, `tone_mode`, `sound_enable`, `feed_sound`, `system_sound_enable`, `smart_frame`
+# are controls instead -- see `switch.py`. `move_track_enable` carries no entity at all: it has
+# no `cjson_key` of its own (an undocumented neighbour of `move_detection`) and is not
+# independently user-controllable.
 
 @dataclass(frozen=True, kw_only=True)
 class KibbleHopperEmptyDescription(BinarySensorEntityDescription):
@@ -139,15 +114,21 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
     entities: list[BinarySensorEntity] = [
         KibbleFeedingSensor(coordinator),
         KibbleEatingSensor(coordinator),
         KibbleReachableBinarySensor(coordinator),
-        KibbleVomitDetectedBinarySensor(coordinator),
     ]
-    entities.extend(KibbleSettingBinarySensor(coordinator, d) for d in SETTING_SENSORS)
-    entities.extend(KibbleHopperEmptySensor(coordinator, d) for d in HOPPER_EMPTY_SENSORS)
+    entities.extend(
+        KibbleHopperEmptySensor(coordinator, d)
+        for d in HOPPER_EMPTY_SENSORS
+        if applies_to(Platform.BINARY_SENSOR, d.key, stack)
+    )
     async_add_entities(entities)
+
+    if not applies_to(Platform.BINARY_SENSOR, "cat_present", stack):
+        return
 
     # Per-cat presence entities are created dynamically from `GET /cats` -- there is no fixed
     # list at integration setup, since cats are enrolled over time by labelling crops.
@@ -244,44 +225,6 @@ class KibbleReachableBinarySensor(KibbleEntity, BinarySensorEntity):
         }
 
 
-class KibbleVomitDetectedBinarySensor(KibbleEntity, BinarySensorEntity):
-    """Diagnostic readout for the vendor's own on-device behaviour classifier
-    (`CPetkitAlgoBehaviorRec`, kibble tools/VISION-ABI.md §21): on for [VOMIT_FRESH_WINDOW]
-    after `GET /state`'s `vomit_detected_at` last advanced, off otherwise. The underlying
-    signal is entirely the vendor's own classifier at its own hardcoded 0.9 threshold -- the
-    protocol exposes no sensitivity knob for it (unlike `eat`/`move`/`pet` detection, which do
-    have one), so this entity has no companion `number` entity and never will short of a new
-    protocol field.
-
-    Unavailable, rather than a bare `off`, when `vomit_detected_at` is missing from `GET
-    /state` altogether -- an agent old enough to predate this field never reports it, which is
-    a different fact from "reported, never yet detected" (`None`/`null`). Checks `state.raw`
-    directly for the same reason `event.py`'s `KibbleButtonEvent.available` does for
-    `keys`/`last_key`.
-    """
-
-    _attr_translation_key = "vomit_detected"
-    _attr_device_class = BinarySensorDeviceClass.PROBLEM
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = False
-
-    def __init__(self, coordinator: KibbleCoordinator) -> None:
-        super().__init__(coordinator, "vomit_detected")
-
-    @property
-    def available(self) -> bool:
-        return super().available and "vomit_detected_at" in self.coordinator.data.state.raw
-
-    @property
-    def is_on(self) -> bool:
-        return vomit_is_fresh(self.coordinator.data.state.vomit_detected_at, dt_util.utcnow())
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        at = self.coordinator.data.state.vomit_detected_at
-        return {"vomit_detected_at": dt_util.utc_from_timestamp(at).isoformat() if at is not None else None}
-
-
 class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):
     """Whether one hopper's food-level sensor is at or below the vendor's own low-food
     threshold (`agent/src/state.rs::off::FOOD_1`/`FOOD_2`, kibble docs/07-config.md).
@@ -302,31 +245,6 @@ class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool | None:
         return self.coordinator.data.state.hopper_empty[self.entity_description.index]
-
-
-class KibbleSettingBinarySensor(KibbleEntity, BinarySensorEntity):
-    """One read-only boolean device setting, read from the feeder's shared config.
-
-    Unavailable, rather than a bare `unknown`, when this setting's key is missing from
-    `GET /config` altogether -- LibreFeed serves only `light`/`night`/`microphone` there
-    today, so every other entry in `SETTING_SENSORS` names a vendor-only setting the agent
-    genuinely does not have an opinion on, not a value that happens to be unset. Mirrors
-    `light.py`'s `KibbleStatusLight.available`/`select.py`'s `KibbleStackSelect.available`."""
-
-    entity_description: BinarySensorEntityDescription
-
-    def __init__(self, coordinator, description: BinarySensorEntityDescription) -> None:
-        super().__init__(coordinator, description.key)
-        self.entity_description = description
-
-    @property
-    def available(self) -> bool:
-        return super().available and self.entity_description.key in self.coordinator.data.config
-
-    @property
-    def is_on(self) -> bool | None:
-        value = self.coordinator.data.config.get(self.entity_description.key)
-        return None if value is None else bool(value)
 
 
 class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEntity):

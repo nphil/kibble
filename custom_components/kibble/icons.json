@@ -13,12 +13,6 @@
           "off": "mdi:lan-disconnect"
         }
       },
-      "vomit_detected": {
-        "default": "mdi:emoticon-sick-outline",
-        "state": {
-          "on": "mdi:emoticon-sick"
-        }
-      },
       "hopper_1_empty": {
         "default": "mdi:food-drumstick",
         "state": {
@@ -30,9 +24,6 @@
         "state": {
           "on": "mdi:food-drumstick-off"
         }
-      },
-      "manual_lock": {
-        "default": "mdi:lock-outline"
       },
       "cat_present": {
         "default": "mdi:cat"
@@ -232,12 +223,6 @@
       },
       "microphone": {
         "default": "mdi:microphone"
-      },
-      "vomit_detection": {
-        "default": "mdi:emoticon-sick-outline",
-        "state": {
-          "on": "mdi:emoticon-sick"
-        }
       },
       "pet_detection": {
         "default": "mdi:cat"

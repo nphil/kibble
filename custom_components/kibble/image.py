@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
 from homeassistant.components.image import ImageEntity, ImageEntityDescription
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -19,6 +20,7 @@ from .api import DetectionEvent, FeedRecord, KibbleError, ReviewFace
 from .const import CONF_HOST, CONF_PORT
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
+from .stacks import applies_to
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,13 +47,18 @@ async def async_setup_entry(
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities(
-        [
-            KibblePendingFaceImage(hass, entry),
-            KibbleLastDetectionImage(hass, entry),
-            *(KibbleDishImage(hass, entry, description) for description in DISH_IMAGES),
-        ]
+    stack = entry.runtime_data.data.detected_stack
+    entities: list[ImageEntity] = []
+    if applies_to(Platform.IMAGE, "pending_face", stack):
+        entities.append(KibblePendingFaceImage(hass, entry))
+    if applies_to(Platform.IMAGE, "last_detection_image", stack):
+        entities.append(KibbleLastDetectionImage(hass, entry))
+    entities.extend(
+        KibbleDishImage(hass, entry, description)
+        for description in DISH_IMAGES
+        if applies_to(Platform.IMAGE, description.key, stack)
     )
+    async_add_entities(entities)
 
 
 def _image_url(entry: KibbleConfigEntry, review: ReviewFace, pending_face_count: int) -> str | None:

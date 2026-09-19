@@ -50,7 +50,7 @@ below: `sensor.vendor_last_seen_pet`.
 | detections_today | KibbleDetectionsTodaySensor | GET /events → filtered by local date | — | MEASUREMENT | — | Yes | counter | ✓ |
 | agent_starts | KibbleAgentStartsSensor | GET /state → kibbled_start_count | — | — | DIAGNOSTIC | No | restart | ✓ |
 
-### binary_sensor.py (18 static + dynamic per-cat)
+### binary_sensor.py (17 static + dynamic per-cat)
 
 | Translation Key | Entity Class | Endpoint/Field | Device Class | Entity Category | Enabled by Default | Icon |
 |---|---|---|---|---|---|---|
@@ -61,7 +61,6 @@ below: `sensor.vendor_last_seen_pet`.
 | move_detection | KibbleSettingBinarySensor | GET /config → move_detection | — | DIAGNOSTIC | No | run |
 | pet_detection | KibbleSettingBinarySensor | GET /config → pet_detection | — | DIAGNOSTIC | No | cat |
 | eat_detection | KibbleSettingBinarySensor | GET /config → eat_detection | — | DIAGNOSTIC | No | silverware-fork-knife |
-| vomit_detection | KibbleSettingBinarySensor | GET /config → vomit_detection | — | DIAGNOSTIC | No | emoticon-sick |
 | feed_picture | KibbleSettingBinarySensor | GET /config → feed_picture | — | DIAGNOSTIC | No | camera-outline |
 | eat_video | KibbleSettingBinarySensor | GET /config → eat_video | — | DIAGNOSTIC | No | video-outline |
 | sound_enable | KibbleSettingBinarySensor | GET /config → sound_enable | — | DIAGNOSTIC | No | bullhorn-outline |
@@ -73,6 +72,12 @@ below: `sensor.vendor_last_seen_pet`.
 | manual_lock | KibbleSettingBinarySensor | GET /config → manual_lock | — | DIAGNOSTIC | No | lock-outline |
 | smart_frame | KibbleSettingBinarySensor | GET /config → smart_frame | — | DIAGNOSTIC | No | crop-free |
 | cat_present (dynamic) | KibbleCatPresentBinarySensor | GET /identify: cat==name & ts within 15m | — | — | Yes | cat |
+
+`vomit_detection` (binary_sensor, `GET /config → vomit_detection`) was implemented as a
+diagnostic readout, later promoted to a writable `switch.py` control plus a separate
+`vomit_detected`/`vomit_detected_at` diagnostic binary sensor, and removed entirely on
+2026-09-18: `librefeed-media`'s RSS measured 36.7 MB (6.9 MB `MemAvailable`) with the feature
+enabled vs. 26.5 MB (16.7 MB `MemAvailable`) disabled, on a 92 MB device.
 
 **Per-cat presence derivation (binary_sensor.py:163-177, 271):**
 - Created dynamically for each cat in GET /cats

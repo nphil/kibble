@@ -20,6 +20,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     EntityCategory,
+    Platform,
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
@@ -31,6 +32,7 @@ from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntr
 from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry, KibbleCoordinator, VendorSighting
 from .entity import KibbleEntity
+from .stacks import applies_to
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -152,22 +154,30 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
     entities: list[SensorEntity] = [KibbleSensor(coordinator, d) for d in SENSORS]
     entities.extend(KibbleSettingSensor(coordinator, d) for d in SETTING_SENSORS)
-    entities.append(KibbleScheduleSensor(coordinator))
-    entities.append(KibbleScheduleCardStateSensor(coordinator))
-    entities.append(KibbleNextFeedSensor(coordinator))
-    entities.append(KibbleCloudConnectionSensor(coordinator))
-    entities.append(KibbleControlPathSensor(coordinator))
-    entities.append(KibbleWifiNetworkSensor(coordinator))
-    entities.append(KibbleWifiSignalSensor(coordinator))
-    entities.append(KibbleLastSeenPetSensor(coordinator))
-    entities.append(KibbleIdentificationScoreSensor(coordinator))
-    entities.append(KibblePendingFacesSensor(coordinator))
-    entities.append(KibbleClipsSensor(coordinator))
-    entities.append(KibbleLastDetectionSensor(coordinator))
-    entities.append(KibbleDetectionsTodaySensor(coordinator))
-    entities.append(KibbleAgentStartsSensor(coordinator))
+    # One-off, non-description-driven sensors -- `(key, entity)` so every one of them still
+    # goes through `applies_to`, the same as the data-driven lists above, per `stacks.py`'s
+    # "no scattered `if stack == ...`" rule. Building each entity is cheap (no I/O), so nothing
+    # is lost constructing the handful that end up filtered out.
+    one_offs: list[tuple[str, SensorEntity]] = [
+        ("schedule", KibbleScheduleSensor(coordinator)),
+        ("schedule_card_state", KibbleScheduleCardStateSensor(coordinator)),
+        ("next_feed", KibbleNextFeedSensor(coordinator)),
+        ("cloud_connection", KibbleCloudConnectionSensor(coordinator)),
+        ("control_path", KibbleControlPathSensor(coordinator)),
+        ("wifi_network", KibbleWifiNetworkSensor(coordinator)),
+        ("wifi_signal", KibbleWifiSignalSensor(coordinator)),
+        ("last_seen_pet", KibbleLastSeenPetSensor(coordinator)),
+        ("identification_score", KibbleIdentificationScoreSensor(coordinator)),
+        ("pending_faces", KibblePendingFacesSensor(coordinator)),
+        ("clips", KibbleClipsSensor(coordinator)),
+        ("last_detection", KibbleLastDetectionSensor(coordinator)),
+        ("detections_today", KibbleDetectionsTodaySensor(coordinator)),
+        ("agent_starts", KibbleAgentStartsSensor(coordinator)),
+    ]
+    entities.extend(entity for key, entity in one_offs if applies_to(Platform.SENSOR, key, stack))
     async_add_entities(entities)
 
 
@@ -194,9 +204,12 @@ class KibbleSettingSensor(KibbleEntity, SensorEntity):
     """One read-only integer device setting, read from the feeder's shared config.
 
     Unavailable, rather than a bare `unknown`, when this setting's key is missing from
-    `GET /config` altogether -- LibreFeed serves only `light`/`night`/`microphone` there
-    today, so every other entry in `SETTING_SENSORS` names a vendor-only setting the agent
-    genuinely does not have an opinion on, not a value that happens to be unset. Mirrors
+    `GET /config` altogether -- an agent old enough to predate serving it. Today both stacks'
+    `/config` report every `SETTING_SENSORS` key here (`factor1`/`factor2`, the vendor's own
+    hopper calibration factors -- round-tripped by LibreFeed too, per its own
+    `docs/06-entity-audit.md`, "the key can round-trip, but the vendor's grams formula is
+    unrecovered"), so this specific check exists for agent-version gaps, not stack ones --
+    see `stacks.py` for entities that ARE gated by which stack is running. Mirrors
     `light.py`'s `KibbleStatusLight.available`/`select.py`'s `KibbleStackSelect.available`."""
 
     entity_description: SensorEntityDescription

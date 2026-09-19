@@ -29,17 +29,11 @@
       "reachable": {
         "name": "Feeder reachable"
       },
-      "vomit_detected": {
-        "name": "Vomit detected"
-      },
       "hopper_1_empty": {
         "name": "Hopper 1 empty"
       },
       "hopper_2_empty": {
         "name": "Hopper 2 empty"
-      },
-      "manual_lock": {
-        "name": "Child lock"
       },
       "cat_present": {
         "name": "{cat_name} present"
@@ -239,9 +233,6 @@
       },
       "microphone": {
         "name": "Microphone"
-      },
-      "vomit_detection": {
-        "name": "Vomit detection"
       },
       "pet_detection": {
         "name": "Pet detection"

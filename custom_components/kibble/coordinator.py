@@ -77,6 +77,20 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   several requests to the same, or different, endpoints concurrently. The one long-lived
   connection is the push socket, and it is deliberately on a *different port and thread* on
   the agent (`agent/src/push.rs`) so it can never hold the HTTP server's single connection slot.
+
+## Stack-gated entities and reload-on-change (stacks.py)
+
+Every platform's `async_setup_entry` calls `stacks.applies_to` before creating an entity, so
+the running feeder userland (vendor kibbled or LibreFeed -- `KibbleData.detected_stack`, see
+`_fetch_all`/`stacks.detect_stack`) only ever gets entities it can actually back, instead of
+the full ~80-entity superset sitting mostly `unavailable`. `_check_stack_change`, called from
+the successful branch of `_async_update_data` only, reloads the config entry the moment a poll
+confirms a *different* stack than the last one it confirmed, so `async_setup_entry` reruns
+against the new reading. A poll that merely fails (or that succeeds but leaves `detected_stack`
+`None` -- an inconclusive `GET /mode`) never reaches that comparison, and never overwrites the
+last confirmed stack either: the same tolerance-for-a-few-bad-cycles policy above already
+covers the feeder rebooting through a stack switch, so this never mistakes "unreachable" for
+"the other stack now".
 """
 
 from __future__ import annotations
@@ -137,6 +151,7 @@ from .const import (
     parse_vendor_pet_ids,
 )
 from .push import Frame, KibblePush, KibblePushClosed, KibblePushUnsupported, merge_frame
+from .stacks import Stack, detect_stack
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -245,6 +260,13 @@ class KibbleData:
     #: equivalent counter is cloud-set, not agent-served; see `button.py`'s
     #: `KibbleReplaceDesiccantButton.available`).
     desiccant: DesiccantState | None = None
+    #: The feeder userland this snapshot's `stack`/`state.raw` identify, or `None` if neither
+    #: signal does -- see `stacks.detect_stack`'s own doc for exactly how. Every platform's
+    #: `async_setup_entry` gates entity creation on this (via `stacks.applies_to`), and
+    #: `KibbleCoordinator._check_stack_change` compares it across polls to decide whether the
+    #: config entry needs reloading. Never touched by a push frame (`push.py`'s `_PARSERS` has
+    #: no `"stack"`/`"detected_stack"` entry), so it only ever changes on a fresh poll.
+    detected_stack: Stack | None = None
 
 
 def _rtsp_url(entry: KibbleConfigEntry) -> str:
@@ -363,6 +385,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         self.push_reconnects = 0
         self.push_last_frame: float | None = None
         self.push_unsupported = False
+        # `stacks.py`'s module docstring: the last stack a poll actually confirmed (never set
+        # from an undetermined `None` reading -- see `_check_stack_change`), so the entry can
+        # be reloaded exactly once when it genuinely changes, and never merely because one
+        # cycle's `GET /mode` happened to fail.
+        self._last_confirmed_stack: Stack | None = None
 
     @property
     def feeder_reachable(self) -> bool:
@@ -477,7 +504,45 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         except (KibbleError, TimeoutError) as err:
             return self._handle_poll_failure(err)
         self._handle_poll_success()
+        self._check_stack_change(data)
         return data
+
+    def _check_stack_change(self, data: KibbleData) -> None:
+        """Reloads the config entry the first time a poll confirms a DIFFERENT stack than the
+        last one it confirmed -- so every platform's `async_setup_entry` reruns and rebuilds
+        its entity set against `data.detected_stack` (`stacks.applies_to`).
+
+        `data.detected_stack is None` (this cycle's poll didn't identify a stack) is always a
+        no-op: it neither counts as a change nor overwrites `_last_confirmed_stack`, which is
+        exactly what keeps a feeder rebooting mid-switch from being read as "changed" -- while
+        it is unreachable, `_async_update_data`'s own failure path serves stale data and never
+        calls this method at all (see its own call site); once it *does* answer again, either
+        it reports the same stack as before (no-op below) or the new one (reload, below) --
+        there is no reachable state in between that could trigger a spurious reload.
+
+        The very first confirmation (`_last_confirmed_stack` still `None`, e.g. right after
+        `async_config_entry_first_refresh`) only records a baseline; "changed from nothing" is
+        not a change `async_setup_entry` needs to rerun for, since it already ran once against
+        this exact first reading.
+
+        Reloading is scheduled as a background task, never awaited here: `_async_update_data`
+        is a bound method *of* the coordinator a reload would tear down and replace -- awaiting
+        it inline would cancel this very call mid-flight. Mirrors `_push_loop`'s own
+        `hass.async_create_task(self.async_request_refresh())` fire-and-forget pattern.
+        """
+        new_stack = data.detected_stack
+        if new_stack is None:
+            return
+        if self._last_confirmed_stack is not None and self._last_confirmed_stack != new_stack:
+            _LOGGER.info(
+                "Feeder stack changed %s -> %s; reloading the config entry",
+                self._last_confirmed_stack,
+                new_stack,
+            )
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(self.entry.entry_id)
+            )
+        self._last_confirmed_stack = new_stack
 
     async def _fetch_all(self) -> KibbleData:
         """One full snapshot: every read this integration polls, back-to-back over the one
@@ -508,12 +573,17 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         events = tuple(await _optional(self.client.events(), ()))
         # A malformed option can't reach here: the options flow validates it before saving.
         pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
+        detected_stack = detect_stack(
+            mode_running=stack.running if stack is not None else None,
+            state_stack_field=state.raw.get("stack"),
+        )
         return KibbleData(
             state=state,
             schedule=schedule,
             config=config,
             cloud=cloud,
             stack=stack,
+            detected_stack=detected_stack,
             led=led,
             desiccant=desiccant,
             wifi=wifi,

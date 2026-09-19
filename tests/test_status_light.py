@@ -19,7 +19,7 @@ from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-from kibble.api import KibbleClient, KibbleNotFoundError
+from kibble.api import FeederState, KibbleClient, KibbleNotFoundError, StackState
 from kibble.coordinator import KibbleCoordinator
 from kibble.light import KibbleStatusLight, _quantize_rgb
 from kibble.switch import SWITCHES
@@ -205,14 +205,14 @@ def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
 
 
 async def test_get_led_404_leaves_led_none_while_the_rest_of_the_poll_still_updates() -> None:
-    state = object()
+    state = FeederState.from_json({})
     cloud = object()
     client = AsyncMock(
         state=AsyncMock(return_value=state),
         schedule=AsyncMock(return_value=object()),
         config=AsyncMock(return_value={}),
         cloud=AsyncMock(return_value=cloud),
-        mode=AsyncMock(return_value=object()),
+        mode=AsyncMock(return_value=StackState.from_json({"running": "vendor"})),
         led=AsyncMock(side_effect=KibbleNotFoundError("not found")),
         wifi=AsyncMock(return_value=object()),
         wifi_scan=AsyncMock(return_value=[]),

@@ -136,14 +136,6 @@ class FeederState:
     #: Falls back to a one-element tuple built from `last_key` for older LibreFeed builds that
     #: don't yet report `keys`; empty when the feeder has reported neither.
     keys: tuple[KeyEvent, ...]
-    #: `GET /state`'s `vomit_detected_at`: unix seconds of the last frame whose pose-history
-    #: window crossed the vendor behaviour classifier's own 0.9 threshold (see
-    #: `binary_sensor.py`'s `KibbleVomitDetectedBinarySensor`), `None` if never this boot.
-    #: LibreFeed-only -- absent entirely (not merely `null`) from a `GET /state` body old
-    #: enough to predate this field, which is what that entity's `available` distinguishes by
-    #: checking `raw` directly, the same way `event.py`'s `KibbleButtonEvent.available` does
-    #: for `keys`/`last_key`.
-    vomit_detected_at: int | None
     raw: dict[str, Any]
 
     @classmethod
@@ -157,7 +149,6 @@ class FeederState:
         # into the other via `or`.
         last_start = data.get("kibbled_last_start_unix")
         exit_code = data.get("kibbled_last_exit_code")
-        vomit_detected_at = data.get("vomit_detected_at")
         return cls(
             serial=str(data.get("serial", "")),
             firmware=str(data.get("firmware", "")),
@@ -188,9 +179,6 @@ class FeederState:
                 tuple(KeyEvent.from_json(k) for k in raw_keys)
                 if (raw_keys := data.get("keys")) is not None
                 else (KeyEvent.from_json(last_key),) if last_key else ()
-            ),
-            vomit_detected_at=(
-                int(vomit_detected_at) if isinstance(vomit_detected_at, (int, float)) else None
             ),
             raw=data,
         )

@@ -1,6 +1,6 @@
 """Switches for the feeder's writable boolean settings.
 
-`night`, `microphone`, `vomit_detection` were the original writable set (the same keys the
+`night`, `microphone` were the original writable set (the same keys the
 vendor's own `agent/src/settings.rs` also marked writable) -- `light` was too, but it is gone
 from here now: it drove the exact same physical LED as `light.py`'s `KibbleStatusLight`
 through a strict subset of what that entity already does (plain on/off, via `POST /config`,
@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -38,6 +38,7 @@ from .api import KibbleError
 from .coordinator import KibbleConfigEntry
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -54,12 +55,6 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
     SwitchEntityDescription(
         key="microphone",
         translation_key="microphone",
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-    ),
-    SwitchEntityDescription(
-        key="vomit_detection",
-        translation_key="vomit_detection",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
     ),
@@ -168,8 +163,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    entities: list[SwitchEntity] = [KibbleSettingSwitch(coordinator, d) for d in SWITCHES]
-    entities.append(KibbleCloudSwitch(coordinator))
+    stack = coordinator.data.detected_stack
+    entities: list[SwitchEntity] = [
+        KibbleSettingSwitch(coordinator, d) for d in SWITCHES if applies_to(Platform.SWITCH, d.key, stack)
+    ]
+    if applies_to(Platform.SWITCH, "cloud", stack):
+        entities.append(KibbleCloudSwitch(coordinator))
     async_add_entities(entities)
 
 
@@ -178,7 +177,7 @@ class KibbleSettingSwitch(KibbleEntity, SwitchEntity):
     config through the agent's `/config` endpoint.
 
     Unavailable, rather than a bare `unknown`, when this setting's key is missing from `GET
-    /config` altogether -- e.g. `vomit_detection` on a daemon old enough to predate serving
+    /config` altogether -- e.g. `pet_detection` on a daemon old enough to predate serving
     it. Mirrors `light.py`'s `KibbleStatusLight.available`/`select.py`'s
     `KibbleStackSelect.available`/`binary_sensor.py`'s
     `KibbleSettingBinarySensor.available`."""

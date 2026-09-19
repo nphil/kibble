@@ -14,11 +14,13 @@ never by position, so a reboot (at_ms restarts) or the ring wrapping cannot repl
 from __future__ import annotations
 
 from homeassistant.components.event import EventDeviceClass, EventEntity
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
+from .stacks import applies_to
 
 # Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -51,12 +53,16 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
+    stack = coordinator.data.detected_stack
+    candidates = [
+        ("button_pairing", _NODE_PAIRING),
+        ("button_1", _NODE_BUTTON_1),
+        ("button_2", _NODE_BUTTON_2),
+    ]
     async_add_entities(
-        [
-            KibbleButtonEvent(coordinator, "button_pairing", _NODE_PAIRING),
-            KibbleButtonEvent(coordinator, "button_1", _NODE_BUTTON_1),
-            KibbleButtonEvent(coordinator, "button_2", _NODE_BUTTON_2),
-        ]
+        KibbleButtonEvent(coordinator, key, node)
+        for key, node in candidates
+        if applies_to(Platform.EVENT, key, stack)
     )
 
 

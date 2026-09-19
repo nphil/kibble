@@ -14,7 +14,7 @@ import colorsys
 from typing import Any
 
 from homeassistant.components.light import ATTR_EFFECT, ATTR_RGB_COLOR, ColorMode, LightEntity, LightEntityFeature
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -22,6 +22,7 @@ from .api import KibbleError
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -92,7 +93,8 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities([KibbleStatusLight(coordinator)])
+    if applies_to(Platform.LIGHT, "status_light", coordinator.data.detected_stack):
+        async_add_entities([KibbleStatusLight(coordinator)])
 
 
 class KibbleStatusLight(KibbleEntity, LightEntity):

@@ -11,7 +11,7 @@ from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-from kibble.api import KibbleClient, KibbleConnectionError, StackState
+from kibble.api import FeederState, KibbleClient, KibbleConnectionError, StackState
 from kibble.coordinator import KibbleCoordinator
 from kibble.select import KibbleStackSelect
 
@@ -116,7 +116,7 @@ def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
 async def test_get_mode_failure_leaves_stack_none_while_the_rest_of_the_poll_still_updates() -> (
     None
 ):
-    state = object()
+    state = FeederState.from_json({})
     cloud = object()
     client = AsyncMock(
         state=AsyncMock(return_value=state),

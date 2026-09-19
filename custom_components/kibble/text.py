@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.text import TextEntity, TextEntityDescription, TextMode
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -35,6 +35,7 @@ from .api import KibbleError
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
+from .stacks import applies_to
 
 # Writes are coordinator-mediated and serialised by api.py's own lock; see coordinator.py's
 # module docstring and the parallel-updates quality-scale rule.
@@ -130,7 +131,10 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    async_add_entities(KibbleHourRangeText(coordinator, d) for d in HOUR_RANGES)
+    stack = coordinator.data.detected_stack
+    async_add_entities(
+        KibbleHourRangeText(coordinator, d) for d in HOUR_RANGES if applies_to(Platform.TEXT, d.key, stack)
+    )
 
 
 class KibbleHourRangeText(KibbleEntity, TextEntity):
