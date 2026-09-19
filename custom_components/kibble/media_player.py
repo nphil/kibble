@@ -28,7 +28,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    BrowseMedia,
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
@@ -70,6 +72,7 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
         MediaPlayerEntityFeature.VOLUME_SET
         | MediaPlayerEntityFeature.PLAY_MEDIA
         | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
+        | MediaPlayerEntityFeature.BROWSE_MEDIA
     )
 
     def __init__(self, coordinator: KibbleCoordinator) -> None:
@@ -94,6 +97,29 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
             await self.coordinator.async_set_config("volume", device_volume)
         except KibbleError as err:
             raise_agent_action_failed("Set volume", err)
+
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """The "pick a media file" tree in HA's own UI.
+
+        Added 2026-09-19: this entity could already PLAY anything HA could resolve -- a
+        media-source URI, a URL, whatever `tts.speak` hands it -- but without `BROWSE_MEDIA`
+        the UI offered no way to choose a file, so the only way to use it was an automation
+        with a URI typed by hand. A second media_player for the same physical speaker (the
+        Scrypted ONVIF-backchannel one) existed purely because it did offer the picker.
+
+        Filtered to audio: everything else on the tree is unplayable here (one mono 16 kHz
+        speaker), and offering a video file the device can only fail on is not a browser, it
+        is a trap.
+        """
+        return await media_source.async_browse_media(
+            self.hass,
+            media_content_id,
+            content_filter=lambda item: item.media_content_type.startswith("audio/"),
+        )
 
     async def async_play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
