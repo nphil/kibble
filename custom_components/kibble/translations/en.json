@@ -281,6 +281,9 @@
       },
       "detection_overlay": {
         "name": "Detection overlay"
+      },
+      "detection_overlay_ignored": {
+        "name": "Overlay ignored detections"
       }
     },
     "select": {

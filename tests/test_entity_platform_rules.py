@@ -154,6 +154,10 @@ _ENABLED_BY_DEFAULT_EXCEPTIONS = {
         "the feed, not a diagnostic knob; documented in switch.py's SWITCHES comment for "
         "detection_overlay"
     ),
+    "switch.detection_overlay_ignored": (
+        "same reasoning as detection_overlay above -- it narrows what that overlay draws "
+        "while the user is watching it, so it has to be reachable next to it"
+    ),
 }
 
 

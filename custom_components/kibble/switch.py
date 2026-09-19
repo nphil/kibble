@@ -171,6 +171,18 @@ SWITCHES: tuple[SwitchEntityDescription, ...] = (
         translation_key="detection_overlay",
         entity_category=EntityCategory.CONFIG,
     ),
+    # `detection_overlay_ignored`: whether that overlay ALSO draws the detections the feeder's
+    # clutter memory threw away (`admitted: false`). Enabled-by-default like its parent, for the
+    # same reason -- but the setting itself defaults OFF on the daemon: the rejected boxes are
+    # what make "the feeder is ignoring the cat" visible instead of indistinguishable from an
+    # empty room, and a busy room emits several of them on every frame forever, so they belong
+    # behind a switch rather than on a dashboard someone lives with. Turning the parent
+    # `detection_overlay` off hides everything regardless; this one only narrows what is drawn.
+    SwitchEntityDescription(
+        key="detection_overlay_ignored",
+        translation_key="detection_overlay_ignored",
+        entity_category=EntityCategory.CONFIG,
+    ),
 )
 
 

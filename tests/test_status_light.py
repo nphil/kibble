@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock
 
 from kibble.api import FeederState, KibbleClient, KibbleNotFoundError, StackState
 from kibble.coordinator import KibbleCoordinator
-from kibble.light import KibbleStatusLight, _quantize_rgb
+from kibble.light import _EFFECT_LIST, KibbleStatusLight
 from kibble.switch import SWITCHES
 
 HOST = "192.168.4.85"
@@ -75,102 +75,81 @@ def _led(white: str | int, green: int) -> SimpleNamespace:
     return SimpleNamespace(white=white, green=green, camera="auto")
 
 
-# --- (1) GET /led parsed -> is_on/effect/rgb_color correct for every white/green combination ---
+# --- (1) GET /led parsed -> is_on/effect correct for every white/green combination ------------
 
 
-async def test_get_led_parsed_reflects_is_on_effect_and_rgb_for_white_only() -> None:
+async def test_get_led_parsed_reflects_is_on_and_effect_for_white_only() -> None:
     session = _RecordingSession(200, {"white": "auto", "green": 0})
     led = await KibbleClient(session, HOST, PORT).led()
     ent = _fake_light(led=led)
     assert ent.is_on is True
     assert ent.effect == "auto"
-    assert ent.rgb_color == (255, 255, 255)
 
 
-async def test_get_led_parsed_reflects_is_on_effect_and_rgb_for_green_only() -> None:
+async def test_get_led_parsed_reflects_is_on_and_effect_for_green_only() -> None:
     session = _RecordingSession(200, {"white": 0, "green": 1})
     led = await KibbleClient(session, HOST, PORT).led()
     ent = _fake_light(led=led)
     assert ent.is_on is True
-    # 0 is a forced-off value, not one of the three forced-on effects -- no effect applies.
-    assert ent.effect is None
-    assert ent.rgb_color == (0, 255, 0)
+    # A lit green channel with the white one dark: its own effect, not a blank. Reported as
+    # `None` until 2026-09-19, which left the LED visibly on with no state to show for it.
+    assert ent.effect == "green"
 
 
-async def test_get_led_parsed_reflects_is_on_and_rgb_for_both_channels_lit() -> None:
+async def test_get_led_parsed_reports_a_combined_effect_when_both_channels_are_lit() -> None:
     session = _RecordingSession(200, {"white": 1, "green": 1})
     led = await KibbleClient(session, HOST, PORT).led()
     ent = _fake_light(led=led)
     assert ent.is_on is True
-    assert ent.effect == "on"
-    assert ent.rgb_color == (170, 255, 170)
+    assert ent.effect == "green + white"
 
 
-def test_rgb_color_and_effect_are_none_when_both_channels_are_off() -> None:
+def test_effect_is_none_only_when_both_channels_are_off() -> None:
     ent = _fake_light(led=_led(0, 0))
     assert ent.is_on is False
-    assert ent.rgb_color is None
     assert ent.effect is None
 
 
-# --- (2) _quantize_rgb: every requested colour -> the nearest achievable channel pair ----------
+def test_every_reachable_hardware_state_has_exactly_one_effect() -> None:
+    """The point of the effect list replacing the colour wheel: it must be TOTAL over what the
+    hardware can do, so no real LED state renders as a blank, and it must offer nothing the
+    hardware cannot do. Nine lit combinations: four white modes x green off/on, minus
+    (white off, green off) which is simply "off", plus green alone."""
+    reachable = {
+        _fake_light(led=_led(white, green)).effect
+        for white in ("auto", 1, 2, 3, 0)
+        for green in (0, 1)
+    } - {None}
+    assert reachable == set(_EFFECT_LIST)
+    assert len(_EFFECT_LIST) == 9
 
 
-def test_quantize_rgb_white_bucket_for_low_saturation_colours() -> None:
-    assert _quantize_rgb((255, 255, 255)) == (1, 0)
-    assert _quantize_rgb((240, 245, 240)) == (1, 0)
+# --- (3) turn_on(effect=...) POSTs the exact {"white", "green"} pair that effect names --------
 
 
-def test_quantize_rgb_green_bucket_for_a_strongly_saturated_green() -> None:
-    assert _quantize_rgb((0, 255, 0)) == (0, 1)
-
-
-def test_quantize_rgb_both_bucket_for_unachievable_hues_and_washed_out_green() -> None:
-    assert _quantize_rgb((255, 0, 0)) == (1, 1)  # red: no channel for it at all
-    assert _quantize_rgb((0, 0, 255)) == (1, 1)  # blue: same
-    assert _quantize_rgb((200, 255, 200)) == (1, 1)  # pale green: too washed out to call green-ish
-
-
-# --- (3) turn_on(effect=...) POSTs {"white": ...} only; green is never touched by an effect ----
-
-
-async def test_turn_on_with_effect_posts_forced_white_only() -> None:
-    session = _RecordingSession(200, {"white": 2, "green": 0})
-    client = KibbleClient(session, HOST, PORT)
-    coordinator = SimpleNamespace(
-        client=client, data=SimpleNamespace(led=_led(0, 0), config={}), async_request_refresh=AsyncMock()
-    )
-    coordinator.async_set_led = MethodType(KibbleCoordinator.async_set_led, coordinator)
-    ent = _fake_light(led=_led(0, 0))
-    ent.coordinator = coordinator
-
-    await ent.async_turn_on(effect="blink")
-
-    assert session.calls == [("POST", f"http://{HOST}:{PORT}/led", {"white": 2})]
-
-
-# --- (4) turn_on(rgb_color=...) quantises and POSTs the exact {"white", "green"} pair ----------
-
-
-async def test_turn_on_with_rgb_color_posts_the_exact_quantised_pair_for_each_bucket() -> None:
+async def test_turn_on_with_an_effect_posts_both_channels() -> None:
+    """An effect names the whole hardware state, so it must write both channels. Writing only
+    `white` (the behaviour until 2026-09-19) meant picking "white blink" while green happened
+    to be lit left the LED in a state no effect in the list described."""
     cases = [
-        ((255, 255, 255), {"white": 1, "green": 0}),
-        ((0, 255, 0), {"white": 0, "green": 1}),
-        ((255, 0, 0), {"white": 1, "green": 1}),
+        ("white blink", {"white": 2, "green": 0}),
+        ("green", {"white": 0, "green": 1}),
+        ("green + white fast blink", {"white": 3, "green": 1}),
+        ("auto", {"white": "auto", "green": 0}),
     ]
-    for rgb, expected_payload in cases:
+    for effect, expected_payload in cases:
         session = _RecordingSession(200, {"white": 0, "green": 0})
         client = KibbleClient(session, HOST, PORT)
         coordinator = SimpleNamespace(
-            client=client, data=SimpleNamespace(led=_led(0, 0), config={}), async_request_refresh=AsyncMock()
+            client=client, data=SimpleNamespace(led=_led(1, 1), config={}), async_request_refresh=AsyncMock()
         )
         coordinator.async_set_led = MethodType(KibbleCoordinator.async_set_led, coordinator)
-        ent = _fake_light(led=_led(0, 0))
+        ent = _fake_light(led=_led(1, 1))
         ent.coordinator = coordinator
 
-        await ent.async_turn_on(rgb_color=rgb)
+        await ent.async_turn_on(effect=effect)
 
-        assert session.calls == [("POST", f"http://{HOST}:{PORT}/led", expected_payload)]
+        assert session.calls == [("POST", f"http://{HOST}:{PORT}/led", expected_payload)], effect
 
 
 # --- (5) turn_off POSTs both channels off, so a lit green does not survive a turn_off ----------
@@ -250,7 +229,6 @@ def test_config_fallback_reflects_is_on_and_offers_no_colour_or_effects_when_led
     assert on_ent.is_on is True
     assert on_ent.effect is None
     assert on_ent.effect_list is None
-    assert on_ent.rgb_color is None
     assert on_ent.supported_features == LightEntityFeature(0)
     assert on_ent.supported_color_modes == {ColorMode.ONOFF}
     assert on_ent.color_mode == ColorMode.ONOFF
@@ -259,15 +237,21 @@ def test_config_fallback_reflects_is_on_and_offers_no_colour_or_effects_when_led
     assert off_ent.is_on is False
 
 
-def test_led_route_still_offers_colour_and_effects_when_led_is_present() -> None:
+def test_led_route_offers_effects_but_never_a_colour_picker() -> None:
+    """Nitin, 2026-09-19: the entity advertised `ColorMode.RGB`, so HA drew a full colour wheel
+    for an LED with exactly two channels -- an interface inviting an action the device cannot
+    take. On/off plus the real combinations, on both stacks, forever."""
     from homeassistant.components.light import ColorMode, LightEntityFeature
 
     ent = _fake_light(led=_led("auto", 0), config={"light": 0})
     assert ent._using_led is True
-    assert ent.effect_list == ["auto", "on", "blink", "fast"]
+    assert ent.effect_list == ["auto", "white", "white blink", "white fast blink", "green",
+                               "green + auto", "green + white", "green + white blink",
+                               "green + white fast blink"]
     assert ent.supported_features == LightEntityFeature.EFFECT
-    assert ent.supported_color_modes == {ColorMode.RGB}
-    assert ent.color_mode == ColorMode.RGB
+    assert ent.supported_color_modes == {ColorMode.ONOFF}
+    assert ent.color_mode == ColorMode.ONOFF
+    assert not hasattr(ent, "rgb_color") or ent.rgb_color is None
 
 
 # --- (8) turn_on/turn_off write POST /config {"key": "light", ...} when /led is absent ---------
@@ -310,6 +294,6 @@ def test_no_switch_description_still_carries_the_old_light_key() -> None:
     """`switch.py`'s `SWITCHES` used to have a `light` entry driving this exact physical LED
     through `POST /config` alone -- a strict subset of what this entity already does over
     `/led`. It is removed for good: `KibbleStatusLight`'s own fallback (tests 7-9 above) is
-    the only surface for the vendor-stack case now, and its RGB colour picker (tests 2-4) is
-    the only surface for the green channel -- no `switch.<feeder>_green_led` either."""
+    the only surface for the vendor-stack case now, and its effect list (tests 1-3) is the
+    only surface for the green channel -- no `switch.<feeder>_green_led` either."""
     assert "light" not in {d.key for d in SWITCHES}
