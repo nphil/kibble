@@ -54,9 +54,20 @@ def _event(
     cat: str | None = None,
     image: str | None = None,
     score: float | None = None,
+    image_before: str | None = None,
+    image_after: str | None = None,
 ) -> DetectionEvent:
     return DetectionEvent(
-        seq=seq, ts=ts, cls=cls, image=image, cat=cat, score=score, pet_id=pet_id, total_score=None
+        seq=seq,
+        ts=ts,
+        cls=cls,
+        image=image,
+        cat=cat,
+        score=score,
+        pet_id=pet_id,
+        total_score=None,
+        image_before=image_before,
+        image_after=image_after,
     )
 
 
@@ -617,3 +628,27 @@ async def test_ws_vision_last_maps_an_old_daemons_404_to_a_null_frame_not_an_err
     await ws_vision_last.__wrapped__(hass, connection, {"id": 20, "entry_id": "e1"})
     connection.send_result.assert_called_once_with(20, {"frame": None})
     connection.send_error.assert_not_called()
+
+
+def test_an_eat_row_carries_the_dish_photos_taken_around_the_meal() -> None:
+    """LibreFeed photographs the dish when a meal starts and when it ends, so the card can
+    show how much actually went. Kitty's 01:51 meal on 2026-09-20 was recorded with both
+    photos on disk and served by the daemon, and the card showed neither: `DetectionEvent`
+    had no field for them, so they were dropped at the parse step and never reached a row."""
+    named = _event(1, 100, "eat", cat="Kitty", image="face.jpg", image_before="b.jpg", image_after="a.jpg")
+    bare = _event(2, 200, "eat", image="crop.jpg", image_before="b2.jpg", image_after="a2.jpg")
+    rows = timeline_items((named, bare), (), {})
+    by_ts = {row["ts"]: row for row in rows}
+    assert (by_ts[100]["image_before"], by_ts[100]["image_after"]) == ("b.jpg", "a.jpg")
+    assert (by_ts[200]["image_before"], by_ts[200]["image_after"]) == ("b2.jpg", "a2.jpg")
+
+
+def test_a_row_with_no_meal_to_compare_grows_no_photo_keys() -> None:
+    """A visit has no meal, and a vendor-stack agent never sends these at all. Emitting empty
+    keys anyway would make "the pair was not captured" indistinguishable from "this kind of
+    row never has one", which is the distinction the card's compare view keys off."""
+    visit = _event(1, 100, "visit", cat="Kitty", image="face.jpg")
+    eat_without = _event(2, 200, "eat", cat="Kitty", image="face2.jpg")
+    rows = {row["ts"]: row for row in timeline_items((visit, eat_without), (), {}, include_visits=True)}
+    assert "image_before" not in rows[100] and "image_after" not in rows[100]
+    assert "image_before" not in rows[200] and "image_after" not in rows[200]

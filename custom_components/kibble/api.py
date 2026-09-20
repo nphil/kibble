@@ -555,6 +555,14 @@ class DetectionEvent:
     score: float | None
     pet_id: str | None
     total_score: float | None
+    #: LibreFeed attaches a dish photo from the start and the end of an `eat`, so the card can
+    #: show how much of the bowl actually went. The vendor stack never produced these, which is
+    #: why they were missing here: the daemon sent them on every eat row and this parser
+    #: dropped them, so a meal was recorded (2026-09-20 01:51, Kitty) with both photos on disk
+    #: and nothing to show. Optional, because a `track`/`face` row has no pair and an eat whose
+    #: pair was never captured sends `null`.
+    image_before: str | None = None
+    image_after: str | None = None
 
     @classmethod
     def from_json(cls_, data: dict[str, Any]) -> DetectionEvent:
@@ -569,6 +577,8 @@ class DetectionEvent:
             score=float(score) if score is not None else None,
             pet_id=str(data["pet_id"]) if data.get("pet_id") is not None else None,
             total_score=float(total_score) if total_score is not None else None,
+            image_before=data.get("image_before") or None,
+            image_after=data.get("image_after") or None,
         )
 
 

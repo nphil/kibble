@@ -146,6 +146,18 @@ def _labelled_face_item(event: DetectionEvent) -> dict[str, Any]:
     }
 
 
+def _eat_compare_pair(event: DetectionEvent) -> dict[str, Any]:
+    """The dish photos LibreFeed takes at the start and end of an `eat`, as the card's
+    `comparePairFor` expects them. Only ever attached to an `eat`: a `visit` has no meal to
+    compare, and adding empty keys to every row would make "no pair captured" and "not the
+    kind of row that has one" indistinguishable. Omitted entirely when neither side exists,
+    so a vendor-stack row can never grow a key its agent never sent."""
+    if event.cls != "eat":
+        return {}
+    pair = {k: v for k, v in (("image_before", event.image_before), ("image_after", event.image_after)) if v}
+    return pair
+
+
 def _direct_identified_item(event: DetectionEvent) -> dict[str, Any]:
     """A `visit`/`eat` row that already carries its own `cat` -- LibreFeed's own onboard
     identification (`ai::Feed`), which has no separate `track` event to pair against at all.
@@ -165,6 +177,7 @@ def _direct_identified_item(event: DetectionEvent) -> dict[str, Any]:
     }
     if event.score is not None:
         item["score"] = event.score
+    item.update(_eat_compare_pair(event))
     return item
 
 
@@ -172,7 +185,7 @@ def _bare_detection_item(event: DetectionEvent, kind: str) -> dict[str, Any]:
     """A `visit`/`eat` row no `track` claimed as its pairing image (see `timeline_items`).
     `image` is the bare `GET /events/<name>` filename, for the HTTP image view's `kind="event"`
     -- unchanged from every class's image reference before this row shape split by kind."""
-    return {"kind": kind, "ts": event.ts, "image": event.image}
+    return {"kind": kind, "ts": event.ts, "image": event.image, **_eat_compare_pair(event)}
 
 
 def _feed_item(record: FeedRecord) -> dict[str, Any]:
