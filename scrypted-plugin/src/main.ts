@@ -37,6 +37,39 @@ const DEFAULTS: Record<string, string> = {
 };
 
 const SETTING_DEFS: Setting[] = [
+    {
+        key: 'feederHost',
+        title: 'Feeder host',
+        description: 'LAN IP of the Kibble agent (kibbled) running on the feeder itself.',
+        type: 'string',
+    },
+    {
+        key: 'feederHttpPort',
+        title: 'Feeder HTTP port',
+        type: 'number',
+    },
+    {
+        key: 'feederRtspPort',
+        title: 'Feeder RTSP port',
+        type: 'number',
+    },
+    {
+        key: 'feederRtspPath',
+        title: 'Feeder RTSP mount',
+        description: 'Mount ("sub" or "main") used when this plugin needs its own RTSP session. '
+            + 'Two-way audio -- which is what used to open that session -- now lives in '
+            + '@nphil/camera-intercom, so nothing here opens one today; the setting stays '
+            + 'because FeederConfig still carries it and the agent\'s mounts are per-install.',
+        type: 'string',
+        choices: ['sub', 'main'],
+    },
+    {
+        key: 'secondPassEnabled',
+        title: 'Second-pass detection',
+        description: 'Re-check on-device "face" detections against an installed ONNX/OpenVINO '
+            + 'ObjectDetection plugin for a real, off-device class + confidence score.',
+        type: 'boolean',
+    },
 ];
 
 class KibbleFeederPlugin extends ScryptedDeviceBase implements MixinProvider, Settings {
