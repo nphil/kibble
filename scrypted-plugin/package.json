@@ -30,7 +30,8 @@
       "type": "API",
       "interfaces": [
          "MixinProvider",
-         "Settings"
+         "Settings",
+         "HttpRequestHandler"
       ]
    },
    "dependencies": {

@@ -1,5 +1,8 @@
-// Polls the agent's real detection feed (`GET /events` -- `agent/src/ai.rs`) and hands each new
-// `RawDetection` to a callback.
+// Polls the agent's real detection feed (`GET /events` -- `agent/src/ai.rs`) and hands the
+// current track snapshot, plus which of those tracks are new/changed since the last poll, to a
+// callback every poll cycle -- not just when something changed, since an already-open track
+// whose evidence hasn't refreshed this cycle can still need re-reporting (see `mixin.ts`'s
+// `handleEating`).
 //
 // Deliberately short-polls the plain, immediate `GET /events` snapshot on a gap, rather than
 // holding the agent's own `GET /events/stream?since=N` long-poll (a ~25s server-side hold) open
@@ -38,7 +41,7 @@ export class KibbleDetectionFeed {
     constructor(
         private host: string,
         private port: number,
-        private onDetections: (detections: RawDetection[]) => void,
+        private onSnapshot: (snapshot: RawDetection[], fresh: RawDetection[]) => void,
         private console: Console,
     ) { }
 
@@ -85,11 +88,9 @@ export class KibbleDetectionFeed {
                 if (this.stopped)
                     return;
                 const fresh = snapshot.filter(d => d.seq > this.since);
-                if (fresh.length === 0)
-                    continue;
                 for (const d of fresh)
                     this.since = Math.max(this.since, d.seq);
-                this.onDetections(fresh);
+                this.onSnapshot(snapshot, fresh);
             } catch (e) {
                 if (this.stopped)
                     return;

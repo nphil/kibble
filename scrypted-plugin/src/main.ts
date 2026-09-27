@@ -1,5 +1,9 @@
 // Plugin entry point: a MixinProvider that attaches ObjectDetector to the feeder camera (see
-// mixin.ts), plus the plugin-wide Settings (feeder host/ports, second-pass toggle).
+// mixin.ts), plus the plugin-wide Settings (feeder host/ports, second-pass toggle, and a "Record
+// test clip" button that reaches the live mixin instance via `CameraRegistry`/`RegisteredCamera`
+// -- see `types.ts`'s doc comment on why that button lives here and not on the mixin itself),
+// plus a public, read-only HTTP endpoint (`clips`) HA polls for the feeder camera's Events
+// Recorder clips -- see `onRequest` and `kibble/docs/39-eating-clips.md`.
 //
 // Two-way audio moved out of this plugin to `camera-intercom`, whose `onvif-backchannel` driver
 // speaks the same backchannel this used to implement here, for every camera in the system. Only
@@ -19,14 +23,15 @@
 // for), so avoiding it entirely is the cleanest fix.
 
 import type {
-    Camera, MixinProvider, ScryptedDeviceType,
-    Setting, Settings, SettingValue, VideoCamera, WritableDeviceState,
+    Camera, HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, ScryptedDeviceType,
+    Setting, Settings, SettingValue, VideoCamera, VideoClips, WritableDeviceState,
 } from '@scrypted/sdk';
 import { ScryptedDeviceBase, ScryptedInterface } from '@scrypted/sdk';
-import { KibbleFeederMixin } from './mixin';
-import './sdkFix';
-import { FeederConfig } from './types';
+import { KibbleFeederMixin, TEST_CLIP_DURATION_MS } from './mixin';
+import { sdk } from './sdkFix';
+import { CameraRegistry, FeederConfig, RegisteredCamera } from './types';
 
+const { systemManager } = sdk;
 
 const DEFAULTS: Record<string, string> = {
     feederHost: '192.168.1.85', // moved networks once already -- this is why it's a setting, not a constant
@@ -35,6 +40,8 @@ const DEFAULTS: Record<string, string> = {
     feederRtspPath: 'sub',
     secondPassEnabled: 'true',
 };
+
+const RECORD_TEST_CLIP_KEY = 'recordTestClip';
 
 const SETTING_DEFS: Setting[] = [
     {
@@ -70,14 +77,45 @@ const SETTING_DEFS: Setting[] = [
             + 'ObjectDetection plugin for a real, off-device class + confidence score.',
         type: 'boolean',
     },
+    {
+        key: RECORD_TEST_CLIP_KEY,
+        title: 'Record test clip',
+        description: `Emits synthetic "cat eating" detections for the attached feeder camera (a real bounding box, no cat physically required) for about ${TEST_CLIP_DURATION_MS / 1000}s, so the Events Recorder trigger -> clip pipeline can be verified end to end.`,
+        type: 'button',
+    },
 ];
 
-class KibbleFeederPlugin extends ScryptedDeviceBase implements MixinProvider, Settings {
+class KibbleFeederPlugin extends ScryptedDeviceBase implements MixinProvider, Settings, HttpRequestHandler, CameraRegistry {
+    /** Live feeder camera mixin instances, keyed by camera id, self-registered by
+     * `KibbleFeederMixin` (its constructor/`release()`) since `getMixin`/`releaseMixin` here
+     * don't hand this plugin the underlying camera's own `id` directly (`mixinDevice` is typed
+     * narrowly as `VideoCamera & Camera`). The `clips` webhook and "Record test clip" button both
+     * use this to reach "the" feeder camera without hardcoding a device id that can differ across
+     * Scrypted installs -- see `types.ts`'s `CameraRegistry` doc comment. */
+    private cameras = new Map<string, RegisteredCamera>();
+
+    registerCamera(id: string, camera: RegisteredCamera): void {
+        this.cameras.set(id, camera);
+    }
+
+    unregisterCamera(id: string): void {
+        this.cameras.delete(id);
+    }
+
     async getSettings(): Promise<Setting[]> {
         return SETTING_DEFS.map(def => ({ ...def, value: this.storage.getItem(def.key!) ?? DEFAULTS[def.key!] }));
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key === RECORD_TEST_CLIP_KEY) {
+            const cameras = [...this.cameras.values()];
+            if (cameras.length !== 1) {
+                this.console.error(`kibble: "Record test clip" expected exactly one attached feeder camera, found ${cameras.length}`);
+                return;
+            }
+            await cameras[0].recordTestClip().catch(e => this.console.error('kibble: recordTestClip failed:', e));
+            return;
+        }
         if (value === null || value === undefined)
             this.storage.removeItem(key);
         else
@@ -96,11 +134,66 @@ class KibbleFeederPlugin extends ScryptedDeviceBase implements MixinProvider, Se
         return new KibbleFeederMixin(
             { mixinDevice, mixinDeviceInterfaces, mixinDeviceState, mixinProviderNativeId: this.nativeId },
             () => this.getConfig(),
+            this,
         );
     }
 
     async releaseMixin(id: string, mixinDevice: KibbleFeederMixin): Promise<void> {
         mixinDevice.release();
+    }
+
+    /** `GET clips?start=<ms>&end=<ms>` (public, read-only): clips for the feeder camera that
+     * overlap `[start, end]`, sourced from its own `VideoClips` interface --
+     * `@apocaliss92/scrypted-events-recorder`'s mixin further down device 240's mixin chain
+     * implements it; calling it on the composite device routes through that mixin exactly the
+     * way any other interface call does. See `kibble/docs/39-eating-clips.md`. Reachable
+     * locally and unauthenticated at
+     * `http://<scrypted-host>:11080/endpoint/@nphil/kibble-scrypted/public/clips` (port and
+     * path form confirmed live against this exact instance, 2026-09-25). */
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        const url = new URL(`http://localhost${request.url}`);
+        const route = url.pathname.split('/').filter(Boolean).pop();
+
+        if (route !== 'clips') {
+            response.send(`kibble: not found: ${url.pathname}`, { code: 404 });
+            return;
+        }
+
+        try {
+            const cameraIds = [...this.cameras.keys()];
+            if (cameraIds.length !== 1) {
+                this.console.error(`kibble: clips endpoint expected exactly one camera with the Kibble mixin attached, found ${cameraIds.length}: ${JSON.stringify(cameraIds)}`);
+                response.send(
+                    `kibble: expected exactly one feeder camera attached, found ${cameraIds.length}`,
+                    { code: 500 },
+                );
+                return;
+            }
+
+            const startParam = url.searchParams.get('start');
+            const endParam = url.searchParams.get('end');
+            const startTime = startParam === null ? undefined : Number(startParam);
+            const endTime = endParam === null ? undefined : Number(endParam);
+            if ((startTime !== undefined && !Number.isFinite(startTime)) || (endTime !== undefined && !Number.isFinite(endTime))) {
+                response.send('kibble: start/end must be milliseconds since epoch', { code: 400 });
+                return;
+            }
+
+            const camera = systemManager.getDeviceById<VideoClips>(cameraIds[0]);
+            const clips = await camera.getVideoClips({ startTime, endTime });
+            const body = clips.map(clip => ({
+                videoId: clip.videoId,
+                startTime: clip.startTime,
+                endTime: clip.startTime + (clip.duration ?? 0),
+                duration: clip.duration ?? 0,
+                detectionClasses: clip.detectionClasses ?? [],
+            }));
+
+            response.send(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+        } catch (e) {
+            this.console.error('kibble: clips endpoint failed:', e);
+            response.send(`kibble: ${(e as Error).message}`, { code: 500 });
+        }
     }
 
     private getConfig(): FeederConfig {

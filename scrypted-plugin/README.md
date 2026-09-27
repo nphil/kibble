@@ -1,21 +1,28 @@
 # Kibble Feeder — Scrypted plugin
 
-A Scrypted `MixinProvider` for the Kibble feeder camera (device "Plant Room Feeder Camera",
-RTSP Camera Plugin). Adds two capabilities on top of that camera:
+A Scrypted `MixinProvider` for the Kibble feeder camera (device 240, "Plant Room Cat Feeder").
+Adds:
 
 - **`ObjectDetector`** — relays the agent's (`kibbled`) real on-device detection feed
   (short-polls `GET /events` on a gap; see "The starvation incident" below for why it does not use
-  the agent's `GET /events/stream` long-poll) as Scrypted `ObjectsDetected` events, plus an
-  optional off-device re-check through this Scrypted instance's own ONNX/OpenVINO detector.
-- **`Intercom`** — a direct, transient RTSP connection to the agent's ONVIF-style backchannel
-  (`agent/src/rtsp.rs`/`backchannel.rs`), independent of Scrypted's Rebroadcast plugin (which only
-  ever *reads* from the feeder).
+  the agent's `GET /events/stream` long-poll) as Scrypted `ObjectsDetected` events: a one-shot,
+  boxless augmentation per fresh track for NVR smart search, plus a continuous, real-box
+  className: 'cat' trigger emitted every poll
+  while a track is open and eating (`handleEating`) — the only thing meant to drive
+  `@apocaliss92/scrypted-events-recorder`'s own mixin into recording a clip. See
+  `kibble/docs/39-eating-clips.md` for the full design and `## Eating clips` below for what's
+  proven live.
+- **`Settings`** (plugin-level, not per-mixin — see `types.ts`'s `CameraRegistry` doc comment for
+  why) — feeder host/ports, the second-pass toggle, and a "Record test clip" button that exercises
+  the eating-trigger pipeline without a real cat.
+- **`HttpRequestHandler`** — a public, read-only `clips` webhook HA polls for the feeder camera's
+  Events Recorder clips (`main.ts`'s `onRequest`).
 
 > **Note on the feeder's address:** the feeder has moved networks at least once during this
 > project (`192.168.4.85` → `192.168.1.85`). The host is a plugin Setting, not a hardcoded
 > constant, for exactly this reason — update it there, not in code, if it moves again. Evidence
-> captured earlier in this README against `192.168.4.85` predates the move; the default now
-> points at the current address.
+> captured earlier in this README against `192.168.4.85`/device 238 predates both the move and a
+> device re-add; the default now points at the current address, and the live camera is device 240.
 
 ## The starvation incident (read this before touching the poll design)
 
@@ -126,45 +133,86 @@ already used by other consumers.
 
 ## What's real vs. honestly incomplete in `ObjectsDetected`
 
-Per the agent's own module doc (`agent/src/ai.rs`): `class` and the cropped `image` are genuine
-vendor JPEG side effects; `score`, `pet_id`, and `box` are **honestly always `null`** — that data
-exists only inside a private vendor message queue (`ctrl`'s own `/msg_dispatch_1`, fully documented
-in `docs/24-onboard-ai.md`) that Kibble deliberately does not tap (a POSIX mqueue has exactly one
-reader; a second reader would steal `ctrl`'s own messages).
+The feeder's GET /events returns track records. Each kept sample's box and score are live detector
+results; body/face are flat asset names, each null when that crop was not retained. Identity is no
+longer in the feeder API; Home Assistant owns cat naming.
 
-This plugin mirrors that honesty instead of inventing numbers:
-- The on-device `ObjectDetectionResult` never sets `boundingBox` (optional field, simply omitted)
-  and never sets `score` (the SDK's own type marks `score: number` *required*; this plugin builds
-  the object without it and casts once, at that single boundary, with a comment explaining why —
-  see `mixin.ts`'s `HonestDetectionResult`. No `0`, `1`, or `NaN` placeholder is ever emitted).
-- `label`/`labelScore` on that same entry come from `GET /identify` — Kibble's **own** real,
-  first-party nearest-centroid cat-name classifier (`docs/27-cat-id.md`), not the vendor's.
+This plugin's one-shot detection mirrors the track class and does not invent missing box, score, or
+identity fields. The eating trigger uses the latest real sample's box and score, with 0.9 only when
+the daemon provides no score.
 
-**A real gap this plugin found, worked around, and flagged instead of papering over — now
-resolved upstream.** `agent/src/main.rs`'s route table originally had no endpoint serving
-`EVENTS_DIR`'s files, so `Detection.image` was a bare filename with no way to fetch it for any
-class; the first version of this plugin worked around that with a same-tick, face-class-only
-heuristic (`GET /faces/current`, a different directory, no guaranteed 1:1 mapping) and flagged the
-gap in an "Agent-side TODO" section. **`GET /events/<file>` now exists** (verified live by `Main`
-against the real device: a real 99,831-byte JPEG fetched by name, path traversal rejected —
-`../settings.json` → 400, `..%2Fsettings.json` → 404, `/etc/passwd` → 400 — unknown names → 404).
-This plugin now fetches every class's crop directly by name (`mixin.ts`'s `tryFetchCrop`) instead
-of the old face-only workaround; `visit`/`eat` detections get a real crop (and therefore a real
-second-pass re-check) for the first time. Events with `image: null` still honestly get no crop.
+**Event media path:** the feeder serves assets by flat name at GET /events/<name>. Home Assistant's
+ingest archives them under media/<YYYY-MM-DD>/<asset>, then acknowledges them with DELETE
+/events/<asset>. That date directory is the HA archive layout, not part of the feeder URL. An event
+row can still name an asset already removed from the feeder's transient spool. The plugin
+URL-encodes the flat name; 404 means no image is available, and other HTTP/network failures remain
+visible.
 
-## Second pass: did both, for different reasons
+## Second pass: off-device detection
 
-The assignment asks: use Scrypted's own ONNX/OpenVINO plugin if it can be invoked as a service from
-a mixin; otherwise fall back to the on-device result plus Kibble's own cat name. **It can — verified
-live** (`ObjectDetection.detectObjects(mediaObject)` on "ONNX Object Detection", ~35ms, real
-bounding boxes/scores on a real feeder-camera JPEG). So the plugin does the real off-device
-re-check (`secondPass.ts`) *and* always attaches Kibble's own cat name via `/identify` when
-available — the two answer different questions (WHAT vs. WHO) and neither substitutes for the
-other. Auto-discovery skips the NVR's own per-camera detection mixins (designed for their own video
-pipeline, not standalone crops) and matches on `/onnx|openvino/i`, so this also works on an
-OpenVINO-based instance without code changes. Toggle: Settings → "Second-pass detection".
+The plugin can invoke Scrypted's ONNX/OpenVINO detector as a service from the mixin (verified live
+with ObjectDetection.detectObjects on ONNX Object Detection, about 35 ms). It runs this re-check
+only when an event crop is available. Auto-discovery skips the NVR's own per-camera detection
+mixins and matches on /onnx|openvino/i, so it also works with an OpenVINO-based instance. Toggle:
+Settings → Second-pass detection.
 
-## Intercom: working, wideband
+## Eating clips: Events Recorder trigger, verified live end to end
+
+Design: `kibble/docs/39-eating-clips.md`. The wire schema this depends on (`GET /events` reports
+TRACKS with `samples[]`, not one-shot detections — `event_id` stable, `seq` bumping every admitted
+frame while open) was re-verified live against the real feeder 2026-09-25, since it had drifted
+from this file's original (dead) `RawDetection` shape; see `types.ts`'s header comment.
+
+**The trigger.** `handleEating` (`mixin.ts`) watches every poll's full snapshot (not just the
+`seq`-fresh subset `handleOne` uses) for a track that is `open` and either `class === 'eat'` or
+already has `eat_start` set. While one exists, it emits one `ObjectDetector` event per poll:
+`className: 'cat'`, a real `boundingBox` (the latest sample's fractional `box`, converted to pixel
+space via `fractionalBoxToPixels`), `score` (the sample's own, or `0.9` when absent), and a
+detectionId stable for that track's whole life (`kibble-eat-<event_id>` — `event_id`, not `seq`,
+because `seq` itself keeps changing while the track is open). Configured on device 240's Events
+Recorder mixin: `detectionClasses: ['animal']` only (no `motion`), `ignoreCameraDetections: true`,
+`prolongClipOnMotion: false`, `maxLength: 900`, `postEventSeconds: 15`, `minDelayBetweenClips: 1`.
+
+**Nothing else may trigger it.** Scrypted NVR Object Detection's per-camera `allowList` on 240 is
+narrowed off (`["package"]` — an empty list is silently rejected by that plugin, confirmed live;
+`package` is a harmless placeholder that can never fire at a feeder). `ignoreCameraDetections:
+true` also blocks the ONVIF plugin's own native `Detection` events, which never carry a
+`boundingBox` (`@scrypted/onvif`'s `onvif-events.ts`) — verified by reading that plugin's own
+source, not assumed. Within this plugin, `trySecondPass`'s general-purpose off-device re-check
+(runs on every one-shot detection with a crop, not just eating) strips any Animal-mapped className
+before returning — real, low-confidence `'animal'`-classed hits from it were confirmed live in
+`/NVR/clips/240/events/*/events.json` before this filter existed, which would otherwise have made
+this mixin its own second, uncontrolled trigger source on ordinary bowl *visits*.
+
+**Verified live, 2026-09-25**, via the "Record test clip" Settings button (Kibble Feeder plugin,
+not the camera's own Settings — see `types.ts`'s `CameraRegistry` doc comment for why): pressing
+it emits the same shape of synthetic eating detection every 5s for 30s. Result: Events Recorder
+logged `Starting new recording: {"classTriggers":["animal"]}` at the press instant, then
+`Videoclip stored /NVR/clips/240/videoclips/1790329844804_1790329894817_1001000000.mp4` ~50s
+later (5s pre-roll + 30s test + ~15s post-roll, matching the configured settings). `ffprobe`:
+valid `h264`/1920x1080/25fps + `aac`, 53.76s, 3.79 Mbps. The `clips` webhook listed it
+(`{"videoId":"...804_...817_1001000000","startTime":1790329844804,"endTime":1790329894817,
+"duration":50013,"detectionClasses":["animal","motion"]}`); a `Range: bytes=0-2097151` GET against
+the recorder's own `videoclip` webhook for that `videoId` returned `206 Partial Content` with a
+matching `Content-Range`.
+
+**Also observed live in the same window, unprompted:** real cat "visit" tracks (event_ids
+1433-1438, `class: "visit"`, `eat_start: null`) produced no clip at all — direct evidence, not
+just synthetic-test evidence, that a walk-by no longer records.
+
+**Missing images:** feeder assets disappear from its transient spool after Home Assistant archives
+them. If the feeder returns 404, the plugin supplies no detection image instead of throwing; the
+detection and clip trigger still run. Other HTTP/network failures remain visible.
+
+## Intercom: MOVED to `@nphil/camera-intercom` — historical record below, not current behavior
+
+Everything in this section describes an earlier build. Two-way audio no longer lives in this
+plugin at all — see this file's top summary and `mixin.ts`'s own header comment. Kept verbatim
+for the historical negotiation transcript (still a real, useful reference for the ONVIF
+backchannel protocol itself), not because any of `startIntercom`/`stopIntercom`/`rtspBackchannel.ts`
+still exists here.
+
+### Historical: "Intercom: working, wideband" (original section, verbatim)
 
 The feeder serves video to exactly one persistent consumer (Scrypted's Rebroadcast). Scrypted's
 rebroadcast path is receive-only, so talkback opens its **own** short-lived RTSP session straight to
