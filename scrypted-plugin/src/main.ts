@@ -98,8 +98,9 @@ class KibbleFeederPlugin extends ScryptedDeviceBase implements MixinProvider, Se
         this.cameras.set(id, camera);
     }
 
-    unregisterCamera(id: string): void {
-        this.cameras.delete(id);
+    unregisterCamera(id: string, camera: RegisteredCamera): void {
+        if (this.cameras.get(id) === camera)
+            this.cameras.delete(id);
     }
 
     async getSettings(): Promise<Setting[]> {

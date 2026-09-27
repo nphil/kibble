@@ -96,5 +96,10 @@ export interface RegisteredCamera {
  * instead, and reaches the live mixin instance through this registry. */
 export interface CameraRegistry {
     registerCamera(id: string, camera: RegisteredCamera): void;
-    unregisterCamera(id: string): void;
+    /** Removes `camera` only if it is still the instance registered under `id`. Scrypted
+     * rebuilds a camera's mixin chain whenever any of that camera's settings change, and it
+     * constructs the replacement mixin BEFORE releasing the old one -- an id-only delete from
+     * the old instance's `release()` would wipe out the replacement's registration and leave
+     * the registry empty until the next plugin restart. */
+    unregisterCamera(id: string, camera: RegisteredCamera): void;
 }

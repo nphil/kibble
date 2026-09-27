@@ -141,7 +141,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         this.feed.stop();
         if (this.testClipTimer)
             clearTimeout(this.testClipTimer);
-        this.registry.unregisterCamera(this.id);
+        this.registry.unregisterCamera(this.id, this);
         super.release();
     }
 
