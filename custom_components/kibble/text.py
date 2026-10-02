@@ -27,11 +27,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.text import TextEntity, TextEntityDescription, TextMode
-from homeassistant.const import EntityCategory, Platform
+from homeassistant.const import EntityCategory, Platform, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .api import KibbleError
+from .const import MAX_HOPPER_FOOD_LENGTH
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .errors import raise_agent_action_failed
@@ -125,6 +127,34 @@ HOUR_RANGES: tuple[KibbleHourRangeTextDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KibbleHopperFoodTextDescription(TextEntityDescription):
+    """A local food-name label for one hopper -- meaningful only with the divider fitted (see
+    `KibbleHopperFoodText`)."""
+
+    hopper: int
+
+
+# Local-only, never written to the feeder (docs/37-hopper-full.md) -- both stacks apply (no
+# `ENTITY_STACKS` row for either key, so `applies_to` below defaults them to `_BOTH`).
+HOPPER_FOODS: tuple[KibbleHopperFoodTextDescription, ...] = (
+    KibbleHopperFoodTextDescription(
+        key="hopper_1_food",
+        translation_key="hopper_1_food",
+        hopper=1,
+        native_max=MAX_HOPPER_FOOD_LENGTH,
+        mode=TextMode.TEXT,
+    ),
+    KibbleHopperFoodTextDescription(
+        key="hopper_2_food",
+        translation_key="hopper_2_food",
+        hopper=2,
+        native_max=MAX_HOPPER_FOOD_LENGTH,
+        mode=TextMode.TEXT,
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
@@ -132,9 +162,13 @@ async def async_setup_entry(
 ) -> None:
     coordinator = entry.runtime_data
     stack = coordinator.data.detected_stack
-    async_add_entities(
+    entities: list[TextEntity] = [
         KibbleHourRangeText(coordinator, d) for d in HOUR_RANGES if applies_to(Platform.TEXT, d.key, stack)
+    ]
+    entities.extend(
+        KibbleHopperFoodText(coordinator, d) for d in HOPPER_FOODS if applies_to(Platform.TEXT, d.key, stack)
     )
+    async_add_entities(entities)
 
 
 class KibbleHourRangeText(KibbleEntity, TextEntity):
@@ -216,3 +250,42 @@ class KibbleHourRangeText(KibbleEntity, TextEntity):
             raise_agent_action_failed(f"Set {self.entity_description.key}", err)
         finally:
             await self.coordinator.async_request_refresh()
+
+
+class KibbleHopperFoodText(KibbleEntity, TextEntity, RestoreEntity):
+    """What is loaded in one hopper, as the user typed it -- local only, never sent to the
+    feeder, and meaningful only with the divider fitted: two compartments can hold different
+    foods, one shared bin cannot (docs/37-hopper-full.md). Restored across restarts and pushed
+    onto the coordinator (`KibbleCoordinator.async_set_hopper_food`) the moment it is known --
+    mirrors `switch.py`'s `KibbleHopperDividerSwitch` pushing `single_hopper` the same way --
+    so ingest can freeze it onto a feed row the instant that row is first recorded.
+
+    An empty string means unnamed and is always a valid value; there is no requirement to name
+    either hopper."""
+
+    entity_description: KibbleHopperFoodTextDescription
+
+    def __init__(self, coordinator, description: KibbleHopperFoodTextDescription) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+        self._value = ""
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._value = last.state[: self.entity_description.native_max]
+        self.coordinator.async_set_hopper_food(self.entity_description.hopper, self._value)
+
+    @property
+    def native_value(self) -> str:
+        return self._value
+
+    async def async_set_value(self, value: str) -> None:
+        self._value = value
+        self.coordinator.async_set_hopper_food(self.entity_description.hopper, value)
+        self.async_write_ha_state()

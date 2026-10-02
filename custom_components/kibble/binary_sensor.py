@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -15,12 +13,9 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util, slugify
 
-from .api import IdentifyResult
-from .const import DEFAULT_SCAN_INTERVAL
-from .coordinator import KibbleConfigEntry, KibbleCoordinator, Sighting
+from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .stacks import applies_to
 
@@ -28,20 +23,6 @@ from .stacks import applies_to
 # module docstring and the parallel-updates quality-scale rule.
 PARALLEL_UPDATES = 0
 
-# How long a cat stays "present" after its last identification. An implementation choice, not
-# a device-measured value -- see docs/27-cat-id.md's honesty section. Two independent sources
-# feed it: Kibble's own classifier (`GET /identify`, every enrolled cat) and the vendor's
-# on-device identifier (`track` detections, only for cats mapped through the `vendor_pet_ids`
-# option). Both are discrete, event-driven identifications, not a dwell time, so each latches
-# for this window.
-#
-# Sized to the delivery path, not to taste: a sighting reaches HA up to one poll late
-# (`DEFAULT_SCAN_INTERVAL`, 45 s), so a window shorter than one poll could expire before it is
-# ever displayed, and one exactly one poll long is visible for a single refresh at best. Two
-# polls plus slack is the smallest window that guarantees the entity turns on and stays on
-# across at least one full refresh. The check itself is a timestamp comparison at read time --
-# no polling, no timers, no load -- so nothing is saved by going lower.
-PRESENCE_WINDOW = timedelta(seconds=DEFAULT_SCAN_INTERVAL * 2 + 30)
 
 # `light`, `night`, `microphone`, `pet_detection`, `move_detection`,
 # `eat_detection`, `feed_picture`, `eat_video`, `food_warn`, `time_display`, `camera`,
@@ -76,34 +57,6 @@ HOPPER_EMPTY_SENSORS: tuple[KibbleHopperEmptyDescription, ...] = (
 )
 
 
-def is_present(
-    cat_name: str,
-    sightings: Sequence[Sighting],
-    now: datetime,
-) -> bool:
-    """Whether `cat_name` was identified as a visitor recently enough to still call it
-    present. A free function (not a method) so it's directly unit-testable with no entity or
-    coordinator involved."""
-    return any(
-        s.cat == cat_name and now - dt_util.utc_from_timestamp(s.ts) < PRESENCE_WINDOW
-        for s in sightings
-    )
-
-
-def last_seen(cat_name: str, sightings: Sequence[Sighting]) -> datetime | None:
-    """When `cat_name` was most recently identified as a visitor, or None if never this run.
-    The same input `is_present` latches on, so the two can never disagree.
-
-    `GET /identify` used to be a second input here and was removed on 2026-09-19: its subject
-    is the newest *pending crop* -- i.e. whatever a human last labelled -- so it answered a
-    question about the review queue while the tile above it said "Last here". On a feeder
-    whose classifier was switched off it was the ONLY input, which is how a cat last seen days
-    ago showed a confident recent timestamp while the cat standing at the bowl showed "Not
-    seen yet". A sighting is the only thing that may move this."""
-    candidates = [s.ts for s in sightings if s.cat == cat_name]
-    if not candidates:
-        return None
-    return dt_util.utc_from_timestamp(max(candidates))
 
 
 class KibbleBowlEmptySensor(KibbleEntity, BinarySensorEntity):
@@ -166,13 +119,13 @@ async def async_setup_entry(
     if not applies_to(Platform.BINARY_SENSOR, "cat_present", stack):
         return
 
-    # Per-cat presence entities are created dynamically from `GET /cats` -- there is no fixed
-    # list at integration setup, since cats are enrolled over time by labelling crops.
+    # Per-cat presence entities are created dynamically from the identity engine's roster --
+    # there is no fixed list at integration setup, since cats are enrolled over time.
     known_cats: set[str] = set()
 
     @callback
     def _add_new_cats() -> None:
-        new = [cat.name for cat in coordinator.data.cats if cat.name not in known_cats]
+        new = [name for name in coordinator.data.identity.cats if name not in known_cats]
         if not new:
             return
         known_cats.update(new)
@@ -283,54 +236,45 @@ class KibbleHopperEmptySensor(KibbleEntity, BinarySensorEntity):
         return self.coordinator.data.state.hopper_empty[self.entity_description.index]
 
 
-class KibbleCatPresentBinarySensor(KibbleEntity, RestoreEntity, BinarySensorEntity):
-    """Whether this specific cat was the most recently identified visitor, recently enough to
-    still call it present -- see [`is_present`]/[`PRESENCE_WINDOW`]. Created dynamically as
-    `GET /cats` reports new cats (`async_setup_entry` above).
+class KibbleCatPresentBinarySensor(KibbleEntity, BinarySensorEntity):
+    """Whether this specific cat is the subject of a currently open visit or eat track.
 
-    The `last_seen` attribute is what the dashboard's cat tiles show ("Last here 2 hours
-    ago"). Sightings live only in the agent's in-memory event journal, so after an agent
-    restart there is nothing to derive it from until the next visit; the last value is
-    restored across that gap via `RestoreEntity` and any newer live sighting wins over it."""
+    A live query (`store.identity_summary`'s `CatStats.present`), not a time-decay window:
+    the device tells HA exactly when a track opens and closes (docs/36-ai-pipeline.md), so
+    presence needs no latching heuristic of its own, and nothing needs restoring across an HA
+    restart either -- the store itself is the durable record. Created dynamically as the
+    identity engine's cat roster grows (`async_setup_entry` above).
+
+    `last_seen`/`last_ate` are ISO timestamps: any visit or eat, and specifically the newest
+    eat, this cat was identified in."""
 
     _attr_translation_key = "cat_present"
 
     def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
         super().__init__(coordinator, f"cat_present_{slugify(cat_name)}")
         self._cat_name = cat_name
-        # Display-only capitalisation. The agent stores a cat's name verbatim (it is also the
-        # directory name under /opt/kibble/faces), so a lowercase name produced a lowercase
-        # friendly name -- "Cat Feeder pending present" -- which reads as a typo next to every
-        # other sentence-case entity. Matching on `self._cat_name` stays exact; only the label
-        # changes, and an already-capitalised or multi-word name is left alone.
+        # Display-only capitalisation -- the store keeps a cat's name exactly as entered, so a
+        # lowercase name would otherwise read as a typo next to every other sentence-case
+        # entity. Matching on `self._cat_name` stays exact; only the label changes.
         display = cat_name[:1].upper() + cat_name[1:] if cat_name else cat_name
         self._attr_translation_placeholders = {"cat_name": display}
-        self._restored_last_seen: datetime | None = None
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        if self._live_last_seen() is not None:
-            return
-        last_state = await self.async_get_last_state()
-        if last_state is None:
-            return
-        restored = last_state.attributes.get("last_seen")
-        if isinstance(restored, str):
-            self._restored_last_seen = dt_util.parse_datetime(restored)
-
-    def _live_last_seen(self) -> datetime | None:
-        data = self.coordinator.data
-        return last_seen(self._cat_name, data.sightings)
 
     @property
     def is_on(self) -> bool:
-        data = self.coordinator.data
-        return is_present(self._cat_name, data.sightings, dt_util.utcnow())
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        return stats.present if stats is not None else False
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        live = self._live_last_seen()
-        seen = live
-        if seen is None or (self._restored_last_seen is not None and self._restored_last_seen > seen):
-            seen = self._restored_last_seen
-        return {"last_seen": seen.isoformat() if seen is not None else None}
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        last_seen = (
+            dt_util.utc_from_timestamp(stats.last_seen).isoformat()
+            if stats is not None and stats.last_seen is not None
+            else None
+        )
+        last_ate = (
+            dt_util.utc_from_timestamp(stats.last_meal).isoformat()
+            if stats is not None and stats.last_meal is not None
+            else None
+        )
+        return {"last_seen": last_seen, "last_ate": last_ate}

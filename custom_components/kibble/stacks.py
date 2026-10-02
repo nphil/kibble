@@ -45,10 +45,10 @@ stack entirely, caught by `test_stack_applicability.py`'s full-platform sweep).
 
 A `(platform, key)` with no entry defaults to `_BOTH` -- both because that is the correct answer
 for most of this integration's ~80 entities (telemetry, feed controls, Wi-Fi, the cloud switch,
-Kibble's own face-ID pipeline -- all implemented in kibbled itself and confirmed reachable "on
-either stack", `websocket.py`'s `timeline_items`), and because it is the SAFE failure mode for a
-future entity whose author forgets to add a row here: it simply appears on both stacks, exactly
-like every entity did before this module existed, rather than silently vanishing from one.
+the AI pipeline's own `/events`/`/feeds` reads -- both implemented in kibbled itself and
+confirmed reachable "on either stack"), and because it is the SAFE failure mode for a future
+entity whose author forgets to add a row here: it simply appears on both stacks, exactly like
+every entity did before this module existed, rather than silently vanishing from one.
 """
 
 from __future__ import annotations
@@ -118,9 +118,8 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     (Platform.NUMBER, "surplus_standard"): _LIBREFEED_ONLY,  # also LibreFeed's own definition -- const.py
     (Platform.NUMBER, "eating_hold"): _LIBREFEED_ONLY,  # backed by `eat_sensitivity`, writable: false on vendor
     # --- select.py -------------------------------------------------------------------------
-    # `wifi` (its own `/wifi/scan` route), `label_face` (kibbled's own `agent/src/faces.rs`,
-    # confirmed "on either stack" by `websocket.py`'s `timeline_items` doc), and `stack` itself
-    # (bridges both by design) are correctly absent -- both.
+    # `wifi` (its own `/wifi/scan` route) and `stack` itself (bridges both by design) are
+    # correctly absent -- both.
     (Platform.SELECT, "camera_indicator"): _LIBREFEED_ONLY,  # `/led`'s `camera` field -- vendor has no `/led`
     (Platform.SELECT, "selected_sound"): _LIBREFEED_ONLY,  # `/config` key, writable: false on vendor
     (Platform.SELECT, "surplus_control"): _LIBREFEED_ONLY,  # `/config` key, writable: false on vendor
@@ -135,13 +134,23 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     # virtual "cat_present" key below) are all both.
     # Virtual key: gates the whole dynamically-created-per-cat listener in `binary_sensor.py`
     # (there is no single fixed `key` for these entities -- see that module's `async_setup_entry`).
-    # `GET /cats` is kibbled's own `agent/src/faces.rs` `Gallery`; both -- listed for the reader,
-    # not because omitting it (default `_BOTH`) would behave any differently.
+    # The identity engine itself (`store.py`, `identity.py`) is HA-side and stack-agnostic;
+    # listed for the reader, not because omitting it (default `_BOTH`) would behave any
+    # differently.
     (Platform.BINARY_SENSOR, "cat_present"): _BOTH,
     # --- button.py ---------------------------------------------------------------------------
     # `feed`/`feed_hopper_1`/`feed_hopper_2`/`cancel_feed` are both (`POST /feed(/cancel)`).
     (Platform.BUTTON, "beep"): _LIBREFEED_ONLY,  # `POST /beep` -- absent from kibbled's own route table
     (Platform.BUTTON, "replace_desiccant"): _LIBREFEED_ONLY,  # `POST /desiccant` -- same, absent from kibbled
+    # `POST /hopper/full` (docs/37-hopper-full.md) -- LibreFeed-only, same footing as `/beep`/
+    # `/desiccant` above: absent from kibbled's own route table (`api.py`'s `mark_hopper_full`
+    # docstring), so a vendor-stack press would 404 rather than do anything.
+    (Platform.BUTTON, "hopper_1_full"): _LIBREFEED_ONLY,
+    (Platform.BUTTON, "hopper_2_full"): _LIBREFEED_ONLY,
+    (Platform.BUTTON, "hopper_full"): _LIBREFEED_ONLY,
+    # `POST /cue` ("call the cats") -- LibreFeed-only, same footing as `/beep` above: absent
+    # from kibbled's own route table, so a vendor-stack press would 404 rather than do anything.
+    (Platform.BUTTON, "call_cats"): _LIBREFEED_ONLY,
     # --- event.py ----------------------------------------------------------------------------
     # `GET /state`'s `keys`/`last_key` ring: api.py's `FeederState` docs both fields
     # LibreFeed-only outright (not merely "an old agent lacks them").
@@ -149,16 +158,21 @@ ENTITY_STACKS: dict[tuple[Platform, str], frozenset[Stack]] = {
     (Platform.EVENT, "button_1"): _LIBREFEED_ONLY,
     (Platform.EVENT, "button_2"): _LIBREFEED_ONLY,
     # image.py, light.py, media_player.py, camera.py, sensor.py: every entity there is `_BOTH`
-    # (dish snapshots and the pending/last-detection crops are kibbled's own
-    # `agent/src/feed_capture.rs`/`ai.rs`/`faces.rs`, confirmed serving both raw-H.264 and
-    # ready-made-JPEG shapes from the SAME `GET /feeds`/`GET /events` routes; the status light
-    # already branches on `/led` vs. `config["light"]` internally instead of needing a
-    # creation-time gate; the speaker's `POST /speak`/`POST /clips` routes exist on kibbled too
-    # -- the current audible-silence gap is a separate, actively-being-fixed device bug, not a
-    # missing route), so none of them need a row here.
+    # (dish snapshots are kibbled's own `agent/src/feed_capture.rs`, confirmed serving both
+    # raw-H.264 and ready-made-JPEG shapes from `GET /feeds`; the status light already branches
+    # on `/led` vs. `config["light"]` internally instead of needing a creation-time gate; the
+    # speaker's `POST /speak`/`POST /clips` routes exist on kibbled too -- the current audible-
+    # silence gap is a separate, actively-being-fixed device bug, not a missing route), so none
+    # of them need a row here.
     #
     # sensor.py's exceptions:
     (Platform.SENSOR, "agent_starts"): _LIBREFEED_ONLY,  # `kibbled_start_count` -- kibbled's own restart counter
+    # `hopper_full_at`/`hopper_portions_since_full`/`hopper_full_to_low` (docs/37-hopper-full.md)
+    # are LibreFeed-only `GET /state` fields (`api.py`'s `FeederState` docstring) -- on vendor
+    # these stay permanently null, so the sensor would just be permanently unknown rather than
+    # meaningfully unavailable; gate it like every other LibreFeed-only reading above.
+    (Platform.SENSOR, "hopper_1_remaining"): _LIBREFEED_ONLY,
+    (Platform.SENSOR, "hopper_2_remaining"): _LIBREFEED_ONLY,
     # `GET /calibration` (`calibration.rs`) is a LibreFeed-only route, same footing as `/led`/
     # `/desiccant` above -- kibbled has no bowl-fill calibration concept at all.
     (Platform.SENSOR, "bowl_fill_calibration_hopper_1"): _LIBREFEED_ONLY,

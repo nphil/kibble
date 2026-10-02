@@ -16,10 +16,10 @@ Assistant core instance or a real ffmpeg binary:
 - `api.KibbleClient.speak`: a 409 from the agent raises the distinct `KibbleSpeakerBusyError`,
   not a generic `KibbleError` -- the one thing `media_player.py`/`__init__.py`'s clip services
   need to tell "speaker busy" from "the agent rejected the request" and give a clear message.
-- `api.KibbleClient.label_face`/`unlabel_face`: a 404 names a specific crop that is no longer
-  pending/labelled (a race, an eviction, a stale UI reference) -- `KibbleNotFoundError` with the
-  agent's own message, not the default "not supported by this agent version" `KibbleError` that
-  used to make it read like the agent lacked the route entirely.
+- `image.KibbleLastDetectionImage._apply`/`async_image`: the identity-engine-driven contract
+  (`store.DeviceIdentitySummary.last_detection_thumb`) that replaced the old per-`DetectionEvent`
+  crop-picking logic -- unchanged thumb id must not reset the cached image, a changed one must,
+  and the entity reads its bytes straight off the store rather than an external URL.
 
 `coordinator.py`/`image.py`/`media_player.py` import real `homeassistant` components (`ffmpeg`,
 `media_player`, `media_source`), unlike the BLE-only modules the rest of this test suite
@@ -35,7 +35,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from homeassistant.util import dt as dt_util
-from kibble.api import DetectionEvent, FeedRecord, KibbleClient, KibbleNotFoundError, KibbleSpeakerBusyError
+from kibble.api import FeedRecord, KibbleClient, KibbleSpeakerBusyError
 from kibble.const import DOMAIN
 from kibble.coordinator import (
     KibbleCoordinator,
@@ -44,6 +44,7 @@ from kibble.coordinator import (
     _resolve_media_to_pcm,
 )
 from kibble.image import KibbleLastDetectionImage, _h264_to_jpeg_args, _latest_dish_snapshot
+from kibble.store import DeviceIdentitySummary
 
 
 # --- coordinator._pcm_convert_args -------------------------------------------------------------
@@ -90,31 +91,100 @@ def test_latest_dish_snapshot_empty_feeds_is_none_for_both_sides() -> None:
     assert _latest_dish_snapshot((), "after") == (None, None)
 
 
+def test_latest_dish_snapshot_does_not_trust_the_agents_ordering() -> None:
+    """This picked `feeds[-1]` because the vendor agent returns oldest-first. LibreFeed
+    returns newest-first, so from 2026-09-17 both dish entities sat on the OLDEST record on
+    the device -- a chime test from the 18th -- through every real feed since. The card's
+    timeline also watches these entities to know when to refetch, so a feed's photos never
+    appeared until the page was reloaded by hand."""
+    newest = _record(300, "newest", "300-before.jpg", "300-after.jpg")
+    oldest = _record(100, "oldest", "100-before.jpg", "100-after.jpg")
+    for order in ((newest, _record(200, "mid", None, None), oldest), (oldest, _record(200, "mid", None, None), newest)):
+        assert _latest_dish_snapshot(order, "before")[0] == "300-before.jpg"
+        assert _latest_dish_snapshot(order, "after")[0] == "300-after.jpg"
+
+
 # --- image.KibbleLastDetectionImage._apply ---------------------------------------------------
 
 
-def _detection(seq: int, ts: int, cls: str, image: str | None) -> DetectionEvent:
-    return DetectionEvent(
-        seq=seq, ts=ts, cls=cls, image=image, cat=None, score=None, pet_id=None, total_score=None
+def test_last_detection_image_apply_is_a_noop_when_the_thumb_id_is_unchanged() -> None:
+    """Re-applying the same thumb id (a coordinator update carrying no new identified event)
+    must not reset the cached image or bump the last-updated timestamp -- either would make
+    Home Assistant treat an unchanged picture as freshly updated."""
+    fake = SimpleNamespace(
+        _asset_id="2026-09-24/e1-s1-body.jpg", _cached_image="sentinel", _attr_image_last_updated=None
+    )
+    identity = DeviceIdentitySummary(
+        last_seen_pet="Kitty", last_seen_pet_ts=100,
+        last_detection_thumb={"id": "2026-09-24/e1-s1-body.jpg", "url": "/x"},
     )
 
+    KibbleLastDetectionImage._apply(fake, identity)
 
-def test_last_detection_image_keeps_the_newest_crop_when_a_track_event_is_newer() -> None:
-    """A `track` event (the vendor's identification) has no crop. It must not blank the image
-    entity -- the regression that made `image.*_last_detection` read unknown the moment the
-    first identification landed after the newest visit crop."""
-    fake = SimpleNamespace(_entry=SimpleNamespace(data={"host": "h", "port": 1}))
-    events = (
-        _detection(1, 100, "visit", "100-visit.jpg"),
-        _detection(2, 200, "track", None),
+    assert fake._cached_image == "sentinel"
+    assert fake._attr_image_last_updated is None
+
+
+def test_last_detection_image_apply_resets_cache_and_bumps_last_updated_on_a_new_thumb() -> None:
+    fake = SimpleNamespace(_asset_id=None, _cached_image="stale", _attr_image_last_updated=None)
+    identity = DeviceIdentitySummary(
+        last_seen_pet="Kitty", last_seen_pet_ts=1700000000,
+        last_detection_thumb={"id": "2026-09-24/e1-s1-body.jpg", "url": "/x"},
     )
-    KibbleLastDetectionImage._apply(fake, events)
-    assert fake._event.seq == 1
-    assert fake._attr_image_url.endswith("/events/100-visit.jpg")
-    assert fake._attr_image_last_updated == dt_util.utc_from_timestamp(100)
 
-    KibbleLastDetectionImage._apply(fake, (_detection(2, 200, "track", None),))
-    assert fake._event is None and fake._attr_image_url is None
+    KibbleLastDetectionImage._apply(fake, identity)
+
+    assert fake._asset_id == "2026-09-24/e1-s1-body.jpg"
+    assert fake._cached_image is None
+    assert fake._attr_image_last_updated == dt_util.utc_from_timestamp(1700000000)
+
+
+def test_last_detection_image_apply_clears_the_asset_when_nothing_is_identified_yet() -> None:
+    fake = SimpleNamespace(_asset_id="stale-id", _cached_image="stale", _attr_image_last_updated=None)
+
+    KibbleLastDetectionImage._apply(fake, DeviceIdentitySummary.empty())
+
+    assert fake._asset_id is None
+    assert fake._cached_image is None
+
+
+async def test_last_detection_image_async_image_reads_the_archived_asset_off_the_store() -> None:
+    """Overrides `async_image` to read the bytes straight off `coordinator.store` -- no external
+    URL, no remote-image proxy: the crop is already archived locally by the time this entity
+    can name it."""
+    fake = SimpleNamespace(
+        _asset_id="2026-09-24/e1-s1-body.jpg",
+        hass=SimpleNamespace(async_add_executor_job=AsyncMock(side_effect=lambda fn: fn())),
+        coordinator=SimpleNamespace(
+            store=SimpleNamespace(asset_path=Mock(return_value=SimpleNamespace(read_bytes=lambda: b"jpeg")))
+        ),
+    )
+
+    assert await KibbleLastDetectionImage.async_image(fake) == b"jpeg"
+
+
+async def test_last_detection_image_async_image_is_none_with_no_thumb_yet() -> None:
+    fake = SimpleNamespace(_asset_id=None)
+
+    assert await KibbleLastDetectionImage.async_image(fake) is None
+
+
+async def test_last_detection_image_async_image_is_none_when_the_archived_file_is_missing() -> None:
+    """The store still names an asset id, but the file itself is gone (e.g. retention purged it
+    between the identity snapshot and this read) -- `FileNotFoundError` must not propagate."""
+
+    def _raise() -> bytes:
+        raise FileNotFoundError()
+
+    fake = SimpleNamespace(
+        _asset_id="2026-09-24/e1-s1-body.jpg",
+        hass=SimpleNamespace(async_add_executor_job=AsyncMock(side_effect=lambda fn: fn())),
+        coordinator=SimpleNamespace(
+            store=SimpleNamespace(asset_path=Mock(return_value=SimpleNamespace(read_bytes=_raise)))
+        ),
+    )
+
+    assert await KibbleLastDetectionImage.async_image(fake) is None
 
 
 def test_latest_dish_snapshot_uses_the_newest_records_own_side_not_an_older_records() -> None:
@@ -244,29 +314,3 @@ async def test_speak_409_raises_speaker_busy_error_not_a_generic_kibble_error() 
     with pytest.raises(KibbleSpeakerBusyError, match="already in use"):
         await client.speak(b"\x00\x00" * 100)
 
-
-# --- api.KibbleClient.label_face / unlabel_face 404 handling ---------------------------------
-
-
-async def test_label_face_404_surfaces_the_agents_own_not_found_message() -> None:
-    """A 404 from `POST /faces/label` names a specific crop that is no longer pending (already
-    labelled by a race, evicted, a stale/double-submitted UI reference) -- a real
-    `KibbleNotFoundError` carrying the agent's own message, not the default "not supported by
-    this agent version" `KibbleError` that used to make it read exactly like the agent lacked
-    this route entirely (the actual 2026-09-18 log: "Label face failed: /faces/label not
-    supported by this agent version")."""
-    session = _FakeSession(404, {"error": "no such pending face crop"})
-    client = KibbleClient(session, "192.168.4.85", 8765)
-
-    with pytest.raises(KibbleNotFoundError, match="no such pending face crop"):
-        await client.label_face("1-unknown.jpg", "Kitty")
-
-
-async def test_unlabel_face_404_surfaces_the_agents_own_not_found_message() -> None:
-    """Same reasoning as `label_face` -- `unlabel_face`'s crop/cat pair not currently being
-    labelled is a real 404, not evidence the route is unsupported."""
-    session = _FakeSession(404, {"error": "no such labelled crop"})
-    client = KibbleClient(session, "192.168.4.85", 8765)
-
-    with pytest.raises(KibbleNotFoundError, match="no such labelled crop"):
-        await client.unlabel_face("1-unknown.jpg", "Kitty")

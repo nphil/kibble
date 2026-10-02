@@ -99,9 +99,10 @@ import asyncio
 import contextlib
 import logging
 import random
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
 from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
@@ -114,42 +115,46 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
-    CatInfo,
     ClipInfo,
     CloudState,
     DesiccantState,
     DetectionEvent,
     FeederState,
     FeedRecord,
-    IdentifyResult,
     KibbleClient,
     KibbleError,
     KibbleMediaError,
     KibbleNotFoundError,
     LedState,
-    ReviewFace,
     ScheduleState,
     StackState,
     WifiNetwork,
     WifiState,
 )
 from .ble_fallback import async_feed_with_fallback
+from . import bowl_fill
 from .const import (
     CONF_BLE_ADDRESS,
     CONF_ENABLE_SCHEDULE_WRITES,
     CONF_HOST,
+    CONF_RETENTION_DAYS,
     CONF_STREAM_URL,
-    CONF_VENDOR_PET_IDS,
+    DEFAULT_RETENTION_DAYS,
     DEFAULT_RTSP_PATH,
     DEFAULT_RTSP_PORT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    HOPPER_1,
+    HOPPER_BOTH,
     ISSUE_FEEDER_UNRESPONSIVE,
-    parse_vendor_pet_ids,
+    MAX_AMOUNT,
 )
+from .ingest import IdentityEngine, Ingestor
+from .store import DeviceIdentitySummary, KibbleStore
 from .push import Frame, KibblePush, KibblePushClosed, KibblePushUnsupported, merge_frame
 from .stacks import Stack, detect_stack
 
@@ -185,47 +190,6 @@ PUSH_RESYNC_SECONDS = 600.0
 type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
 
-@dataclass(frozen=True, slots=True)
-class Sighting:
-    """One identification of a specific cat, from whichever stack made it.
-
-    On the **vendor** stack that is a `track` event: the feeder's own onboard identifier
-    naming a cloud `pet_id`, which the `vendor_pet_ids` option maps to an operator-assigned
-    name (`cat` is `None` when the id is not in the option -- surfaced raw, never guessed).
-
-    On **LibreFeed** it is any event row the classifier named (`cat` set, `pet_id` `None`) --
-    the same rows the timeline renders, so a cat tile and the timeline can never disagree
-    about when that cat was last here."""
-
-    ts: int
-    pet_id: str | None
-    cat: str | None
-    total_score: float | None
-
-
-def sightings(
-    events: Sequence[DetectionEvent], pet_ids: Mapping[str, str]
-) -> tuple[Sighting, ...]:
-    """Every identification in `events`, newest last, from either stack -- see [`Sighting`].
-
-    LibreFeed rows were missing here until 2026-09-19, which is why its cat tiles read "Last
-    here 17 hours ago" and "Not seen yet" while the feeder was identifying cats: the only
-    other input `last_seen` had was `GET /identify`, whose subject is the newest *pending
-    crop* (i.e. the last crop a human labelled), not a visit. A tile that says "last here"
-    must be fed by sightings, and nothing else.
-    """
-    return tuple(
-        Sighting(
-            ts=e.ts,
-            pet_id=e.pet_id,
-            cat=pet_ids.get(e.pet_id) if e.cls == "track" else e.cat,
-            total_score=e.total_score,
-        )
-        for e in sorted(events, key=lambda e: (e.ts, e.seq))
-        if (e.cls == "track" and e.pet_id is not None) or (e.cls != "track" and e.cat is not None)
-    )
-
-
 _T = TypeVar("_T")
 
 
@@ -248,11 +212,15 @@ class KibbleData:
     device-settings snapshot, the Petkit-cloud kill switch's status, which feeder userland is
     running (`GET /mode`; `None` on an agent old enough not to have that route -- see
     `_fetch_all`), the current Wi-Fi association plus a fresh scan (`agent/src/wifi.rs`),
-    every enrolled cat, the classifier's current identification, the crop the pending-face
-    image entity is showing (`agent/src/faces.rs`'s `Gallery`/`review_target`/
-    `identify_target`), every stored audio clip, every before/after dish-snapshot record
-    (`agent/src/feed_capture.rs`), and each hopper's bowl-fill calibration curve
-    (`GET /calibration`, LibreFeed-only -- see `calibration` below)."""
+    every stored audio clip, every before/after dish-snapshot record (`agent/src/
+    feed_capture.rs`), every onboard visit/eat track, and each hopper's bowl-fill calibration
+    curve (`GET /calibration`, LibreFeed-only -- see `calibration` below).
+
+    `identity` is not part of the poll at all: it is HA's own identity engine's read of the
+    store (`store.identity_summary`), pushed in by `KibbleCoordinator.
+    async_refresh_identity_snapshot` whenever ingest or a store mutation could have changed it,
+    and simply carried forward unchanged by every poll/push cycle in between -- see
+    `_fetch_all`/`_apply_frame`."""
 
     state: FeederState
     schedule: ScheduleState
@@ -260,14 +228,10 @@ class KibbleData:
     cloud: CloudState
     wifi: WifiState
     wifi_scan: tuple[WifiNetwork, ...]
-    cats: tuple[CatInfo, ...]
-    identify: IdentifyResult
-    review_face: ReviewFace
-    pending_face_count: int
     clips: tuple[ClipInfo, ...]
     feeds: tuple[FeedRecord, ...]
     events: tuple[DetectionEvent, ...]
-    sightings: tuple[Sighting, ...]
+    identity: DeviceIdentitySummary
     #: `None` on agents that predate `GET /mode` (the stack select is unavailable then).
     stack: StackState | None = None
     #: `None` on the vendor stack (`GET /led` is a LibreFeed-only route -- see `light.py`'s
@@ -381,7 +345,13 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
     """Keeps one feeder's state fresh."""
 
     def __init__(
-        self, hass: HomeAssistant, entry: KibbleConfigEntry, client: KibbleClient
+        self,
+        hass: HomeAssistant,
+        entry: KibbleConfigEntry,
+        client: KibbleClient,
+        store: KibbleStore,
+        engine: IdentityEngine,
+        ingestor: Ingestor,
     ) -> None:
         super().__init__(
             hass,
@@ -392,9 +362,24 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         )
         self.client = client
         self.entry = entry
+        self.store = store
+        self.engine = engine
+        self.ingestor = ingestor
         # Which transport last actually carried (or was attempted for) a feed command; the
         # "Control path" diagnostic sensor reads this directly. `None` until the first feed.
         self.control_path: str | None = None
+        # The hopper divider is out: one shared bin (`switch.py`'s `KibbleHopperDividerSwitch`
+        # owns and restores this). Every feed amount then means the whole serving from that bin.
+        self.single_hopper = False
+        # Local food-name labels for each hopper (`text.py`'s `KibbleHopperFoodText`), pushed
+        # in the same way as `single_hopper` above. Only meaningful in dual mode; index 0/1 is
+        # hopper 1/2. `None` means unnamed.
+        self._hopper_food: list[str | None] = [None, None]
+        # Whether `ingest.py`'s auto-learn may add new training samples on its own
+        # (`switch.py`'s `KibbleAutoLearnSwitch` owns and restores this, same local-only
+        # pattern as `single_hopper` above). Human labels and uploads always still train
+        # regardless -- this only gates samples nobody reviewed.
+        self.auto_learn_enabled = True
         # Which platforms actually finished `async_setup_entry` -- see `__init__.py`'s
         # per-platform forwarding loop. Populated once, after `async_setup_entry` forwards
         # every platform; `async_unload_entry` only unloads what is in here.
@@ -415,6 +400,56 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # be reloaded exactly once when it genuinely changes, and never merely because one
         # cycle's `GET /mode` happened to fail.
         self._last_confirmed_stack: Stack | None = None
+        # Ingest (docs/36-ai-pipeline.md): one pass in flight at a time, same guard shape as
+        # the poll/push paths' own single-in-flight discipline.
+        self._ingest_task: asyncio.Task[None] | None = None
+        # Bowl-fill estimate (bowl_fill.py): the last real (non-estimated) camera reading, each
+        # hopper's learned fill-per-portion rate (seeded from the store below), before/after
+        # brackets still waiting on the camera to confirm, the estimate currently overriding
+        # `sensor.py`'s `KibbleBowlFillSensor`, and when that override should stop trusting
+        # itself over a real reading that has since caught up (`None` once a fresh reading
+        # supersedes it). All local-only, never round-tripped to the device -- same footing as
+        # `single_hopper`/`_hopper_food` above.
+        self._bowl_fill_last_measured: float | None = None
+        self._bowl_fill_learned: dict[str, tuple[float, int]] = {}
+        self._bowl_fill_pending: list[bowl_fill.PendingFillSample] = []
+        self._bowl_fill_estimate: tuple[float, dict[str, Any]] | None = None
+        self._bowl_fill_clear_after: float | None = None
+
+    async def async_setup_store(self) -> None:
+        """Opens the SQLite store and loads any existing training into the identity engine.
+        Called once, before the first refresh, so ingest can classify from it immediately."""
+        await self.store.async_setup()
+        for bucket in ("hopper1", "hopper2"):
+            learned = await self.store.async_get_bowl_fill_learning(bucket)
+            if learned is not None:
+                self._bowl_fill_learned[bucket] = learned
+        await self.engine.async_rebuild()
+
+    def async_start_retention(self) -> Callable[[], None]:
+        """Runs one retention purge now (background task) and schedules an hourly one for the
+        life of the entry -- docs/36-ai-pipeline.md: "Runs at startup and hourly". Returns the
+        unsubscribe callback for `entry.async_on_unload`."""
+        self.hass.async_create_task(self._async_purge())
+        return async_track_time_interval(self.hass, self._async_purge_scheduled, timedelta(hours=1))
+
+    async def _async_purge_scheduled(self, _now: datetime) -> None:
+        await self._async_purge()
+
+    def retention_days(self) -> int:
+        return self.entry.options.get(CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)
+
+    def retention_cutoff(self) -> int:
+        """The unix timestamp below which an event/feed is outside retention -- the one place
+        this conversion happens, shared by the purge job and every reclassify-after-training-
+        change call (`websocket.py`)."""
+        return int(time.time()) - self.retention_days() * 86400
+
+    async def _async_purge(self) -> None:
+        try:
+            await self.store.async_purge(self.retention_days())
+        except Exception:  # noqa: BLE001 -- a purge failure must never crash the schedule
+            _LOGGER.exception("Kibble retention purge failed")
 
     @property
     def feeder_reachable(self) -> bool:
@@ -515,12 +550,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         successful contact: the failure counter resets exactly as a good poll would."""
         if self.data is None:
             return  # first refresh has not completed; the poll path will seed us
-        pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
         data = merge_frame(self.data, frame)
-        if "events" in frame.fields:
-            data = replace(data, sightings=sightings(data.events, pet_ids))
         self._handle_poll_success()
         self.async_set_updated_data(data)
+        if "events" in frame.fields or "feeds" in frame.fields:
+            self._schedule_ingest(data.events, data.feeds)
 
     async def _async_update_data(self) -> KibbleData:
         try:
@@ -530,7 +564,36 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             return self._handle_poll_failure(err)
         self._handle_poll_success()
         self._check_stack_change(data)
+        self._schedule_ingest(data.events, data.feeds)
         return data
+
+    def _schedule_ingest(
+        self, events: Sequence[DetectionEvent], feeds: Sequence[FeedRecord]
+    ) -> None:
+        if self._ingest_task is None or self._ingest_task.done():
+            self._ingest_task = self.hass.async_create_task(self._async_run_ingest(events, feeds))
+
+    async def _async_run_ingest(
+        self, events: Sequence[DetectionEvent], feeds: Sequence[FeedRecord]
+    ) -> None:
+        """Runs off the coordinator path -- see `ingest.Ingestor`'s own module docstring for
+        the durable-write-then-ack ordering and idempotency this relies on."""
+        try:
+            await self.ingestor.async_ingest(events, feeds)
+        except Exception:  # noqa: BLE001 -- one bad ingest pass must never crash the poll loop
+            _LOGGER.exception("Kibble ingest failed")
+            return
+        await self.async_refresh_identity_snapshot()
+
+    async def async_refresh_identity_snapshot(self) -> None:
+        """Recomputes the identity summary the cat entities read and pushes it through the
+        normal coordinator update path -- the same mechanism `kibble/timeline/subscribe`
+        already listens on, so a label, a `kibble/cats/add`/`/delete`, or a
+        `kibble/training/remove` all reach subscribers and entities the same way an ingest
+        pass does."""
+        summary = await self.store.async_identity_summary()
+        if self.data is not None:
+            self.async_set_updated_data(replace(self.data, identity=summary))
 
     def _check_stack_change(self, data: KibbleData) -> None:
         """Reloads the config entry the first time a poll confirms a DIFFERENT stack than the
@@ -590,19 +653,17 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         calibration = await _optional(self.client.calibration(), None)
         wifi = await self.client.wifi()
         wifi_scan = tuple(await _optional(self.client.wifi_scan(), ()))
-        cats = tuple(await _optional(self.client.cats(), ()))
-        identify = await _optional(self.client.identify(), IdentifyResult.from_json({}))
-        review_face = await _optional(self.client.review_face(), ReviewFace.from_json({}))
-        pending_face_count = len(await _optional(self.client.pending_faces(), ()))
         clips = tuple(await _optional(self.client.clips(), ()))
         feeds = tuple(await _optional(self.client.feeds(), ()))
         events = tuple(await _optional(self.client.events(), ()))
-        # A malformed option can't reach here: the options flow validates it before saving.
-        pet_ids = parse_vendor_pet_ids(self.entry.options.get(CONF_VENDOR_PET_IDS, ""))
         detected_stack = detect_stack(
             mode_running=stack.running if stack is not None else None,
             state_stack_field=state.raw.get("stack"),
         )
+        # Identity is never part of the poll -- it is pushed in separately by ingest/store
+        # mutations (see `async_refresh_identity_snapshot`) and simply carried forward
+        # unchanged here, the same way `push.merge_frame` never touches it either.
+        identity = self.data.identity if self.data is not None else DeviceIdentitySummary.empty()
         return KibbleData(
             state=state,
             schedule=schedule,
@@ -615,14 +676,10 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             calibration=calibration,
             wifi=wifi,
             wifi_scan=wifi_scan,
-            cats=cats,
-            identify=identify,
-            review_face=review_face,
-            pending_face_count=pending_face_count,
             clips=clips,
             feeds=feeds,
             events=events,
-            sightings=sightings(events, pet_ids),
+            identity=identity,
         )
 
     def _handle_poll_success(self) -> None:
@@ -683,7 +740,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         )
 
     def _ble_feed(
-        self, hopper: str, amount: int, feed_id: str | None
+        self, hopper: str, amount: int, feed_id: str | None, amount2: int | None = None
     ) -> Callable[[], Awaitable[None]] | None:
         """A zero-arg BLE feed attempt, or None if no `ble_address` is configured. Imports
         `.ble` lazily -- a feeder with no BLE fallback set up should never need bleak/
@@ -696,21 +753,43 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             from .ble import async_feed as ble_async_feed
 
             await ble_async_feed(
-                self.hass, address, hopper=hopper, amount=amount, feed_id=feed_id
+                self.hass,
+                address,
+                hopper=hopper,
+                amount=amount,
+                feed_id=feed_id,
+                amount2=amount2,
             )
 
         return _attempt
 
-    async def async_feed(self, hopper: str, amount: int, feed_id: str | None = None) -> None:
+    async def async_feed(
+        self,
+        hopper: str,
+        amount: int,
+        feed_id: str | None = None,
+        amount2: int | None = None,
+    ) -> None:
         """Dispense over Wi-Fi; on a connection error, fall back to BLE if `ble_address` is
         configured (`docs/25-ble-feed-frame.md`). Always refreshes afterwards and always
         records which transport was used/attempted on `self.control_path` -- the "Control
-        path" sensor -- even when the call ultimately fails."""
+        path" sensor -- even when the call ultimately fails.
+
+        `amount2`, when given, is hopper 2's own share of a `hopper="both"` split feed --
+        `None` (the default) keeps every pre-existing caller's behaviour of dispensing
+        `amount` from each side (both the agent/daemon and `api.feed` default it to `amount`
+        themselves when omitted). Ignored outright for a single-hopper feed (`hopper` is never
+        "both" by the time it reaches the client below).
+
+        With the divider out, "both" would run both dispensers under one bin and serve twice
+        the amount asked for, so it goes through dispenser 1 alone instead."""
+        if self.single_hopper and hopper == HOPPER_BOTH:
+            hopper = HOPPER_1
 
         async def _wifi_feed() -> None:
-            await self.client.feed(hopper, amount, feed_id)
+            await self.client.feed(hopper, amount, feed_id, amount2)
 
-        ble_feed = self._ble_feed(hopper, amount, feed_id)
+        ble_feed = self._ble_feed(hopper, amount, feed_id, amount2)
         outcome = await async_feed_with_fallback(_wifi_feed, ble_feed)
         self.control_path = outcome.control_path
         self.async_update_listeners()
@@ -784,11 +863,17 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             translation_placeholders={"entry_id": card_id},
         )
 
+    def card_amounts(self, amount: int) -> tuple[int, int]:
+        """The per-dispenser split for one schedule-card `amount`: mirrored onto both sides with
+        the divider in (the same per-side meaning the primary Feed button has), all from
+        dispenser 1 with it out, where `amount` is the whole serving from the one bin."""
+        return (amount, 0) if self.single_hopper else (amount, amount)
+
     async def async_schedule_card_add(self, time: str, amount: int) -> None:
-        """One `amount` mirrored onto both `amount_l`/`amount_r` -- the same shared-bin
-        simplification the primary Feed button already makes. The agent mints the id."""
+        """The agent mints the id; see `card_amounts` for the per-side split."""
         self._require_schedule_writes_enabled()
-        await self.async_schedule_add(time, amount, amount, True, None)
+        amount_l, amount_r = self.card_amounts(amount)
+        await self.async_schedule_add(time, amount_l, amount_r, True, None)
 
     async def async_schedule_card_edit(self, card_id: str, time: str, amount: int) -> None:
         """No native edit exists -- `schedule.rs`'s `add` rejects a duplicate id
@@ -799,9 +884,163 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         entry_id = self.resolve_card_entry_id(card_id)
         try:
             await self.client.remove_schedule_entry(entry_id)
-            await self.client.add_schedule_entry(time, amount, amount, True, entry_id)
+            amount_l, amount_r = self.card_amounts(amount)
+            await self.client.add_schedule_entry(time, amount_l, amount_r, True, entry_id)
         finally:
             await self.async_request_refresh()
+
+    async def async_set_auto_learn_enabled(self, enabled: bool) -> None:
+        """Local-only, no feeder round trip -- see `auto_learn_enabled`'s own comment."""
+        self.auto_learn_enabled = enabled
+        self.async_update_listeners()
+
+    async def async_set_single_hopper(self, single: bool) -> None:
+        """Switch between two compartments and one shared bin. Scheduled feeds are converted
+        so each one keeps serving the same total amount of food: two sides' portions pour into
+        dispenser 1 when the divider comes out, and split back across both sides (the odd
+        portion on side 1) when it goes back in. The feeder runs its schedule on its own and
+        cannot know about the divider, so this is the only place that keeps it consistent.
+        Skipped, with a warning, while schedule writes are turned off in the options."""
+        if single == self.single_hopper:
+            return
+        self.single_hopper = single
+        self.async_update_listeners()
+        if not self.entry.options.get(CONF_ENABLE_SCHEDULE_WRITES, False):
+            if self.data.schedule.entries:
+                _LOGGER.warning(
+                    "Hopper divider changed, but schedule writes are off: scheduled feeds were not converted"
+                )
+            return
+        try:
+            for entry in self.data.schedule.entries:
+                total = entry.amount_l + entry.amount_r
+                if single:
+                    amount_l, amount_r = min(total, MAX_AMOUNT), 0
+                else:
+                    amount_l, amount_r = (total + 1) // 2, total // 2
+                if (amount_l, amount_r) == (entry.amount_l, entry.amount_r):
+                    continue
+                await self.client.remove_schedule_entry(entry.id)
+                await self.client.add_schedule_entry(entry.time, amount_l, amount_r, entry.enabled, entry.id)
+        finally:
+            await self.async_request_refresh()
+
+    def hopper_food(self, n: int) -> str | None:
+        """The user-typed food name for hopper `n` (1 or 2), or `None` when unnamed. Only
+        meaningful in dual mode -- kept current by `text.py`'s `KibbleHopperFoodText`, the
+        same way `single_hopper` above is kept current by the divider switch."""
+        return self._hopper_food[n - 1]
+
+    @callback
+    def async_set_hopper_food(self, n: int, value: str) -> None:
+        """Pushed by `KibbleHopperFoodText` on restore and on every write. Notifies listeners
+        so `kibble/timeline/subscribe` re-renders any feed row that falls back to this name for
+        an unnamed hopper (`websocket.py`'s `_feed_view`)."""
+        name = value or None
+        if name == self._hopper_food[n - 1]:
+            return
+        self._hopper_food[n - 1] = name
+        self.async_update_listeners()
+
+    def bowl_fill_per_portion(self, bucket: str) -> tuple[float, int]:
+        """`bucket`'s current fill-per-portion rate and how many real samples produced it --
+        the learned EWMA once at least one real sample exists, else the calibration-or-constant
+        default (`bowl_fill.default_fill_per_portion`) with a `0` sample count."""
+        learned = self._bowl_fill_learned.get(bucket)
+        if learned is not None:
+            return learned
+        hopper_index = 0 if bucket == "hopper1" else 1
+        hoppers = (self.data.calibration or {}).get("hoppers") or []
+        entry = hoppers[hopper_index] if hopper_index < len(hoppers) else None
+        return (bowl_fill.default_fill_per_portion(entry), 0)
+
+    @property
+    def bowl_fill_estimate(self) -> tuple[float, dict[str, Any]] | None:
+        """`(value, attrs)` currently overriding `sensor.py`'s `KibbleBowlFillSensor`, or `None`
+        while nothing is -- see `bowl_fill.py`'s module doc for the full lifecycle."""
+        return self._bowl_fill_estimate
+
+    @callback
+    def bowl_fill_settle_pending(self) -> None:
+        """Every ingest pass' bracket bookkeeping (`bowl_fill.py`): taints outstanding brackets
+        the instant eating is observed, resolves whatever just reached its own settle deadline
+        into a learned EWMA sample (persisted to the store in the background), and expires
+        anything the camera never confirmed. Also clears the currently-displayed estimate back
+        to `None` once its own settle window has passed and a real reading is available --
+        independent of whether any particular bracket exists or resolved cleanly, so a "both
+        hopper" feed's estimate (which registers no bracket at all) is never left stuck forever.
+        Called once per `Ingestor.async_ingest` pass, before that pass looks at any individual
+        feed."""
+        now = time.time()
+        if self.data is None or self.data.state is None:
+            return
+        state = self.data.state
+        if state.eating:
+            bowl_fill.mark_eating_seen(self._bowl_fill_pending)
+        still_pending, resolved = bowl_fill.resolve_ready(self._bowl_fill_pending, now, state.bowl_fill)
+        self._bowl_fill_pending = bowl_fill.expire_stale(still_pending, now)
+        for bucket, sample in resolved:
+            learned = bowl_fill.ewma_update(self._bowl_fill_learned.get(bucket), sample)
+            self._bowl_fill_learned[bucket] = learned
+            self.hass.async_create_task(
+                self.store.async_set_bowl_fill_learning(bucket, learned[0], learned[1])
+            )
+        if (
+            self._bowl_fill_estimate is not None
+            and self._bowl_fill_clear_after is not None
+            and now >= self._bowl_fill_clear_after
+            and state.bowl_fill is not None
+        ):
+            # The camera has had a fair settle window since the last feed applied, and has a
+            # real reading available: that reading is authoritative again, regardless of
+            # whether it happened to resolve (or even have) a learning bracket of its own.
+            self._bowl_fill_estimate = None
+            self._bowl_fill_clear_after = None
+            self.async_update_listeners()
+        if state.bowl_fill is not None:
+            self._bowl_fill_last_measured = state.bowl_fill
+
+    @callback
+    def async_apply_bowl_fill_feed(self, feed: FeedRecord) -> None:
+        """Registers this brand-new feed's immediate estimate (and, for a single-sided
+        dispense, a before/after bracket for `bowl_fill_settle_pending` to eventually learn
+        from) -- called by `Ingestor._ingest_feed` exactly once per feed uid, the same "first
+        INSERT only" moment that freezes `amount1`/`amount2`/`food1`/`food2`/`single` onto that
+        feed's own store row. A "both" feed still moves the estimate (using both buckets' own
+        current rates), but registers no bracket: a single shared delta can't be cleanly split
+        back into two per-food rates, so it would teach neither bucket anything trustworthy. Any
+        bracket already in flight is superseded (poisoned, never learned from) by this feed's
+        own dispense landing before that bracket's own window closes."""
+        baseline = self._bowl_fill_estimate[0] if self._bowl_fill_estimate is not None else self._bowl_fill_last_measured
+        if baseline is None:
+            return  # nothing measured yet at all -- no floor to add portions onto
+        sides = ((1, feed.amount1 or 0), (2, feed.amount2 or 0))
+        active = [(hopper, portions) for hopper, portions in sides if portions > 0]
+        if not active:
+            return
+        bowl_fill.mark_superseded(self._bowl_fill_pending)
+        delta = sum(portions * self.bowl_fill_per_portion(f"hopper{hopper}")[0] for hopper, portions in active)
+        if len(active) == 1:
+            hopper, portions = active[0]
+            self._bowl_fill_pending.append(
+                bowl_fill.PendingFillSample(
+                    bucket=f"hopper{hopper}",
+                    fill_before=baseline,
+                    portions=portions,
+                    ready_at=time.time() + bowl_fill.SETTLE_SECONDS,
+                )
+            )
+        fill_per_portion_1, samples_1 = self.bowl_fill_per_portion("hopper1")
+        fill_per_portion_2, samples_2 = self.bowl_fill_per_portion("hopper2")
+        self._bowl_fill_estimate = (
+            bowl_fill.estimate_value(baseline, delta),
+            {
+                "fill_per_portion": [round(fill_per_portion_1, 2), round(fill_per_portion_2, 2)],
+                "samples": [samples_1, samples_2],
+            },
+        )
+        self._bowl_fill_clear_after = time.time() + bowl_fill.SETTLE_SECONDS
+        self.async_update_listeners()
 
     async def async_schedule_card_remove(self, card_id: str) -> None:
         self._require_schedule_writes_enabled()
@@ -859,6 +1098,17 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         finally:
             await self.async_request_refresh()
 
+    async def async_call_cats(self) -> dict:
+        """Plays the feed cue on demand ("call the cats") without dispensing anything. Same
+        "always reconcile" shape as `async_beep`/`async_speak`: no "cue is playing" flag exists
+        in `GET /state` to poll for, and even a 429 (cooldown) or 404 (vendor stack) deserves a
+        fresh poll. Propagates `KibbleError` (including `KibbleCueCooldownError`) to the caller
+        uncaught, same as every other `async_*` write here."""
+        try:
+            return await self.client.call_cats()
+        finally:
+            await self.async_request_refresh()
+
     async def async_set_desiccant(
         self,
         *,
@@ -896,50 +1146,14 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         await self.client.wifi_forget(ssid)
         await self.async_request_refresh()
 
-    # The face-store writes use `async_refresh`, not `async_request_refresh`: the latter is
-    # debounced, so it returns before the new data exists. The cats card reads its own write
-    # the moment the service call resolves (re-querying `kibble/cats` for the sample counts and
-    # `kibble/faces/pending` for the queue), and with a debounced refresh it read the *previous*
-    # snapshot -- a crop visibly moved into a cat's gallery while that cat still claimed
-    # "0 samples". Hand-labelling is a handful of calls, not a burst, so coalescing buys
-    # nothing here.
-    async def async_label_face(self, crop_id: str, cat: str) -> None:
-        await self.client.label_face(crop_id, cat)
-        await self.async_refresh()
-
-    async def async_unlabel_face(self, crop_id: str, cat: str) -> None:
-        await self.client.unlabel_face(crop_id, cat)
-        await self.async_refresh()
-
-    async def async_add_cat(self, name: str) -> None:
-        await self.client.add_cat(name)
-        await self.async_refresh()
-
-    async def async_delete_cat(self, name: str) -> dict:
-        """Same immediate-refresh reasoning as the other face-store writes above: the cats
-        card's own delete confirmation re-queries `kibble/cats` right after this resolves and
-        must not still see the deleted cat."""
-        result = await self.client.delete_cat(name)
-        await self.async_refresh()
-        return result
-
-    async def async_upload_face_sample(self, cat: str, jpeg: bytes) -> dict:
-        result = await self.client.upload_face_sample(cat, jpeg)
-        await self.async_refresh()
-        return result
-
-    async def async_delete_face_sample(self, cat: str, name: str) -> dict:
-        result = await self.client.delete_face_sample(cat, name)
-        await self.async_refresh()
-        return result
-
-    async def async_identify_now(self) -> IdentifyResult:
-        """Force an immediate `GET /identify` (bypassing the poll cache) and refresh so the
-        `last_seen_pet`/presence entities reflect it right away. Returns the result for the
-        `kibble.identify` action's response data."""
-        result = await self.client.identify()
-        await self.async_request_refresh()
-        return result
+    async def async_mark_hopper_full(self, hopper: str) -> None:
+        """Tells the daemon `hopper` (`"1"`/`"2"`/`"both"`) was just physically refilled to
+        capacity, then refreshes so `sensor.*_hopper_N_remaining` reflects the reset counters
+        immediately."""
+        try:
+            await self.client.mark_hopper_full(hopper)
+        finally:
+            await self.async_request_refresh()
 
     async def async_speak(self, pcm: bytes) -> dict:
         """Plays already-prepared `pcm` once through the speaker. Refreshes on any outcome --

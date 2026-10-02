@@ -23,14 +23,14 @@ from homeassistant.const import (
     Platform,
     UnitOfTime,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.util import dt as dt_util
+from homeassistant.util import dt as dt_util, slugify
 
+from . import autolearn
 from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntry
 from .ble_fallback import CONTROL_PATHS
-from .coordinator import KibbleConfigEntry, KibbleCoordinator, Sighting
+from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .stacks import applies_to
 
@@ -57,26 +57,42 @@ def _hopper_level_name(level: int | None) -> str | None:
     return HOPPER_LEVELS[level] if level is not None and 0 <= level < len(HOPPER_LEVELS) else None
 
 
-SENSORS: tuple[KibbleSensorDescription, ...] = (
-    KibbleSensorDescription(
-        # The vendor's own reading when there is one, else Kibble's own on-device estimate --
-        # with the Petkit cloud disabled the vendor never refreshes its copy (kibble docs/34),
-        # so this entity would otherwise be permanently unknown. `source`/`measured_at`
-        # attributes say which reading is showing and when the camera saw it.
-        key="bowl_fill",
-        translation_key="bowl_fill",
-        native_unit_of_measurement=PERCENTAGE,
+def hopper_remaining(full_to_low: int | None, portions_since_full: int | None) -> int | None:
+    """Portions estimated left in a hopper before it should hit its low-food threshold, or
+    `None` while the daemon hasn't learned that hopper's full-to-low capacity yet (or it was
+    never marked full)."""
+    if full_to_low is None or portions_since_full is None:
+        return None
+    return max(0, full_to_low - portions_since_full)
+
+
+@dataclass(frozen=True, kw_only=True)
+class KibbleHopperRemainingDescription(SensorEntityDescription):
+    """A per-hopper "portions left" sensor and which slot of `FeederState`'s full/since-full
+    tuples it reads."""
+
+    index: int
+
+
+HOPPER_REMAINING_SENSORS: tuple[KibbleHopperRemainingDescription, ...] = (
+    KibbleHopperRemainingDescription(
+        key="hopper_1_remaining",
+        translation_key="hopper_1_remaining",
+        index=0,
+        native_unit_of_measurement="portions",
         state_class=SensorStateClass.MEASUREMENT,
-        value=lambda s: s.bowl_fill if s.bowl_fill is not None else s.bowl_fill_local[0],
-        attributes=lambda s: (
-            {"source": "feeder"}
-            if s.bowl_fill is not None
-            else {
-                "source": "kibble",
-                "measured_at": _iso_or_none(s.bowl_fill_local[1]),
-            }
-        ),
     ),
+    KibbleHopperRemainingDescription(
+        key="hopper_2_remaining",
+        translation_key="hopper_2_remaining",
+        index=1,
+        native_unit_of_measurement="portions",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+)
+
+
+SENSORS: tuple[KibbleSensorDescription, ...] = (
     KibbleSensorDescription(
         # The MCU's own three-way hopper reading (docs/07-config.md §10) -- the closest thing
         # this feeder has to a hopper gauge; the `_empty` binary sensors are its collapsed form.
@@ -198,6 +214,11 @@ async def async_setup_entry(
         for d in CALIBRATION_SENSORS
         if applies_to(Platform.SENSOR, d.key, stack)
     )
+    entities.extend(
+        KibbleHopperRemainingSensor(coordinator, d)
+        for d in HOPPER_REMAINING_SENSORS
+        if applies_to(Platform.SENSOR, d.key, stack)
+    )
     # One-off, non-description-driven sensors -- `(key, entity)` so every one of them still
     # goes through `applies_to`, the same as the data-driven lists above, per `stacks.py`'s
     # "no scattered `if stack == ...`" rule. Building each entity is cheap (no I/O), so nothing
@@ -206,20 +227,76 @@ async def async_setup_entry(
         ("schedule", KibbleScheduleSensor(coordinator)),
         ("schedule_card_state", KibbleScheduleCardStateSensor(coordinator)),
         ("next_feed", KibbleNextFeedSensor(coordinator)),
+        ("bowl_fill", KibbleBowlFillSensor(coordinator)),
         ("cloud_connection", KibbleCloudConnectionSensor(coordinator)),
         ("control_path", KibbleControlPathSensor(coordinator)),
         ("wifi_network", KibbleWifiNetworkSensor(coordinator)),
         ("wifi_signal", KibbleWifiSignalSensor(coordinator)),
         ("last_seen_pet", KibbleLastSeenPetSensor(coordinator)),
-        ("identification_score", KibbleIdentificationScoreSensor(coordinator)),
-        ("pending_faces", KibblePendingFacesSensor(coordinator)),
         ("clips", KibbleClipsSensor(coordinator)),
         ("last_detection", KibbleLastDetectionSensor(coordinator)),
         ("detections_today", KibbleDetectionsTodaySensor(coordinator)),
         ("agent_starts", KibbleAgentStartsSensor(coordinator)),
+        ("recognition", KibbleOverallRecognitionSensor(coordinator)),
     ]
     entities.extend(entity for key, entity in one_offs if applies_to(Platform.SENSOR, key, stack))
     async_add_entities(entities)
+
+    # Per-cat sensors are created dynamically from the identity engine's roster -- there is no
+    # fixed list at integration setup, since cats are enrolled over time. Mirrors
+    # binary_sensor.py's per-cat presence sensor.
+    known_cats: set[str] = set()
+
+    @callback
+    def _add_new_cats() -> None:
+        new = [name for name in coordinator.data.identity.cats if name not in known_cats]
+        if not new:
+            return
+        known_cats.update(new)
+        async_add_entities(
+            entity
+            for name in new
+            for entity in (
+                KibbleCatLastSeenSensor(coordinator, name),
+                KibbleCatLastMealSensor(coordinator, name),
+                KibbleCatMealsTodaySensor(coordinator, name),
+                KibbleCatRecognitionSensor(coordinator, name),
+            )
+        )
+
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_cats))
+    _add_new_cats()  # cats already known at setup time
+
+
+class KibbleHopperRemainingSensor(KibbleEntity, SensorEntity):
+    """Portions left in hopper `entity_description.index` before it should hit its low-food
+    threshold. Unknown until the hopper has been marked full at least once and the daemon has
+    learned its full-to-low capacity."""
+
+    entity_description: KibbleHopperRemainingDescription
+
+    def __init__(
+        self, coordinator: KibbleCoordinator, description: KibbleHopperRemainingDescription
+    ) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+
+    @property
+    def native_value(self) -> int | None:
+        state = self.coordinator.data.state
+        idx = self.entity_description.index
+        return hopper_remaining(state.hopper_full_to_low[idx], state.hopper_portions_since_full[idx])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data.state
+        idx = self.entity_description.index
+        full_at = state.hopper_full_at[idx]
+        return {
+            "full_at": dt_util.utc_from_timestamp(full_at).isoformat() if full_at is not None else None,
+            "portions_since_full": state.hopper_portions_since_full[idx],
+            "full_to_low": state.hopper_full_to_low[idx],
+        }
 
 
 class KibbleSensor(KibbleEntity, SensorEntity):
@@ -553,13 +630,10 @@ class KibbleWifiSignalSensor(KibbleEntity, SensorEntity):
 
 
 class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
-    """Kibble's own frozen-embedding classifier's most recent opinion (`GET /identify`) --
-    state is the cat's name, the literal `"unknown"` if the classifier ran but wasn't
-    confident, or unavailable if nothing has ever been captured. `source` (an attribute)
-    distinguishes a live classifier guess from ground truth carried over from the most
-    recently labelled crop once the review queue is empty. `docs/27-cat-id.md` documents
-    measured accuracy and the cold-start behaviour this can show with very little labelled
-    data -- treat a low-sample-count identification as a guess, not a fact."""
+    """The cat identified in the newest event HA's own identity engine could name
+    (docs/36-ai-pipeline.md) -- state is unavailable until anything has ever been identified.
+    No live device call: this reads straight off the store, the same engine that names every
+    row on the timeline, so the two can never disagree."""
 
     _attr_translation_key = "last_seen_pet"
 
@@ -568,57 +642,133 @@ class KibbleLastSeenPetSensor(KibbleEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        return self.coordinator.data.identify.cat
+        return self.coordinator.data.identity.last_seen_pet
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        result = self.coordinator.data.identify
-        attrs: dict[str, Any] = {}
-        if result.source is not None:
-            attrs["source"] = result.source
-        if result.score is not None:
-            attrs["score"] = result.score
-        if result.second_best is not None:
-            attrs["second_best_cat"] = result.second_best.cat
-            attrs["second_best_score"] = result.second_best.score
-        if result.ts is not None:
-            attrs["last_identified"] = dt_util.utc_from_timestamp(result.ts).isoformat()
-        return attrs
+        ts = self.coordinator.data.identity.last_seen_pet_ts
+        if ts is None:
+            return {}
+        return {"last_identified": dt_util.utc_from_timestamp(ts).isoformat()}
 
 
-class KibbleIdentificationScoreSensor(KibbleEntity, SensorEntity):
-    """The raw cosine-similarity score behind `last_seen_pet`'s current identification --
-    troubleshooting/tuning only (e.g. seeing how close a borderline call was), disabled by
-    default per house rule 4."""
+def _cat_display_name(cat_name: str) -> str:
+    """Display-only capitalisation -- the store keeps a cat's name exactly as entered, so a
+    lowercase name would otherwise read as a typo next to every other sentence-case entity."""
+    return cat_name[:1].upper() + cat_name[1:] if cat_name else cat_name
 
-    _attr_translation_key = "identification_score"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = False
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, coordinator: KibbleCoordinator) -> None:
-        super().__init__(coordinator, "identification_score")
+class KibbleCatLastSeenSensor(KibbleEntity, SensorEntity):
+    """When this cat was last identified at the bowl, from any visit or eat."""
+
+    _attr_translation_key = "cat_last_seen"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
+        super().__init__(coordinator, f"cat_last_seen_{slugify(cat_name)}")
+        self._cat_name = cat_name
+        self._attr_translation_placeholders = {"cat_name": _cat_display_name(cat_name)}
 
     @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.identify.score
+    def native_value(self) -> datetime | None:
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        return dt_util.utc_from_timestamp(stats.last_seen) if stats and stats.last_seen else None
 
 
-class KibblePendingFacesSensor(KibbleEntity, SensorEntity):
-    """How many captured face crops are still awaiting a human label -- diagnostic (house rule
-    4: disabled by default), not something Nitin needs to watch routinely."""
+class KibbleCatLastMealSensor(KibbleEntity, SensorEntity):
+    """When this cat was last identified eating."""
 
-    _attr_translation_key = "pending_faces"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = False
+    _attr_translation_key = "cat_last_meal"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
+        super().__init__(coordinator, f"cat_last_meal_{slugify(cat_name)}")
+        self._cat_name = cat_name
+        self._attr_translation_placeholders = {"cat_name": _cat_display_name(cat_name)}
+
+    @property
+    def native_value(self) -> datetime | None:
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        return dt_util.utc_from_timestamp(stats.last_meal) if stats and stats.last_meal else None
+
+
+class KibbleCatMealsTodaySensor(KibbleEntity, SensorEntity):
+    """How many meals this cat has been identified at since local midnight. Filtered at read
+    time against every eat in the last 48h rather than a count fixed at the last ingest pass,
+    so the day boundary rolls over on its own -- same pattern as
+    `KibbleDetectionsTodaySensor`."""
+
+    _attr_translation_key = "cat_meals_today"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, coordinator: KibbleCoordinator) -> None:
-        super().__init__(coordinator, "pending_faces")
+    def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
+        super().__init__(coordinator, f"cat_meals_today_{slugify(cat_name)}")
+        self._cat_name = cat_name
+        self._attr_translation_placeholders = {"cat_name": _cat_display_name(cat_name)}
 
     @property
     def native_value(self) -> int:
-        return self.coordinator.data.pending_face_count
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        if stats is None:
+            return 0
+        start = dt_util.start_of_local_day()
+        return sum(1 for ts in stats.recent_meals if dt_util.utc_from_timestamp(ts) >= start)
+
+
+class KibbleCatRecognitionSensor(KibbleEntity, SensorEntity):
+    """How well the identity engine recognises this cat, 0-100% -- confidence-weighted rolling
+    accuracy against real human reviews (or, before there is enough of those, the classifier's
+    own mean guess confidence as a labelled estimate), scaled down by how much training data
+    backs it so a handful of perfect samples never reads as "done"
+    (`autolearn.recognition_score`). Watch it climb, then turn `switch.*_auto_learn` off once
+    it is near full.
+
+    No `state_class`: per-cat entities come and go with the roster (enrolled, deleted, maybe
+    re-enrolled later as a fresh identity), and a `MEASUREMENT` history surviving that is
+    exactly the orphaned long-term-statistics row Home Assistant's own guidance warns against
+    for dynamic entities."""
+
+    _attr_translation_key = "cat_recognition"
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def __init__(self, coordinator: KibbleCoordinator, cat_name: str) -> None:
+        super().__init__(coordinator, f"cat_recognition_{slugify(cat_name)}")
+        self._cat_name = cat_name
+        self._attr_translation_placeholders = {"cat_name": _cat_display_name(cat_name)}
+
+    @property
+    def native_value(self) -> int:
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        return stats.recognition_score if stats else 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = self.coordinator.data.identity.cats.get(self._cat_name)
+        if stats is None:
+            return {"training_samples": 0, "uploads": 0, "basis": "estimate", "learning_state": "learning"}
+        return {
+            "training_samples": stats.training_samples,
+            "uploads": stats.training_uploads,
+            "basis": stats.recognition_basis,
+            "learning_state": stats.learning_state,
+        }
+
+
+class KibbleOverallRecognitionSensor(KibbleEntity, SensorEntity):
+    """The weakest-recognised enrolled cat's score, not an average -- "turn training off once
+    it is near full" means every cat, not most of them (`autolearn.overall_recognition_score`).
+    `None` (unknown) with nothing enrolled yet."""
+
+    _attr_translation_key = "recognition"
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "recognition")
+
+    @property
+    def native_value(self) -> int | None:
+        scores = [stats.recognition_score for stats in self.coordinator.data.identity.cats.values()]
+        return autolearn.overall_recognition_score(scores)
 
 
 class KibbleClipsSensor(KibbleEntity, SensorEntity):
@@ -656,12 +806,13 @@ def _latest_detection(events: Sequence[DetectionEvent]) -> DetectionEvent | None
 
 
 class KibbleLastDetectionSensor(KibbleEntity, SensorEntity):
-    """When the feeder's onboard AI last saw something, with the vendor's own class.
+    """When the feeder's onboard AI last saw a visit or eat track.
 
     Exists because a detection could previously be captured perfectly and remain completely
     invisible in Home Assistant -- the agent held the events and the crops, but nothing surfaced
-    them. The state is the timestamp (so it renders as "2 minutes ago"); the class, the crop
-    filename and Kibble's own cat guess ride along as attributes."""
+    them. The state is the timestamp (so it renders as "2 minutes ago"); the kind and best body
+    crop's filename ride along as attributes. Deliberately identity-agnostic -- see
+    `sensor.*_last_seen_pet`/`image.*_last_detection` for the named version."""
 
     _attr_translation_key = "last_detection"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -681,23 +832,15 @@ class KibbleLastDetectionSensor(KibbleEntity, SensorEntity):
         event = _latest_detection(self.coordinator.data.events)
         if event is None:
             return {}
-        # `pet_id` is real on `track` events (the vendor's own identification, read from the
-        # feeder's shared config); `score` is honestly absent on every class -- see api.py.
-        return {
-            "class": event.cls,
-            "image": event.image,
-            "cat": event.cat,
-            "score": event.score,
-            "pet_id": event.pet_id,
-        }
+        return {"kind": event.kind, "image": event.image}
 
 
 class KibbleDetectionsTodaySensor(KibbleEntity, SensorEntity):
-    """How many detections the agent has recorded since local midnight, by class.
+    """How many detections the agent has recorded since local midnight, by kind.
 
-    Counts from the agent's own event list (capped at its newest 50), so a very busy day reports
-    "at least this many" rather than a true total -- stated in the attributes instead of being
-    quietly wrong."""
+    Counts from the agent's own event list (capped at its newest 256 -- docs/36-ai-pipeline.md),
+    so a very busy day reports "at least this many" rather than a true total -- stated in the
+    attributes instead of being quietly wrong."""
 
     _attr_translation_key = "detections_today"
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -720,13 +863,13 @@ class KibbleDetectionsTodaySensor(KibbleEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         today = self._today()
-        by_class: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
         for e in today:
-            by_class[e.cls] = by_class.get(e.cls, 0) + 1
+            by_kind[e.kind] = by_kind.get(e.kind, 0) + 1
         return {
-            "by_class": by_class,
-            # True when the agent's own 50-event cap may be hiding older detections from today.
-            "capped": len(self.coordinator.data.events) >= 50,
+            "by_kind": by_kind,
+            # True when the agent's own 256-event cap may be hiding older detections from today.
+            "capped": len(self.coordinator.data.events) >= 256,
         }
 
 
@@ -799,6 +942,53 @@ def _calibration_attributes(hopper: dict[str, Any] | None) -> dict[str, Any]:
         "measured_at": _iso_or_none(hopper.get("measured_at")),
         "note": hopper.get("note"),
     }
+
+
+class KibbleBowlFillSensor(KibbleEntity, SensorEntity):
+    """`bowl_fill`: the camera-measured reading when one exists, overridden by an immediate
+    post-feed projection (`bowl_fill.py`, `KibbleCoordinator.async_apply_bowl_fill_feed`) until
+    the next camera assessment supersedes it. Same `key`/unique id/unit/state class as the
+    entity this replaced (a bespoke class purely because the estimate override needs more logic
+    than the generic `KibbleSensorDescription.value` callable shape allows) -- no statistics are
+    orphaned by this change.
+
+    `source` is `"estimate"` while an unresolved post-feed projection is showing, else
+    `"measured"` for either underlying camera path (the vendor's own reading, or Kibble's local
+    fallback when the vendor's has gone stale -- see the module's old `bowl_fill` docstring in
+    git history for why that fallback exists); `measured_at` still rides along for the local
+    path specifically. `fill_per_portion`/`samples` are always `[hopper1, hopper2]`, regardless
+    of which bucket the current reading actually came from."""
+
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_translation_key = "bowl_fill"
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "bowl_fill")
+
+    def _fill_per_portion_attrs(self) -> dict[str, Any]:
+        fpp1, samples1 = self.coordinator.bowl_fill_per_portion("hopper1")
+        fpp2, samples2 = self.coordinator.bowl_fill_per_portion("hopper2")
+        return {"fill_per_portion": [round(fpp1, 2), round(fpp2, 2)], "samples": [samples1, samples2]}
+
+    @property
+    def native_value(self) -> int | None:
+        estimate = self.coordinator.bowl_fill_estimate
+        if estimate is not None:
+            return round(estimate[0])
+        state = self.coordinator.data.state
+        return state.bowl_fill if state.bowl_fill is not None else state.bowl_fill_local[0]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        estimate = self.coordinator.bowl_fill_estimate
+        if estimate is not None:
+            return {"source": "estimate", **estimate[1]}
+        state = self.coordinator.data.state
+        attrs: dict[str, Any] = {"source": "measured", **self._fill_per_portion_attrs()}
+        if state.bowl_fill is None:
+            attrs["measured_at"] = _iso_or_none(state.bowl_fill_local[1])
+        return attrs
 
 
 class KibbleCalibrationSensor(KibbleEntity, SensorEntity):

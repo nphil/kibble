@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import logging
 import re
 
 import voluptuous as vol
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .api import KibbleClient, KibbleError, KibbleSpeakerBusyError
+from .api import KibbleClient, KibbleCueCooldownError, KibbleError, KibbleSpeakerBusyError
 from .const import (
     ATTR_AMOUNT,
+    ATTR_AMOUNT2,
     ATTR_CAT,
-    ATTR_CAT_NAME,
     ATTR_CLIP_NAME,
     ATTR_COUNT,
-    ATTR_CROP_ID,
-    ATTR_CROP_NAME,
     ATTR_DAYS_LEFT,
     ATTR_ENABLED,
     ATTR_ENTRIES,
@@ -36,7 +32,7 @@ from .const import (
     ATTR_HOUR,
     ATTR_ID,
     ATTR_INTERVAL_DAYS,
-    ATTR_JPEG_B64,
+    ATTR_KEEP_UPLOADS,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MINUTE,
     ATTR_OFF_MS,
@@ -45,6 +41,8 @@ from .const import (
     ATTR_SECONDS,
     ATTR_SSID,
     ATTR_TIME,
+    CONF_CORALHUB_TOKEN,
+    CONF_CORALHUB_URL,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_BEEP_COUNT,
@@ -70,13 +68,11 @@ from .const import (
     MIN_DESICCANT_DAYS_LEFT,
     MIN_DESICCANT_INTERVAL_DAYS,
     MIN_SCHEDULE_AMOUNT,
-    SERVICE_ADD_CAT,
     SERVICE_BEEP,
+    SERVICE_CALL_CATS,
     SERVICE_CANCEL_FEED,
-    SERVICE_DELETE_CAT,
+    SERVICE_CLEAR_TRAINING,
     SERVICE_FEED,
-    SERVICE_IDENTIFY,
-    SERVICE_LABEL_FACE,
     SERVICE_PLAY_CLIP,
     SERVICE_RECORD_CLIP,
     SERVICE_SAVE_CLIP,
@@ -89,13 +85,17 @@ from .const import (
     SERVICE_SCHEDULE_SET,
     SERVICE_SCHEDULE_SET_ENABLED,
     SERVICE_SET_DESICCANT,
-    SERVICE_UNLABEL_FACE,
-    SERVICE_UPLOAD_FACE_SAMPLE,
     SERVICE_WIFI_CONNECT,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
-from .errors import raise_agent_action_failed, raise_speaker_busy
-from .views import KibbleImageView
+from .coral_client import CoralHubClient
+from .coral_identity import CoralRecognizer
+from .eating_clips import ClipLinker
+from .errors import raise_agent_action_failed, raise_cue_cooldown, raise_speaker_busy
+from .ingest import IdentityEngine, Ingestor
+from .judge import VisionJudge
+from .store import KibbleStore
+from .views import KibbleClipView, KibbleMediaView, KibbleUploadAvatarView, KibbleUploadTrainingView
 from .websocket import async_setup_websocket_api
 
 _LOGGER = logging.getLogger(__name__)
@@ -125,6 +125,11 @@ FEED_SCHEMA = vol.Schema(
         vol.Required("device_id"): cv.string,
         vol.Optional(ATTR_HOPPER, default=HOPPER_BOTH): vol.In(HOPPERS),
         vol.Required(ATTR_AMOUNT): vol.All(
+            vol.Coerce(int), vol.Range(min=MIN_AMOUNT, max=MAX_AMOUNT)
+        ),
+        # Optional: a genuine per-hopper split for hopper="both". Absent means "dispense
+        # `amount` from each side", exactly like every caller before this field existed.
+        vol.Optional(ATTR_AMOUNT2): vol.All(
             vol.Coerce(int), vol.Range(min=MIN_AMOUNT, max=MAX_AMOUNT)
         ),
         vol.Optional(ATTR_FEED_ID): cv.string,
@@ -227,46 +232,6 @@ WIFI_CONNECT_SCHEMA = vol.Schema(
     }
 )
 
-LABEL_FACE_SCHEMA = vol.Schema(
-    {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_CROP_ID): cv.string,
-        vol.Required(ATTR_CAT): cv.string,
-    }
-)
-
-UNLABEL_FACE_SCHEMA = vol.Schema(
-    {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_CAT): cv.string,
-        vol.Required(ATTR_CROP_NAME): cv.string,
-    }
-)
-
-ADD_CAT_SCHEMA = vol.Schema(
-    {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_CAT_NAME): cv.string,
-    }
-)
-
-UPLOAD_FACE_SAMPLE_SCHEMA = vol.Schema(
-    {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_CAT): cv.string,
-        vol.Required(ATTR_JPEG_B64): cv.string,
-    }
-)
-
-DELETE_CAT_SCHEMA = vol.Schema(
-    {
-        vol.Required("device_id"): cv.string,
-        vol.Required(ATTR_CAT_NAME): cv.string,
-    }
-)
-
-IDENTIFY_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
-
 _CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -317,6 +282,8 @@ BEEP_SCHEMA = vol.Schema(
     }
 )
 
+CALL_CATS_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
+
 SET_DESICCANT_SCHEMA = vol.All(
     vol.Schema(
         {
@@ -332,6 +299,14 @@ SET_DESICCANT_SCHEMA = vol.All(
         }
     ),
     cv.has_at_least_one_key(ATTR_DAYS_LEFT, ATTR_INTERVAL_DAYS),
+)
+
+CLEAR_TRAINING_SCHEMA = vol.Schema(
+    {
+        vol.Optional("device_id"): cv.string,
+        vol.Required(ATTR_CAT): cv.string,
+        vol.Optional(ATTR_KEEP_UPLOADS, default=False): cv.boolean,
+    }
 )
 
 
@@ -383,11 +358,14 @@ async def _async_forward_platforms_isolated(
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Component-level setup, run exactly once regardless of how many feeders are configured
     -- registers the `kibble/*` websocket commands (`websocket.py`) and the
-    `/api/kibble/{entry_id}/image/*` HTTP view (`views.py`), both process-global and entry-
-    independent. Doing this per-entry (in `async_setup_entry` below) would try to register the
-    same command/route more than once for a second feeder."""
+    `/api/kibble/{entry_id}/media|clip/*` HTTP views (`views.py`), both process-global and
+    entry-independent. Doing this per-entry (in `async_setup_entry` below) would try to
+    register the same command/route more than once for a second feeder."""
     async_setup_websocket_api(hass)
-    hass.http.register_view(KibbleImageView())
+    hass.http.register_view(KibbleMediaView())
+    hass.http.register_view(KibbleUploadTrainingView())
+    hass.http.register_view(KibbleUploadAvatarView())
+    hass.http.register_view(KibbleClipView())
     return True
 
 
@@ -407,7 +385,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     client = KibbleClient(
         async_get_clientsession(hass), entry.data[CONF_HOST], entry.data[CONF_PORT]
     )
-    coordinator = KibbleCoordinator(hass, entry, client)
+    store = KibbleStore(hass, entry.entry_id)
+    coralhub_url = (entry.options.get(CONF_CORALHUB_URL) or "").strip()
+    coral_recognizer: CoralRecognizer | None = None
+    if coralhub_url:
+        coralhub_token = (entry.options.get(CONF_CORALHUB_TOKEN) or "").strip()
+        coralhub_client = CoralHubClient(hass, coralhub_url, coralhub_token)
+        coral_recognizer = CoralRecognizer(hass, store, coralhub_client)
+    engine = IdentityEngine(hass, store, coral_recognizer)
+    clip_linker = ClipLinker(hass, entry, store)
+    vision_judge = VisionJudge(hass, entry, store)
+    ingestor = Ingestor(hass, entry.entry_id, client, store, engine, clip_linker, vision_judge)
+    coordinator = KibbleCoordinator(hass, entry, client, store, engine, ingestor)
+    ingestor.coordinator = coordinator
+    vision_judge.coordinator = coordinator
+    if coral_recognizer is not None:
+        # Wired post-construction -- same chicken-and-egg reason `ingestor.coordinator`/
+        # `vision_judge.coordinator` are: a batch of freshly backfilled centroids wants to
+        # reach production right away (`CoralRecognizer.async_backfill`'s own docstring), and
+        # that means calling back into the `IdentityEngine` this recognizer is itself part of.
+        coral_recognizer.on_progress = engine.async_rebuild
+    await coordinator.async_setup_store()
+    # Fills any blank cat coat description (Contract 3), as its own background task -- never
+    # blocking entry setup, since a busy-model deferral (docs/40-vision-judge.md) can now take
+    # up to an hour. Started before the first refresh so the very first verdicts have a chance
+    # to see real descriptions instead of blank roster lines, but never awaited here.
+    entry.async_create_background_task(
+        hass, vision_judge.ensure_descriptions(), name="kibble vision judge descriptions"
+    )
+    if coral_recognizer is not None:
+        # Catches up every training row's and every still-reclassifiable sample's cached
+        # embedding, newest first, entirely in the background (docs/41-coral-recognition.md) --
+        # never blocks entry setup, same reasoning as the vision judge's own description
+        # backfill just above.
+        entry.async_create_background_task(
+            hass, coral_recognizer.async_backfill(), name="kibble coral embedding backfill"
+        )
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
 
@@ -426,13 +439,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, coordinator.async_stop_push)
     )
+    entry.async_on_unload(coordinator.async_start_retention())
+    entry.async_on_unload(clip_linker.async_cancel)
+    await clip_linker.async_relink_recent()
+    entry.async_on_unload(vision_judge.async_cancel)
+    # Startup backfill (docs/40-vision-judge.md, item 4): re-offers every still-eligible closed
+    # event from the last 48h to the judge -- same restart-survival idea as `clip_linker`'s own
+    # sweep just above, since the in-memory debounce/schedule map is lost on every restart.
+    await vision_judge.async_backfill_eligible()
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
-    return await hass.config_entries.async_unload_platforms(
+    unloaded = await hass.config_entries.async_unload_platforms(
         entry, entry.runtime_data.loaded_platforms
     )
+    if unloaded:
+        await entry.runtime_data.store.async_close()
+    return unloaded
 
 
 async def async_remove_config_entry_device(
@@ -488,7 +512,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
             await coordinator.async_feed(
-                call.data[ATTR_HOPPER], call.data[ATTR_AMOUNT], call.data.get(ATTR_FEED_ID)
+                call.data[ATTR_HOPPER],
+                call.data[ATTR_AMOUNT],
+                call.data.get(ATTR_FEED_ID),
+                amount2=call.data.get(ATTR_AMOUNT2),
             )
         except Exception as err:
             # Broader than the other handlers on purpose: a failed feed can now come from
@@ -581,74 +608,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Wi-Fi connect", err)
 
-    async def handle_label_face(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            await coordinator.async_label_face(call.data[ATTR_CROP_ID], call.data[ATTR_CAT])
-        except KibbleError as err:
-            raise_agent_action_failed("Label face", err)
-
-    async def handle_unlabel_face(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            await coordinator.async_unlabel_face(
-                call.data[ATTR_CROP_NAME], call.data[ATTR_CAT]
-            )
-        except KibbleError as err:
-            raise_agent_action_failed("Unlabel face", err)
-
-    async def handle_upload_face_sample(call: ServiceCall) -> None:
-        try:
-            jpeg = base64.b64decode(call.data[ATTR_JPEG_B64], validate=True)
-        except binascii.Error as err:
-            # A malformed payload, not an agent rejection -- the agent never sees this call.
-            # Checked before resolving a device so a bad `jpeg_b64` value fails the same way
-            # regardless of which feeder (if any) would have handled it, and gets a clean,
-            # translated validation error instead of the base64 module's own uncaught
-            # exception in the log.
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="invalid_jpeg_data",
-                translation_placeholders={"error": str(err)},
-            ) from err
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            await coordinator.async_upload_face_sample(call.data[ATTR_CAT], jpeg)
-        except KibbleError as err:
-            raise_agent_action_failed("Upload face sample", err)
-
-    async def handle_add_cat(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            await coordinator.async_add_cat(call.data[ATTR_CAT_NAME])
-        except KibbleError as err:
-            raise_agent_action_failed("Add cat", err)
-
-    async def handle_delete_cat(call: ServiceCall) -> None:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            await coordinator.async_delete_cat(call.data[ATTR_CAT_NAME])
-        except KibbleError as err:
-            raise_agent_action_failed("Delete cat", err)
-
-    async def handle_identify(call: ServiceCall) -> ServiceResponse:
-        coordinator = _coordinator_for_device(hass, call.data["device_id"])
-        try:
-            result = await coordinator.async_identify_now()
-        except KibbleError as err:
-            raise_agent_action_failed("Identify", err)
-        return {
-            "cat": result.cat,
-            "score": result.score,
-            "second_best": (
-                {"cat": result.second_best.cat, "score": result.second_best.score}
-                if result.second_best
-                else None
-            ),
-            "crop": result.crop,
-            "source": result.source,
-        }
-
     async def handle_save_clip(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data["device_id"])
         try:
@@ -687,6 +646,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except KibbleError as err:
             raise_agent_action_failed("Beep", err)
 
+    async def handle_call_cats(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data["device_id"])
+        try:
+            await coordinator.async_call_cats()
+        except KibbleCueCooldownError as err:
+            raise_cue_cooldown(err)
+        except KibbleError as err:
+            raise_agent_action_failed("Call the cats", err)
+
     async def handle_set_desiccant(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
         try:
@@ -696,6 +664,21 @@ def _async_register_services(hass: HomeAssistant) -> None:
             )
         except KibbleError as err:
             raise_agent_action_failed("Set desiccant", err)
+
+    async def handle_clear_training(call: ServiceCall) -> None:
+        coordinator = _coordinator_for_device(hass, call.data.get("device_id"))
+        cat = call.data[ATTR_CAT]
+        target = None if cat == "all" else cat
+        if target is not None and not await coordinator.store.async_cat_exists(target):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="unknown_cat",
+                translation_placeholders={"cat": target},
+            )
+        await coordinator.store.async_clear_training(target, keep_uploads=call.data[ATTR_KEEP_UPLOADS])
+        await coordinator.engine.async_rebuild()
+        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
+        await coordinator.async_refresh_identity_snapshot()
 
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)
@@ -735,33 +718,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_WIFI_CONNECT, handle_wifi_connect, WIFI_CONNECT_SCHEMA
     )
-    hass.services.async_register(DOMAIN, SERVICE_LABEL_FACE, handle_label_face, LABEL_FACE_SCHEMA)
-    hass.services.async_register(
-        DOMAIN, SERVICE_UNLABEL_FACE, handle_unlabel_face, UNLABEL_FACE_SCHEMA
-    )
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_UPLOAD_FACE_SAMPLE,
-        handle_upload_face_sample,
-        UPLOAD_FACE_SAMPLE_SCHEMA,
-    )
-    hass.services.async_register(DOMAIN, SERVICE_ADD_CAT, handle_add_cat, ADD_CAT_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_DELETE_CAT, handle_delete_cat, DELETE_CAT_SCHEMA)
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_IDENTIFY,
-        handle_identify,
-        IDENTIFY_SCHEMA,
-        supports_response=SupportsResponse.OPTIONAL,
-    )
     hass.services.async_register(DOMAIN, SERVICE_SAVE_CLIP, handle_save_clip, SAVE_CLIP_SCHEMA)
     hass.services.async_register(
         DOMAIN, SERVICE_RECORD_CLIP, handle_record_clip, RECORD_CLIP_SCHEMA
     )
     hass.services.async_register(DOMAIN, SERVICE_PLAY_CLIP, handle_play_clip, PLAY_CLIP_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_BEEP, handle_beep, BEEP_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_CALL_CATS, handle_call_cats, CALL_CATS_SCHEMA)
     hass.services.async_register(
         DOMAIN, SERVICE_SET_DESICCANT, handle_set_desiccant, SET_DESICCANT_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_TRAINING, handle_clear_training, CLEAR_TRAINING_SCHEMA
     )
 
 

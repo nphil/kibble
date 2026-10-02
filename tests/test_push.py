@@ -33,6 +33,7 @@ from kibble.push import (
     merge_frame,
     parse_fields,
 )
+from kibble.store import DeviceIdentitySummary
 
 STATE_JSON = {
     "serial": "SN1", "firmware": "895", "ble_firmware": 159, "volume": 20, "desiccant_days": 3,
@@ -50,8 +51,7 @@ def test_every_snapshot_field_has_a_parser_and_maps_onto_kibble_data() -> None:
     would be silently dropped, which is exactly the class of bug this guards against."""
     data_fields = set(KibbleData.__dataclass_fields__)
     for name in SNAPSHOT_FIELDS:
-        attr = "pending_face_count" if name == "pending_faces" else name
-        assert attr in data_fields, name
+        assert name in data_fields, name
 
 
 def test_decode_frame_reads_type_seq_fields_and_hello_proto() -> None:
@@ -68,35 +68,32 @@ def test_parse_fields_uses_the_get_parsers_and_skips_null_and_unknown() -> None:
         {
             "state": STATE_JSON,
             "config": {"volume": "7"},
-            "pending_faces": ["a.jpg", "b.jpg"],
-            "events": [{"seq": 1, "ts": 10, "class": "track", "pet_id": 5, "total_score": 2.5}],
-            "cats": None,  # agent could not serialise it right now -> keep the previous value
+            "clips": None,  # agent could not serialise it right now -> keep the previous value
+            "events": [{"event_id": 12, "seq": 1, "ts": 10, "class": "visit", "open": True}],
             "future_field": {"x": 1},  # a newer agent -> ignored
         }
     )
     assert isinstance(parsed["state"], FeederState) and parsed["state"].feeding is False
     assert parsed["config"] == {"volume": 7}
-    assert parsed["pending_face_count"] == 2
-    assert isinstance(parsed["events"][0], DetectionEvent) and parsed["events"][0].pet_id == "5"
-    assert "cats" not in parsed and "future_field" not in parsed
+    assert isinstance(parsed["events"][0], DetectionEvent) and parsed["events"][0].event_id == 12
+    assert "clips" not in parsed and "future_field" not in parsed
 
 
 def _data(**overrides) -> KibbleData:
     base = dict(
         state=FeederState.from_json(STATE_JSON), schedule=object(), config={"volume": 1},
-        cloud=object(), wifi=object(), wifi_scan=(), cats=(), identify=object(),
-        review_face=object(), pending_face_count=0, clips=(), feeds=(), events=(),
-        sightings=(),
+        cloud=object(), wifi=object(), wifi_scan=(), clips=(), feeds=(), events=(),
+        identity=DeviceIdentitySummary.empty(),
     )
     base.update(overrides)
     return KibbleData(**base)
 
 
 def test_merge_frame_replaces_only_the_carried_fields() -> None:
-    before = _data(config={"volume": 1}, pending_face_count=9)
+    before = _data(config={"volume": 1})
     after = merge_frame(before, Frame(type="update", seq=1, fields={"config": {"volume": 4}}))
     assert after.config == {"volume": 4}
-    assert after.pending_face_count == 9 and after.cats is before.cats
+    assert after.clips is before.clips
     assert merge_frame(before, Frame(type="update", seq=2, fields={})) is before
 
 
@@ -166,7 +163,7 @@ async def test_consume_applies_frames_and_leaves_push_mode_on_close(monkeypatch)
     frames = [
         Frame(type="hello", seq=0, fields={}, proto=1),
         Frame(type="snapshot", seq=1, fields={"config": {"volume": 9}}),
-        Frame(type="update", seq=2, fields={"pending_faces": ["x.jpg"]}),
+        Frame(type="update", seq=2, fields={"clips": [{"name": "x.aac", "bytes": 111}]}),
     ]
     fake = _FakePush(frames, end=KibblePushClosed("agent restarted"))
 
@@ -176,7 +173,7 @@ async def test_consume_applies_frames_and_leaves_push_mode_on_close(monkeypatch)
     assert coord.push_connected is True and coord.update_interval is None
     assert coord.consecutive_failures == 0
     assert coord.published[0].config == {"volume": 9}
-    assert coord.published[1].pending_face_count == 1 and coord.published[1].config == {"volume": 9}
+    assert coord.published[1].clips[0].name == "x.aac" and coord.published[1].config == {"volume": 9}
 
 
 async def test_push_loop_falls_back_to_polling_and_refreshes_on_drop(monkeypatch) -> None:

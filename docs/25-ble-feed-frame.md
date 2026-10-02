@@ -167,16 +167,20 @@ the *same* already-working `dispatch_send_msg(0x6004, 8, payload, 67)` the LAN p
 (`main.rs::send_feed`) — no new struct-packing code on-device, and zero new risk to the proven
 feed path, since it isn't touched.
 
-`hopper`/`amount` (the HA service's vocabulary) → `(amount1, amount2)` uses the identical match
-arms as `agent/src/main.rs::feed()`, reimplemented in `frame.py::hopper_amounts` since the BLE
-path bypasses the agent entirely (there is no Rust code in the loop to do this translation for
-a BLE-delivered command):
+`hopper`/`amount`/`amount2` (the HA service's vocabulary) → `(amount1, amount2)`, implemented in
+`frame.py::hopper_amounts` since the BLE path bypasses the agent entirely (there is no Rust code
+in the loop to do this translation for a BLE-delivered command). Without an explicit `amount2`,
+matches `agent/src/main.rs::feed()`'s single-amount match arms exactly (every caller before
+`amount2` existed); given one, `hopper="both"` becomes a genuine per-hopper split -- the same
+`amount2` the daemon's own HTTP `/feed` already accepts (`librefeed/daemon/src/compat.rs::feed`),
+now threaded through the BLE fallback too so the two transports stay at parity:
 
-| `hopper` | `(amount1, amount2)` |
-|---|---|
-| `"1"` | `(amount, 0)` |
-| `"2"` | `(0, amount)` |
-| `"both"` | `(amount, amount)` |
+| `hopper` | `amount2` | `(amount1, amount2)` |
+|---|---|---|
+| `"1"` | *(ignored)* | `(amount, 0)` |
+| `"2"` | *(ignored)* | `(0, amount)` |
+| `"both"` | absent | `(amount, amount)` |
+| `"both"` | given | `(amount, amount2)` |
 
 ### Worked example
 

@@ -62,6 +62,14 @@ class KibbleCalibrationBusyError(KibbleError):
     never a malformed request."""
 
 
+class KibbleCueCooldownError(KibbleError):
+    """`POST /cue`'s per-call debounce (`speaker::SpeakerOwner::try_start_call`,
+    `speaker::CALL_COOLDOWN`) 429s a call attempted before the previous one's cooldown has
+    elapsed. Raised distinctly from `KibbleSpeakerBusyError`/`KibbleCalibrationBusyError` (both
+    409s, an unrelated resource) so a caller can say "try again in a moment" instead of a
+    generic failure."""
+
+
 class KibbleMediaError(KibbleError):
     """A local failure resolving or converting HA media *before* ever reaching the agent --
     ffmpeg couldn't be started, timed out, or produced nothing; HA's own media-source
@@ -132,6 +140,16 @@ class FeederState:
     #: `GET /state`'s `hopper_level`: the MCU's own three-way reading per hopper, 0 empty /
     #: 1 low / 2 ok, `None` until the MCU has reported one since boot.
     hopper_level: tuple[int | None, int | None]
+    #: Per-hopper "mark as full" bookkeeping (`GET /state`'s `hopper_full_at`/
+    #: `hopper_portions_since_full`/`hopper_full_to_low`, LibreFeed-only): the unix time it was
+    #: last marked full, how many portions have dispensed from it since, and the portions the
+    #: daemon has learned it takes to run from full down to the low-food sensor tripping. All
+    #: `None` per hopper until it has been marked full at least once; `hopper_full_to_low`
+    #: specifically stays `None` until the daemon has actually seen that hopper run all the way
+    #: down to low after being marked -- it is a learned number, not a configured one.
+    hopper_full_at: tuple[int | None, int | None]
+    hopper_portions_since_full: tuple[int | None, int | None]
+    hopper_full_to_low: tuple[int | None, int | None]
     #: Kibble's own bowl-fullness estimate, computed on-device from the camera by the same
     #: vendor vision model the feeder itself uses -- the vendor only runs that model while its
     #: cloud session is up (kibble docs/34), so this is the only reading that exists with the
@@ -161,6 +179,9 @@ class FeederState:
         hopper_empty = data.get("hopper_empty") or [None, None]
         hopper_level = data.get("hopper_level") or [None, None]
         local = data.get("bowl_fill_local") or [None, None]
+        full_at = data.get("hopper_full_at") or [None, None]
+        portions_since_full = data.get("hopper_portions_since_full") or [None, None]
+        full_to_low = data.get("hopper_full_to_low") or [None, None]
         local_frame = data.get("bowl_fill_local_frame_unix")
         # `kibbled_last_exit_code` is null on a first, clean start -- a real 0 means "the
         # previous run exited successfully", which is a different fact, so neither collapses
@@ -189,6 +210,18 @@ class FeederState:
             bowl_fill_local=(
                 local[0],
                 int(local_frame) if isinstance(local_frame, (int, float)) else None,
+            ),
+            hopper_full_at=(
+                full_at[0] if len(full_at) > 0 else None,
+                full_at[1] if len(full_at) > 1 else None,
+            ),
+            hopper_portions_since_full=(
+                portions_since_full[0] if len(portions_since_full) > 0 else None,
+                portions_since_full[1] if len(portions_since_full) > 1 else None,
+            ),
+            hopper_full_to_low=(
+                full_to_low[0] if len(full_to_low) > 0 else None,
+                full_to_low[1] if len(full_to_low) > 1 else None,
             ),
             event_counter=int(data.get("event_counter") or 0),
             agent_starts=int(data.get("kibbled_start_count") or 0),
@@ -400,185 +433,165 @@ class WifiState:
 
 
 @dataclass(frozen=True, slots=True)
-class CatInfo:
-    """One enrolled cat, as reported by `GET /cats` (`agent/src/faces.rs`'s `Gallery`).
+class Face:
+    """A sample's face crop and embedding, when the detector found one in that frame."""
 
-    `avatar` is the sample filename nearest that cat's running centroid -- the crop the cats
-    card shows as the cat's round avatar (`GET /faces/samples/<cat>/<avatar>`) -- `None` for a
-    pre-registered cat (`kibble.add_cat`) with zero samples yet."""
-
-    name: str
-    samples: int
-    last_seen: int | None
-    avatar: str | None
-
-    @classmethod
-    def from_json(cls, data: dict[str, Any]) -> CatInfo:
-        return cls(
-            name=str(data.get("name", "")),
-            samples=int(data.get("samples") or 0),
-            last_seen=data.get("last_seen"),
-            avatar=data.get("avatar"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class IdentifyScore:
-    """A cat/score pair -- `IdentifyResult.second_best`."""
-
-    cat: str
-    score: float
-
-    @classmethod
-    def from_json(cls, data: dict[str, Any]) -> IdentifyScore:
-        return cls(cat=str(data.get("cat", "")), score=float(data.get("score") or 0.0))
-
-
-@dataclass(frozen=True, slots=True)
-class IdentifyResult:
-    """`GET /identify`: Kibble's own frozen-embedding classifier's opinion of the newest
-    pending crop, or ground truth from the most recently labelled one once the review queue is
-    empty -- `source` distinguishes the two ("classifier" vs "labelled"). `cat` is `None` only
-    when nothing has ever been captured; once a crop exists it is a real name or the literal
-    string `"unknown"` (the classifier ran but wasn't confident)."""
-
-    cat: str | None
+    jpeg: str | None
+    emb: str | None
     score: float | None
-    second_best: IdentifyScore | None
-    crop: str | None
-    source: str | None
-    ts: int | None
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> IdentifyResult:
-        second = data.get("second_best")
+    def from_json(cls, data: dict[str, Any]) -> Face:
+        score = data.get("score")
         return cls(
-            cat=data.get("cat"),
-            score=data.get("score"),
-            second_best=IdentifyScore.from_json(second) if second else None,
-            crop=data.get("crop"),
-            source=data.get("source"),
-            ts=data.get("ts"),
+            jpeg=data.get("jpeg"),
+            emb=data.get("emb"),
+            score=float(score) if score is not None else None,
         )
 
 
 @dataclass(frozen=True, slots=True)
-class ReviewFace:
-    """`GET /faces/current/info`: metadata for whichever crop `image.*_pending_face` is
-    currently showing -- the oldest pending crop, or the most recently labelled one once the
-    queue is empty (`agent/src/faces.rs`'s `review_target`)."""
+class OtherSubjectSample:
+    """Another confirmed animal recorded in the same sampled frame."""
 
-    status: str  # "pending" | "labelled" | "none"
-    name: str | None
-    cat: str | None
+    sid: int | None
+    box: tuple[float, float, float, float] | None
+    score: float | None
+    bowl: bool | None
+    body: str | None
+    face: Face | None
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> ReviewFace:
+    def from_json(cls, data: dict[str, Any]) -> OtherSubjectSample:
+        box = data.get("box")
+        score = data.get("score")
         return cls(
-            status=str(data.get("status", "none")), name=data.get("name"), cat=data.get("cat")
+            sid=int(data["sid"]) if data.get("sid") is not None else None,
+            box=tuple(float(v) for v in box) if isinstance(box, list) and len(box) == 4 and any(box) else None,
+            score=float(score) if score is not None else None,
+            bowl=bool(data["bowl"]) if "bowl" in data else None,
+            body=data.get("body"),
+            face=Face.from_json(data["face"]) if isinstance(data.get("face"), dict) else None,
+        )
+@dataclass(frozen=True, slots=True)
+class Sample:
+    """One sampled device frame and the crops associated with its selected subject."""
+
+    k: int
+    t: int
+    box: tuple[float, float, float, float] | None
+    score: float | None
+    body: str | None
+    face: Face | None
+    sid: int | None = None
+    bowl: bool | None = None
+    others: tuple[OtherSubjectSample, ...] = ()
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> Sample:
+        box = data.get("box")
+        score = data.get("score")
+        face = data.get("face")
+        others = data.get("others")
+        return cls(
+            k=int(data.get("k") or 0),
+            t=int(data.get("t") or 0),
+            # Legacy [0, 0, 0, 0] means that the detector did not report a box.
+            box=tuple(float(v) for v in box) if isinstance(box, list) and len(box) == 4 and any(box) else None,
+            score=float(score) if score is not None else None,
+            body=data.get("body"),
+            face=Face.from_json(face) if isinstance(face, dict) else None,
+            sid=int(data["sid"]) if data.get("sid") is not None else None,
+            bowl=bool(data["bowl"]) if "bowl" in data else None,
+            others=(
+                tuple(OtherSubjectSample.from_json(item) for item in others if isinstance(item, dict))
+                if isinstance(others, list)
+                else ()
+            ),
         )
 
-
 @dataclass(frozen=True, slots=True)
-class PendingFace:
-    """One crop still awaiting a human label, as reported by `GET /faces/pending` (newest
-    last). `name` already encodes `ts` and `vendor_pet_id` (`{ts}-{petid|unknown}.jpg`) --
-    they are pulled out as their own fields here so callers never have to re-parse the
-    filename. A crop written before its `track` event lands starts as `vendor_pet_id: None`
-    (filename suffix `-unknown`) and is renamed by the agent once a matching track arrives.
-    `guess` is Kibble's own classifier's verdict for this exact crop, stored beside it at
-    capture time -- `None` if the classifier had nothing to say (e.g. no cats enrolled yet)."""
+class SubjectSummary:
+    """The feeder's per-session timing summary for one confirmed subject."""
 
-    name: str
-    ts: int
-    vendor_pet_id: str | None
-    guess: IdentifyScore | None
+    sid: int
+    first: int
+    last: int
+    eat_start: int | None
+    bowl_s: float
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> PendingFace:
-        guess = data.get("guess")
-        vendor_pet_id = data.get("vendor_pet_id")
+    def from_json(cls, data: dict[str, Any]) -> SubjectSummary:
+        eat_start = data.get("eat_start")
         return cls(
-            name=str(data.get("name", "")),
-            ts=int(data.get("ts") or 0),
-            vendor_pet_id=str(vendor_pet_id) if vendor_pet_id is not None else None,
-            guess=IdentifyScore.from_json(guess) if guess else None,
+            sid=int(data["sid"]),
+            first=int(data.get("first") or 0),
+            last=int(data.get("last") or 0),
+            eat_start=int(eat_start) if eat_start is not None else None,
+            bowl_s=float(data.get("bowl_s") or 0.0),
         )
 
-
-@dataclass(frozen=True, slots=True)
-class FaceSample:
-    """One permanently-labelled sample in a cat's gallery, as reported by `GET
-    /faces/samples/<cat>`."""
-
-    name: str
-    ts: int
-
-    @classmethod
-    def from_json(cls, data: dict[str, Any]) -> FaceSample:
-        return cls(name=str(data.get("name", "")), ts=int(data.get("ts") or 0))
-
-
-@dataclass(frozen=True, slots=True)
-class ClipInfo:
-    """One stored audio clip, as reported by `GET /clips` (`agent/src/clips.rs`'s own
-    `ClipInfo`) -- already normalized and AAC-encoded on the agent side; `bytes` is the
-    encoded size, not the original PCM's."""
-
-    name: str
-    bytes: int
-
-    @classmethod
-    def from_json(cls, data: dict[str, Any]) -> ClipInfo:
-        return cls(name=str(data.get("name", "")), bytes=int(data.get("bytes") or 0))
-
-
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "sid": self.sid, "first": self.first, "last": self.last,
+            "eat_start": self.eat_start, "bowl_s": self.bowl_s,
+        }
 @dataclass(frozen=True, slots=True)
 class DetectionEvent:
-    """One onboard-AI detection, as reported by `GET /events` (`agent/src/ai.rs`).
+    """One visit or eat track, as reported by `GET /events` (docs/36-ai-pipeline.md's device
+    contract -- `librefeedd`'s own tracker). Newest first, at most 256 rows, open tracks
+    included. A legacy journal row predating this shape is served in the same shape: `samples`
+    holds one entry built from the legacy face crop/embedding when both exist, else is empty,
+    and `scene` carries the legacy scene/image name -- its assets keep their legacy names.
 
-    `cls` is `visit` (a pet in frame), `eat` (feeding), `face` (a usable face crop) -- each
-    with an `image` filename for `GET /events/<name>` -- or `track`: the vendor's own on-device
-    identification, read from the feeder's shared config block. A `track` carries `pet_id`
-    (the vendor's cloud pet id, as a string), `ts` = the vendor's own visit start time, and
-    `total_score` (the vendor's own per-visit number: the sum of per-frame identification
-    confidence over the tracked visit -- bigger means longer/steadier, not more probable).
+    Identity (`cat`, review, evidence) is no longer carried on the wire at all: HA's own
+    identity engine and event journal (`store.py`) are the system of record for that now."""
 
-    `score` is honestly `None` on every class: the vendor never computes a similarity this
-    pipeline can observe, and no bounding box exists anywhere in its chain."""
-
+    event_id: int
     seq: int
     ts: int
-    cls: str
+    end: int | None
+    open: bool
+    kind: str  # "visit" | "eat"
+    eat_start: int | None
+    scene: str | None
+    samples: tuple[Sample, ...]
     image: str | None
-    cat: str | None
-    score: float | None
-    pet_id: str | None
-    total_score: float | None
-    #: LibreFeed attaches a dish photo from the start and the end of an `eat`, so the card can
-    #: show how much of the bowl actually went. The vendor stack never produced these, which is
-    #: why they were missing here: the daemon sent them on every eat row and this parser
-    #: dropped them, so a meal was recorded (2026-09-20 01:51, Kitty) with both photos on disk
-    #: and nothing to show. Optional, because a `track`/`face` row has no pair and an eat whose
-    #: pair was never captured sends `null`.
-    image_before: str | None = None
-    image_after: str | None = None
+    image_before: str | None
+    image_after: str | None
+    scene_k: int | None = None
+    subjects: tuple[SubjectSummary, ...] | None = None
 
     @classmethod
-    def from_json(cls_, data: dict[str, Any]) -> DetectionEvent:
-        score = data.get("score")
-        total_score = data.get("total_score")
-        return cls_(
+    def from_json(cls, data: dict[str, Any]) -> DetectionEvent:
+        end = data.get("end")
+        eat_start = data.get("eat_start")
+        samples = data.get("samples")
+        scene_k = data.get("scene_k")
+        subjects = data.get("subjects")
+        return cls(
+            event_id=int(data.get("event_id") or 0),
             seq=int(data.get("seq") or 0),
             ts=int(data.get("ts") or 0),
-            cls=str(data.get("class", "")),
-            image=data.get("image") or None,
-            cat=data.get("cat") or None,
-            score=float(score) if score is not None else None,
-            pet_id=str(data["pet_id"]) if data.get("pet_id") is not None else None,
-            total_score=float(total_score) if total_score is not None else None,
-            image_before=data.get("image_before") or None,
-            image_after=data.get("image_after") or None,
+            end=int(end) if end is not None else None,
+            open=bool(data.get("open")),
+            kind=str(data.get("class", "")),
+            eat_start=int(eat_start) if eat_start is not None else None,
+            scene=data.get("scene"),
+            samples=(
+                tuple(Sample.from_json(s) for s in samples)
+                if isinstance(samples, list)
+                else ()
+            ),
+            image=data.get("image"),
+            image_before=data.get("image_before"),
+            image_after=data.get("image_after"),
+            scene_k=int(scene_k) if scene_k is not None else None,
+            subjects=(
+                tuple(SubjectSummary.from_json(item) for item in subjects if isinstance(item, dict))
+                if isinstance(subjects, list)
+                else None
+            ),
         )
 
 
@@ -618,6 +631,64 @@ class FeedRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SpoolStats:
+    """`GET /spool`: the feeder's bounded transient evidence store (docs/36-ai-pipeline.md) --
+    `used_bytes` against `cap_bytes` (8 MiB), `files` currently held, `evicted_total` since
+    boot, and `opt_free_bytes`, the free-space floor the daemon refuses to write below."""
+
+    used_bytes: int
+    cap_bytes: int
+    files: int
+    evicted_total: int
+    opt_free_bytes: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> SpoolStats:
+        return cls(
+            used_bytes=int(data.get("used_bytes") or 0),
+            cap_bytes=int(data.get("cap_bytes") or 0),
+            files=int(data.get("files") or 0),
+            evicted_total=int(data.get("evicted_total") or 0),
+            opt_free_bytes=int(data.get("opt_free_bytes") or 0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ClipInfo:
+    """One stored audio clip, as reported by `GET /clips` (`agent/src/clips.rs`'s own
+    `ClipInfo`) -- already normalized and AAC-encoded on the agent side; `bytes` is the
+    encoded size, not the original PCM's."""
+
+    name: str
+    bytes: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ClipInfo:
+        return cls(name=str(data.get("name", "")), bytes=int(data.get("bytes") or 0))
+
+
+#: One daemon detection-area rectangle set: a list of `[x1, y1, x2, y2]` normalized boxes.
+VisionAreaMatrix = list[list[float]]
+
+
+@dataclass(frozen=True, slots=True)
+class VisionAreas:
+    """The daemon's normalized ignore-mask rectangles, as reported by `GET /vision/areas`
+    (LibreFeed-only route -- the vendor stack has no such concept). There is no "include"
+    counterpart: a fixed one-bowl camera has nothing useful to positively scope, and the
+    daemon's old `body_include_rois` silently dropped any detection outside it with no
+    surfaced feedback -- removed end to end (daemon, this client, the card) rather than kept
+    unused. See `kibble-card`'s `kibble-detection-areas-dialog.ts` header for the full
+    rationale."""
+
+    exclude: VisionAreaMatrix
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> VisionAreas:
+        return cls(exclude=data.get("exclude") or [])
+
+
 class KibbleClient:
     """Talks to one feeder."""
 
@@ -637,6 +708,7 @@ class KibbleClient:
         not_found_is_missing: bool = False,
         nullable: bool = False,
         busy_error: type[KibbleError] = KibbleSpeakerBusyError,
+        busy_status: int = 409,
     ) -> Any:
         """`payload` is sent as a JSON body; `data`, if given instead, is sent raw -- `/speak`
         and `PUT /clips/<name>` both take raw signed-16-bit-LE/mono/16kHz PCM with no envelope
@@ -695,7 +767,7 @@ class KibbleClient:
                         # default, or -- via `busy_error` -- `/calibration`'s "an animal is
                         # over the bowl right now" refusal. Distinct from every other rejected
                         # write so a caller can tell "busy, retry" from "malformed request".
-                        if resp.status == 409:
+                        if resp.status == busy_status:
                             raise busy_error(str(detail))
                         raise KibbleError(str(detail))
                     # `GET /wifi/scan` returns a bare JSON array, every other endpoint an
@@ -744,10 +816,17 @@ class KibbleClient:
         """Write one writable setting. The agent 400s for any key that isn't writable."""
         return await self._request("POST", "/config", {"key": key, "value": value})
 
-    async def feed(self, hopper: str, amount: int, feed_id: str | None = None) -> dict:
+    async def feed(
+        self, hopper: str, amount: int, feed_id: str | None = None, amount2: int | None = None
+    ) -> dict:
         payload: dict[str, Any] = {"hopper": hopper, "amount": amount}
         if feed_id:
             payload["id"] = feed_id
+        # Omitted (not sent as 0 or duplicated) when absent -- the agent/daemon already
+        # defaults amount2 to amount itself (compat.rs::feed), so leaving the key out keeps
+        # every pre-existing caller's behaviour identical to before this field existed.
+        if amount2 is not None:
+            payload["amount2"] = amount2
         return await self._request("POST", "/feed", payload)
 
     async def cancel_feed(self) -> dict:
@@ -851,6 +930,17 @@ class KibbleClient:
             "POST", "/beep", {"count": count, "on_ms": on_ms, "off_ms": off_ms}
         )
 
+
+    async def call_cats(self) -> dict:
+        """`POST /cue`: plays the fixed feed cue through the feeder's speaker on demand
+        (LibreFeed-only -- absent from kibbled's own route table, same footing as `/beep`). Does
+        not dispense food. 429s with `{"ok":false,"error":"cooldown","retry_after_ms":n}` while
+        the previous call's `speaker::CALL_COOLDOWN` is still running -- raised as
+        `KibbleCueCooldownError`, not the default `KibbleSpeakerBusyError`, since this has
+        nothing to do with the speaker's own owner-lock arbitration. A 404 here means the vendor
+        stack is running; like `beep`, this write is not passed `not_found_is_missing` -- a 404
+        on a write is a real failure, not an optional read to fall back on."""
+        return await self._request("POST", "/cue", {}, busy_error=KibbleCueCooldownError, busy_status=429)
     async def desiccant(self) -> DesiccantState:
         return DesiccantState.from_json(
             await self._request("GET", "/desiccant", not_found_is_missing=True)
@@ -907,111 +997,26 @@ class KibbleClient:
         one currently providing connectivity."""
         return WifiState.from_json(await self._request("POST", "/wifi/forget", {"ssid": ssid}))
 
-    async def cats(self) -> list[CatInfo]:
-        return [CatInfo.from_json(c) for c in await self._request("GET", "/cats", not_found_is_missing=True)]
+    async def mark_hopper_full(self, hopper: str) -> dict:
+        """`POST /hopper/full`: tells the daemon this hopper was just physically refilled to
+        capacity, resetting `hopper_full_at`/`hopper_portions_since_full` to start counting
+        from now (LibreFeed-only, same footing as `/beep`/`/desiccant`: a 404 here is a real
+        failure, not an optional read to fall back on). `hopper` is `"1"`/`"2"`/`"both"`."""
+        return await self._request("POST", "/hopper/full", {"hopper": hopper})
 
-    async def pending_faces(self) -> list[PendingFace]:
-        """Every crop still awaiting a human label (`GET /faces/pending`), newest last. Backs
-        both the diagnostic pending-count sensor (via `len()`) and `kibble/faces/pending`."""
-        return [
-            PendingFace.from_json(p)
-            for p in await self._request("GET", "/faces/pending", not_found_is_missing=True)
-        ]
-
-    async def faces_samples(self, cat: str) -> list[FaceSample]:
-        """Every permanently-labelled sample in `cat`'s gallery (`GET /faces/samples/<cat>`),
-        backing `kibble/faces/samples`."""
-        body = await self._request("GET", f"/faces/samples/{quote(cat, safe='')}")
-        return [FaceSample.from_json(s) for s in body]
-
-    async def add_cat(self, name: str) -> None:
-        """Pre-register a cat with zero samples, so it appears in the label select's options
-        before its first crop is ever labelled. The agent 400s for a reserved bucket name."""
-        await self._request("POST", "/cats", {"name": name})
-
-    async def delete_cat(self, name: str) -> dict:
-        """`DELETE /cats/<name>`: removes the cat, every one of its labelled samples (and
-        their `.emb` sidecars), and its trained classifier model outright. An unknown cat
-        404s -- see `_request`'s `not_found_is_missing`."""
-        return await self._request(
-            "DELETE", f"/cats/{quote(name, safe='')}", not_found_is_missing=True
-        )
-
-    async def identify(self) -> IdentifyResult:
-        return IdentifyResult.from_json(await self._request("GET", "/identify", not_found_is_missing=True))
-
-    async def review_face(self) -> ReviewFace:
-        return ReviewFace.from_json(
-            await self._request("GET", "/faces/current/info", not_found_is_missing=True)
-        )
-
-    async def label_face(self, crop_id: str, cat: str) -> None:
-        """Moves a pending crop into `cat`'s permanent storage and feeds its embedding into
-        that cat's running centroid (`agent/src/main.rs`'s `faces_label_post`). `crop_id` naming
-        a crop that is no longer pending (already labelled by a race, evicted, a stale/double-
-        submitted UI reference) is a real, if infrequent, 404 from the agent -- `not_found_is_
-        missing` surfaces that as `KibbleNotFoundError` carrying the agent's own message ("no
-        such pending face crop") instead of the default "not supported by this agent version"
-        `KibbleError`, which used to make a stale crop id read exactly like the agent lacking
-        this route entirely."""
-        await self._request(
-            "POST", "/faces/label", {"name": crop_id, "cat": cat}, not_found_is_missing=True
-        )
-
-    async def unlabel_face(self, crop_id: str, cat: str) -> None:
-        """The exact inverse of `label_face` -- moves a labelled crop back to pending and
-        corrects the centroid. A full re-label is this followed by another `label_face`. Same
-        `not_found_is_missing` reasoning as `label_face`: a `crop_id`/`cat` pair that is no
-        longer labelled is a real 404, not evidence the route is unsupported."""
-        await self._request(
-            "POST", "/faces/unlabel", {"name": crop_id, "cat": cat}, not_found_is_missing=True
-        )
-
-    async def upload_face_sample(self, cat: str, jpeg: bytes) -> dict:
-        """`POST /faces/upload?cat=<cat>`: `jpeg` is raw bytes the browser has already
-        cropped to exactly 224x224 (`kibble-card`'s crop dialog) -- forwarded as-is, the same
-        raw-body shape `speak`/`save_clip` already use. `cat` must already exist; 404s like
-        `delete_cat`. Returns the agent's `{"name", "samples", "low_quality"?}` unchanged."""
-        return await self._request(
-            "POST",
-            f"/faces/upload?cat={quote(cat, safe='')}",
-            data=jpeg,
-            not_found_is_missing=True,
-        )
-
-    async def delete_face_sample(self, cat: str, name: str) -> dict:
-        """`DELETE /faces/samples/<cat>/<name>`: removes one already-labelled sample outright
-        -- the counterpart to `unlabel_face` for a sample with no pending-queue entry to move
-        back to (an uploaded photo never went through the pending review queue)."""
-        return await self._request(
-            "DELETE",
-            f"/faces/samples/{quote(cat, safe='')}/{quote(name, safe='')}",
-            not_found_is_missing=True,
-        )
-
-    async def event_bytes(self, name: str) -> bytes:
-        """`GET /events/<name>`: one detection crop's raw JPEG bytes -- the timeline's image
-        for every class (`visit`/`eat`/`face`), via the HTTP view's `kind="event"`."""
+    async def spool_stats(self) -> SpoolStats:
+        """`GET /spool`: the feeder's bounded transient evidence store's current usage."""
+        return SpoolStats.from_json(await self._request("GET", "/spool", not_found_is_missing=True))
+    async def asset_bytes(self, name: str) -> bytes:
+        """Fetch one evidence asset -- a body/face crop, `.emb` sidecar, scene frame, or
+        before/after frame -- from the feeder's bounded spool (`GET /events/<name>`)."""
         return await self._get_bytes(f"/events/{quote(name, safe='')}")
 
-    async def pending_bytes(self, name: str) -> bytes:
-        """`GET /faces/pending/<name>`: one pending crop's raw JPEG bytes, via the HTTP view's
-        `kind="pending"`."""
-        return await self._get_bytes(f"/faces/pending/{quote(name, safe='')}")
-
-    async def sample_bytes(self, cat: str, name: str) -> bytes:
-        """`GET /faces/samples/<cat>/<name>`: one permanently-labelled sample's raw JPEG
-        bytes, via the HTTP view's `kind="sample/<cat>"`."""
-        return await self._get_bytes(
-            f"/faces/samples/{quote(cat, safe='')}/{quote(name, safe='')}"
-        )
-
-    async def track_image_bytes(self, ts: int) -> bytes:
-        """`GET /events/track/<ts>/image`: the JPEG of whichever `eat` (preferred) or `visit`
-        event the agent judges paired with the `track` at `ts` -- the live image of the
-        identified cat at the bowl, as opposed to a stored/trained sample. Raises
-        `KibbleNotFoundError` when nothing qualifies, via the HTTP view's `kind="track"`."""
-        return await self._get_bytes(f"/events/track/{ts}/image")
+    async def delete_asset(self, name: str) -> None:
+        """Acknowledge that HA has durably archived this asset (`DELETE /events/<name>`); the
+        agent removes it from the spool. A 404 here means it is already gone (already
+        acknowledged, or evicted under spool pressure before HA got to it) -- not an error."""
+        await self._request("DELETE", f"/events/{quote(name, safe='')}", not_found_is_missing=True)
 
     async def feed_bytes(self, name: str) -> bytes:
         """`GET /feeds/<name>`: one dish-snapshot's raw bytes. LibreFeed's own
@@ -1031,8 +1036,8 @@ class KibbleClient:
         return [FeedRecord.from_json(f) for f in await self._request("GET", "/feeds", not_found_is_missing=True)]
 
     async def events(self) -> list[DetectionEvent]:
-        """`GET /events`: the agent's last 50 detections, oldest first. Rehydrated from disk on
-        agent startup, so this survives a `kibbled` restart."""
+        """`GET /events`: newest first, at most 256 rows, open tracks included. Rehydrated
+        from disk on agent startup, so this survives a `librefeedd` restart."""
         return [
             DetectionEvent.from_json(e)
             for e in await self._request("GET", "/events", not_found_is_missing=True)
@@ -1072,6 +1077,32 @@ class KibbleClient:
         through the coordinator (see that module's docstring), folds the resulting
         `KibbleNotFoundError` into the same `{"frame": None}` reply as a genuine empty frame."""
         return await self._request("GET", "/vision/last", not_found_is_missing=True, nullable=True)
+
+    async def vision_areas(self) -> VisionAreas:
+        """GET /vision/areas: the daemon's ignore-mask detection rectangles."""
+        return VisionAreas.from_json(await self._request("GET", "/vision/areas"))
+
+    async def set_vision_areas(self, exclude: VisionAreaMatrix) -> VisionAreas:
+        """Replace the ignore-mask set through POST /vision/areas."""
+        return VisionAreas.from_json(await self._request("POST", "/vision/areas", {"exclude": exclude}))
+
+    async def vision_bowl_roi(self) -> list[float]:
+        """The daemon's `bowl_roi` -- a single `[x1,y1,x2,y2]` zone (separate from
+        `VisionAreas`) that gates eat detection and food-occlusion, read from the full
+        `GET /vision` config (`bowl_roi` has no dedicated route of its own; unlike
+        `body_include_rois`/`body_exclusion_rois` it was never routed through
+        `/vision/areas`). Falls back to `[]` for an agent old enough to predate the field --
+        the card treats an empty/malformed value as "use the daemon's own default"."""
+        body = await self._request("GET", "/vision")
+        roi = body.get("bowl_roi")
+        return [float(v) for v in roi] if isinstance(roi, list) else []
+
+    async def set_vision_bowl_roi(self, bowl_roi: list[float]) -> list[float]:
+        """Sets just `bowl_roi` through `POST /vision`'s merge-not-replace contract (every
+        other vision.json field -- `pet_detection`, `eat_hold_s`, and so on -- is left as-is)."""
+        body = await self._request("POST", "/vision", {"bowl_roi": bowl_roi})
+        roi = body.get("bowl_roi")
+        return [float(v) for v in roi] if isinstance(roi, list) else bowl_roi
 
     async def calibration(self) -> dict:
         """`GET /calibration`: both hoppers' bowl-fill calibration curves (LibreFeed-only --

@@ -36,6 +36,7 @@ from homeassistant.components.switch import SwitchEntity, SwitchEntityDescriptio
 from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .api import KibbleError
 from .coordinator import KibbleConfigEntry
@@ -198,7 +199,95 @@ async def async_setup_entry(
     ]
     if applies_to(Platform.SWITCH, "cloud", stack):
         entities.append(KibbleCloudSwitch(coordinator))
+    entities.append(KibbleHopperDividerSwitch(coordinator))
+    entities.append(KibbleAutoLearnSwitch(coordinator))
     async_add_entities(entities)
+
+
+class KibbleHopperDividerSwitch(KibbleEntity, SwitchEntity, RestoreEntity):
+    """Whether the hopper's removable divider is fitted. On: two compartments (the default,
+    matching the feeder as shipped). Off: one shared bin -- the coordinator then feeds "both"
+    through dispenser 1 alone, writes schedule-card amounts to that side only, converts the
+    existing schedule to match, and the timeline stops naming a hopper
+    (`KibbleCoordinator.async_set_single_hopper`).
+
+    Nothing on the feeder can sense the divider, so this is a remembered choice: restored across
+    restarts, never unavailable while the entity exists. Restoring it never rewrites the
+    schedule -- only an actual change does."""
+
+    _attr_translation_key = "hopper_divider"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "hopper_divider")
+        self._attr_is_on = True  # only the restore default; `is_on` reads the coordinator
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state in ("on", "off"):
+            self._attr_is_on = last.state == "on"
+        self.coordinator.single_hopper = not self._attr_is_on
+
+    @property
+    def is_on(self) -> bool:
+        return not self.coordinator.single_hopper
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_single_hopper(False)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_single_hopper(True)
+        self.async_write_ha_state()
+
+
+class KibbleAutoLearnSwitch(KibbleEntity, SwitchEntity, RestoreEntity):
+    """Whether `ingest.py`'s auto-learn may add new training samples on its own. Off: the
+    identity engine keeps classifying every visit exactly as before, and a human label or an
+    uploaded photo still trains immediately -- this only gates samples nobody reviewed.
+
+    Local-only, no feeder round trip, restored across restarts -- same pattern as
+    `KibbleHopperDividerSwitch` above (`coordinator.auto_learn_enabled` is the single source of
+    truth; `is_on` reads it, restoring only seeds it once at startup).
+
+    `EntityCategory.CONFIG` without `entity_registry_enabled_default=False`: every other config
+    entity in this integration disables itself by default (kibble docs' "house rule 4"), but
+    this one is explicitly requested visible -- the user wants it in Settings from the start,
+    not opted into."""
+
+    _attr_translation_key = "auto_learn"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "auto_learn")
+        self._attr_is_on = True  # only the restore default; `is_on` reads the coordinator
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state in ("on", "off"):
+            self._attr_is_on = last.state == "on"
+        self.coordinator.auto_learn_enabled = self._attr_is_on
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.auto_learn_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_auto_learn_enabled(True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_auto_learn_enabled(False)
+        self.async_write_ha_state()
 
 
 class KibbleSettingSwitch(KibbleEntity, SwitchEntity):

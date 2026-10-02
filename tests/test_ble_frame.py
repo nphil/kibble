@@ -120,9 +120,28 @@ def test_decoder_rejects_missing_payload_field() -> None:
 def test_hopper_amounts_matches_agent_translation(
     hopper: str, expected: tuple[int, int]
 ) -> None:
-    """Must match `agent/src/main.rs::feed()`'s match arms exactly: the BLE path bypasses the
-    agent, so this is the only place that translation happens for a BLE-delivered command."""
+    """With no explicit `amount2`, matches `agent/src/main.rs::feed()`'s match arms exactly --
+    the single-amount vendor agent's own behaviour, and every caller before `amount2` existed."""
     assert frame.hopper_amounts(hopper, 7) == expected
+    assert frame.hopper_amounts(hopper, 7, None) == expected
+
+
+def test_hopper_amounts_both_with_explicit_amount2_returns_the_real_split() -> None:
+    """A genuine split feed needs its own amount2 -- the wire struct this frame carries
+    already has two independent one-byte fields (`_FEED_STRUCT`), so this must not collapse
+    back to duplicating `amount` once a real amount2 is given, matching `compat.rs::feed`'s
+    own HTTP-side handling of the same field."""
+    assert frame.hopper_amounts("both", 5, 3) == (5, 3)
+    assert frame.hopper_amounts("both", 1, 20) == (1, 20)
+
+
+@pytest.mark.parametrize(("hopper", "expected"), [("1", (5, 0)), ("2", (0, 5))])
+def test_hopper_amounts_ignores_amount2_for_a_single_hopper(
+    hopper: str, expected: tuple[int, int]
+) -> None:
+    """Only `hopper="both"` has two sides to split -- a stray amount2 alongside a single-hopper
+    request must never partially apply to the one side actually being fed."""
+    assert frame.hopper_amounts(hopper, 5, 9) == expected
 
 
 def test_hopper_amounts_rejects_unknown_hopper() -> None:

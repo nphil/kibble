@@ -22,6 +22,13 @@ feed:
           max: 20
           step: 1
           mode: box
+    amount2:
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
     id:
       selector:
         text:
@@ -220,86 +227,6 @@ wifi_connect:
         text:
           type: password
 
-label_face:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-    crop_id:
-      required: true
-      selector:
-        text:
-    cat:
-      required: true
-      selector:
-        text:
-
-unlabel_face:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-    cat:
-      required: true
-      selector:
-        text:
-    name:
-      required: true
-      selector:
-        text:
-
-upload_face_sample:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-    cat:
-      required: true
-      selector:
-        text:
-    jpeg_b64:
-      required: true
-      selector:
-        text:
-
-add_cat:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-    name:
-      required: true
-      selector:
-        text:
-
-delete_cat:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-    name:
-      required: true
-      selector:
-        text:
-
-identify:
-  fields:
-    device_id:
-      required: false
-      selector:
-        device:
-          integration: kibble
-
 save_clip:
   fields:
     device_id:
@@ -381,6 +308,14 @@ beep:
           step: 1
           mode: box
 
+call_cats:
+  fields:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: kibble
+
 set_desiccant:
   fields:
     device_id:
@@ -402,3 +337,19 @@ set_desiccant:
           max: 365
           step: 1
           mode: box
+
+clear_training:
+  fields:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: kibble
+    cat:
+      required: true
+      selector:
+        text:
+    keep_uploads:
+      default: false
+      selector:
+        boolean:

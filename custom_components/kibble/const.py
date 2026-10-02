@@ -23,31 +23,44 @@ CONF_BLE_ADDRESS = "ble_address"
 # _require_schedule_writes_enabled`. Default off; a wrong table could dispense at the wrong
 # time or amount.
 CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
-# The vendor's on-device identifier resolves a face to the *cloud* pet id it was enrolled under
-# (`petId` in the feeder's `/opt/pet_name_color.json`); the name only ever lived in Petkit's
-# cloud. This option is the operator's own `id=name` list, e.g. `101320712=Kitty`, so a vendor
-# `track` event can drive that cat's presence. Ids not listed are still surfaced raw, never
-# guessed into a name.
-CONF_VENDOR_PET_IDS = "vendor_pet_ids"
-
-
-def parse_vendor_pet_ids(raw: str) -> dict[str, str]:
-    """`"101320712=Kitty, 5=Pancake"` -> `{"101320712": "Kitty", "5": "Pancake"}`.
-
-    Ids are kept as strings because that is how `DetectionEvent.pet_id` carries them. Raises
-    `ValueError` on any entry that is not `<digits>=<non-empty name>`; blank entries (a
-    trailing comma) are ignored."""
-    mapping: dict[str, str] = {}
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        pet_id, sep, name = entry.partition("=")
-        pet_id, name = pet_id.strip(), name.strip()
-        if not sep or not pet_id.isdigit() or not name:
-            raise ValueError(entry)
-        mapping[pet_id] = name
-    return mapping
+# Retention now lives entirely in HA storage (docs/36-ai-pipeline.md) -- the feeder keeps no
+# event/feed history of its own past its bounded transient spool. These are the only
+# selectable policies; the options flow rejects anything else.
+CONF_RETENTION_DAYS = "retention_days"
+RETENTION_OPTIONS = (7, 14, 30, 90)
+DEFAULT_RETENTION_DAYS = 14
+# Scrypted's own HTTP origin (e.g. "http://192.168.1.69:11080") for the eating-clips feature
+# (docs/39-eating-clips.md): empty = off entirely, no lookups, no retries, no clip ever shown
+# on the timeline -- the feeder's own photos are the whole experience until this is set. Not
+# validated against Scrypted itself (unlike `CONF_HOST` at initial setup): this is filled in
+# well after the entry already works, and a wrong value should degrade to "no clips", not
+# block saving every other option on this same form.
+CONF_SCRYPTED_CLIPS_URL = "scrypted_clips_url"
+# The judge model's own HTTP endpoint base (an OpenAI-compatible `/v1`, e.g. llama-swap's
+# `http://192.168.1.69:9292/v1` -- docs/40-vision-judge.md). Empty (the default) turns the
+# whole second-opinion-judge feature off: no requests, no description-filling, no verdict ever
+# recorded. Not validated against the endpoint itself at save time (unlike `CONF_HOST` at
+# initial setup) -- this is filled in well after the entry already works, and a wrong value
+# should degrade to "no verdicts", not block saving every other option on this form.
+CONF_VISION_JUDGE_URL = "vision_judge_url"
+# The model alias llama-swap should route judge requests to. `qwen3-vl-4b` is the bake-off's
+# own chosen persistent llama-swap model id; a development install that hasn't created it yet
+# can point this at a stand-in already resident on the same server (e.g. "gemma4-e4b").
+CONF_VISION_JUDGE_MODEL = "vision_judge_model"
+DEFAULT_VISION_JUDGE_MODEL = "qwen3-vl-4b"
+# CoralHub's own HTTP base URL, e.g. "http://192.168.1.69:8720" (docs/41-coral-recognition.md).
+# Empty (the default) turns the whole Coral-backed recognizer off: no embed/health requests,
+# no backfill, the histogram recognizer (`identity.py`) runs exactly as it always has -- same
+# "empty means off" shape as `CONF_VISION_JUDGE_URL`/`CONF_SCRYPTED_CLIPS_URL`. Not validated
+# against the endpoint itself at save time, also same as those two: this is filled in well
+# after the entry already works, and a wrong value should degrade to "still using the
+# histogram recognizer", never block saving every other option on this form.
+CONF_CORALHUB_URL = "coralhub_url"
+# The named bearer token CoralHub issued for this integration ("Kibble" on its own Settings
+# page). Sent as `Authorization: Bearer <token>` on every request; blank when CoralHub has no
+# token configured (an open-on-the-LAN server, `app.security.require_token`'s own "no tokens
+# configured, no gate" contract) or when Coral is entirely unconfigured.
+CONF_CORALHUB_TOKEN = "coralhub_token"
 
 
 DEFAULT_PORT = 8765
@@ -71,6 +84,12 @@ SERVICE_CANCEL_FEED = "cancel_feed"
 
 ATTR_HOPPER = "hopper"
 ATTR_AMOUNT = "amount"
+# Optional second amount for a `hopper="both"` feed: hopper 1 gets `amount`, hopper 2 gets
+# `amount2` (defaults to `amount` when omitted, keeping every pre-existing caller -- schedules,
+# automations, the feed buttons -- dispensing the same on both sides exactly as before). The
+# daemon itself already honours this (`librefeed/daemon/src/compat.rs::feed`); this plumbs it
+# through the service, the coordinator and the BLE fallback frame (`frame.py::hopper_amounts`).
+ATTR_AMOUNT2 = "amount2"
 ATTR_FEED_ID = "id"
 
 HOPPER_1 = "1"
@@ -115,37 +134,17 @@ MAX_SCHEDULE_ENTRIES = 24
 # unit into one dispense cycle.
 MIN_AMOUNT = 1
 MAX_AMOUNT = 20
+# The two per-hopper feed-amount controls (`number.py`'s `feed_amount_hopper_1`/`_2`) allow 0,
+# meaning "nothing from this hopper" -- kibble-card.ts's dual-mode hero sets both directly, one
+# row per hopper, and a 0 there means the hopper is left out of the `kibble.feed` call entirely
+# (see `dual-feed.ts`), never sent to the device as a 0-portion dispense. The combined
+# `feed_amount` control (hopper="both", single-hopper mode's only control) keeps MIN_AMOUNT as
+# its own floor -- it always means "dispense something".
+MIN_HOPPER_AMOUNT = 0
 
 SERVICE_WIFI_CONNECT = "wifi_connect"
 ATTR_SSID = "ssid"
 ATTR_PASSWORD = "password"
-
-SERVICE_LABEL_FACE = "label_face"
-SERVICE_UNLABEL_FACE = "unlabel_face"
-SERVICE_UPLOAD_FACE_SAMPLE = "upload_face_sample"
-SERVICE_ADD_CAT = "add_cat"
-SERVICE_DELETE_CAT = "delete_cat"
-SERVICE_IDENTIFY = "identify"
-
-ATTR_CROP_ID = "crop_id"
-ATTR_CAT = "cat"
-ATTR_CAT_NAME = "name"
-# `kibble.unlabel_face`'s own wire field for the crop filename -- DESIGN.md's contract spells
-# it `{cat, name}`, not `{crop_id, cat}` like `label_face`; same identifier, different name
-# because that's what the two services' documented shapes each already commit to.
-ATTR_CROP_NAME = "name"
-# The raw bytes for `upload_face_sample`/`kibble/faces/upload` cross the wire as base64 (WS
-# messages and service calls are both JSON) -- this is that field's name on both.
-ATTR_JPEG_B64 = "jpeg_b64"
-
-# The two reserved `cat` bucket values `agent/src/faces.rs` treats specially: moved and
-# embedded like any real cat, but never counted as one (excluded from `GET /cats` and the
-# classifier). Display strings are what `select.cat_feeder_label_face` shows in the picker;
-# the bucket values are the wire values `POST /faces/label` actually receives.
-CAT_LABEL_SKIP = "Skip"
-CAT_LABEL_NOT_A_CAT = "Not a cat"
-CAT_BUCKET_SKIP = "other"
-CAT_BUCKET_NOT_A_CAT = "not_a_cat"
 
 SERVICE_SAVE_CLIP = "save_clip"
 SERVICE_RECORD_CLIP = "record_clip"
@@ -190,6 +189,8 @@ MIN_BEEP_OFF_MS = 0
 MAX_BEEP_OFF_MS = 2000
 DEFAULT_BEEP_OFF_MS = 100
 
+SERVICE_CALL_CATS = "call_cats"
+
 SERVICE_SET_DESICCANT = "set_desiccant"
 
 ATTR_DAYS_LEFT = "days_left"
@@ -225,3 +226,12 @@ MAX_DETECT_INTERVAL_S = 300
 # throttle, not a feed-skip threshold.
 MIN_SURPLUS_STANDARD = 0
 MAX_SURPLUS_STANDARD = 100
+
+# `text.py`'s `KibbleHopperFoodText`: a local, never-written-to-the-feeder label for what is
+# loaded in one hopper. Meaningful only with the divider fitted (docs/37-hopper-full.md);
+# empty means unnamed. Not a device-confirmed limit, just a sane cap for a dashboard label.
+MAX_HOPPER_FOOD_LENGTH = 24
+
+SERVICE_CLEAR_TRAINING = "clear_training"
+ATTR_CAT = "cat"
+ATTR_KEEP_UPLOADS = "keep_uploads"

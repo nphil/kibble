@@ -1,76 +1,62 @@
 """Local-push companion for the dashboard cards: WebSocket commands over HA's own
 `websocket_api`, distinct from `push.py`'s channel to the agent.
 
-`kibble/timeline`, `kibble/cats`, and `kibble/calibration` read straight off the coordinator's
-already-polled/pushed `KibbleData` -- no extra agent round trip. `kibble/faces/pending` and
-`kibble/faces/samples` call the agent on demand instead: pending-crop detail and a cat's full
-sample list are exactly the "training" job's data, looked at rarely and in bulk, not worth
-carrying in every poll cycle just so a WS read never has to await one. `kibble/vision/last` is
-on demand for the opposite reason: an open card polls it roughly once a second for its live
-detection overlay, far more often than a poll cycle, not less. Every command takes `entry_id`;
-`_resolve_coordinator` is the one place that turns a bad one into the right WS error instead of
-four copies of the same lookup.
+`kibble/timeline`, `kibble/event`, `kibble/review`, `kibble/cats` and `kibble/training` all read
+straight off `coordinator.store` (SQLite, `store.py`) -- the HA-side event journal and identity
+engine that is now the system of record, per docs/36-ai-pipeline.md. None of them touch the
+feeder. `kibble/cats` is the one exception that also makes a live, on-demand call
+(`client.spool_stats()`) for `Storage.device_spool`, the same "not worth carrying in every poll
+cycle" reasoning `kibble/vision/last` below already uses.
 
-`kibble/cats/delete`, `kibble/faces/upload`, `kibble/faces/delete_sample`, and
-`kibble/calibration/action` are the mutations here: each forwards straight to a
-`KibbleCoordinator.async_*` write (which already refreshes on completion -- see
-`coordinator.py`'s face-store-write comment, and `async_calibration_action`'s own note on why
-it refreshes the same immediate way) and returns the agent's own JSON result unwrapped.
-`_send_agent_error` is their shared failure mapping. The calibration wizard never dispenses
-food through either command -- see `api.py`'s `calibration_action` docstring; a step here only
-ever reads or bookkeeps a vision score the operator's own separate feed action already put in
-the bowl.
+`kibble/label` and `kibble/sample/label` are the fast/slow-split commands: each updates its
+row(s) and responds immediately, then runs training reconciliation, model rebuild and
+reclassification -- all file/CPU work -- in the background, notifying subscribers via
+`kibble/timeline/subscribe` only once that settles. `kibble/label` reviews a whole event;
+`kibble/sample/label` overrides (or clears the override on) one photo within it, independent
+of the event's own label. `kibble/cats/add`, `kibble/cats/delete` and `kibble/training/
+remove` are the other mutations here; each ends by pushing a fresh identity snapshot through
+the coordinator (`KibbleCoordinator.async_refresh_identity_snapshot`) so entities and
+subscribers see the result the same way an ingest pass would.
+
+`kibble/vision/last`, `kibble/vision/areas(/set)`, `kibble/calibration(/action)` are unrelated
+to the AI pipeline and unchanged: every command takes `entry_id`; `_resolve_coordinator` is the
+one place that turns a bad one into the right WS error instead of four copies of the same
+lookup.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-from collections.abc import Mapping, Sequence
+import logging
 from typing import Any
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.util import dt as dt_util
 
-from .api import (
-    CatInfo,
-    DetectionEvent,
-    FeedRecord,
-    KibbleCalibrationBusyError,
-    KibbleConnectionError,
-    KibbleError,
-    KibbleNotFoundError,
-)
-from .const import CONF_VENDOR_PET_IDS, DOMAIN, HOPPER_1, HOPPER_2, HOPPER_BOTH, parse_vendor_pet_ids
+from .api import KibbleCalibrationBusyError, KibbleConnectionError, KibbleError, KibbleNotFoundError
+from .const import DOMAIN
 from .coordinator import KibbleCoordinator
 
-# `kibble/timeline`'s own cap -- matches DESIGN.md's "at most 100" verbatim.
+_LOGGER = logging.getLogger(__name__)
+
+# `kibble/timeline`'s own cap -- matches docs/36-ai-pipeline.md's "at most 100" verbatim.
 MAX_TIMELINE_ITEMS = 100
+MAX_REVIEW_ITEMS = 60
+MAX_TRAINING_ITEMS = 60
 
 ERR_FEEDER_UNREACHABLE = "feeder_unreachable"
-# A named cat/sample the agent reports it doesn't have (`KibbleNotFoundError`) -- distinct from
-# "the feeder itself is unreachable" so the card can say "that cat is already gone" instead of
-# a generic connectivity banner.
+# A named cat/event/sample HA reports it doesn't have -- distinct from "the feeder itself is
+# unreachable" so the card can say "that's already gone" instead of a generic connectivity
+# banner.
 ERR_NOT_FOUND = "not_found"
-# Any other write the agent rejected outright (bad name, bad JPEG, ...): a real `KibbleError`
-# that is neither a connection failure nor a not-found.
+# Any other write rejected outright (bad label value, empty uids list, ...).
 ERR_AGENT_REJECTED = "agent_rejected"
-# An animal is over the bowl right now (`KibbleCalibrationBusyError`, `POST /calibration`'s
-# own 409 on the `point` action) -- distinct from `agent_rejected` so the calibration wizard
-# can say "wait for the bowl to clear" instead of a generic failure.
+# An animal is over the bowl right now (`KibbleCalibrationBusyError`, `POST /calibration`'s own
+# 409 on the `point` action) -- distinct from `agent_rejected` so the calibration wizard can say
+# "wait for the bowl to clear" instead of a generic failure.
 ERR_CALIBRATION_BUSY = "calibration_busy"
-
-# Mirrors the agent's own `GET /events/track/<ts>/image` pairing window exactly (eat preferred,
-# else visit, within `[ts - LOOKBACK, ts + LOOKAHEAD]`, closest wins). Computed here too, ahead
-# of ever fetching an image, purely so `kibble/timeline` can report -- per row, with no extra
-# round trip -- whether an `identified` row has a live image to show at all (and which class it
-# came from, for the card's "ate"/"was at the bowl" verb). The agent's own endpoint is still the
-# one that actually resolves and serves the bytes; this only decides whether to point a row at
-# it.
-TRACK_PAIR_LOOKBACK_SECONDS = 300
-TRACK_PAIR_LOOKAHEAD_SECONDS = 120
 
 
 @callback
@@ -78,246 +64,86 @@ def _resolve_coordinator(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> KibbleCoordinator | None:
     """Resolves `msg["entry_id"]` to its coordinator, or sends the right WS error and returns
-    `None`. Shared by every `kibble/*` command below."""
+    `None` -- every command below calls this first and returns immediately on `None`."""
     entry = hass.config_entries.async_get_entry(msg["entry_id"])
     if entry is None or entry.domain != DOMAIN:
-        connection.send_error(
-            msg["id"], websocket_api.ERR_NOT_FOUND, f"Unknown config entry {msg['entry_id']}"
-        )
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Unknown entry")
         return None
     if entry.state is not ConfigEntryState.LOADED:
-        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, f"{entry.title} is not loaded")
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Entry not loaded")
         return None
     return entry.runtime_data
-
-
-def _vendor_cat(pet_id: str | None, pet_ids: Mapping[str, str]) -> str | None:
-    return pet_ids.get(pet_id) if pet_id is not None else None
-
-
-def _track_pair(track: DetectionEvent, events: Sequence[DetectionEvent]) -> DetectionEvent | None:
-    """The `eat` event closest to `track.ts` within the pairing window, or the closest `visit`
-    in the same window if no `eat` qualifies, or `None`. Computed independently per track: two
-    tracks close enough together can legitimately claim the same `eat`/`visit`, exactly as the
-    agent's own per-request lookup would for either one's own `ts`."""
-    window_start = track.ts - TRACK_PAIR_LOOKBACK_SECONDS
-    window_end = track.ts + TRACK_PAIR_LOOKAHEAD_SECONDS
-    for cls in ("eat", "visit"):
-        candidates = [e for e in events if e.cls == cls and window_start <= e.ts <= window_end]
-        if candidates:
-            return min(candidates, key=lambda e: abs(e.ts - track.ts))
-    return None
-
-
-def _identified_item(
-    track: DetectionEvent, pair: DetectionEvent | None, pet_ids: Mapping[str, str]
-) -> dict[str, Any]:
-    """One `track` row: `cat` is always a display-ready name (falling back to "Unknown cat"
-    for a `pet_id` the `vendor_pet_ids` option hasn't named), never `None` -- there is no "no
-    identification" case for a `kind:"identified"` row, only an unmapped one. `image` is the
-    bare `ts` for the HTTP image view's `kind="track"` (which re-resolves and serves the same
-    pairing live, from the agent) -- `None` when no `eat`/`visit` qualifies, so the card never
-    points a thumbnail at a guaranteed 404. `paired_class` names which one so the card can pick
-    "ate" vs "was at the bowl" without re-deriving the window logic itself."""
-    return {
-        "kind": "identified",
-        "ts": track.ts,
-        "cat": _vendor_cat(track.pet_id, pet_ids) or "Unknown cat",
-        "paired_class": pair.cls if pair is not None else None,
-        "image": str(track.ts) if pair is not None else None,
-        "image_kind": "track",
-    }
-
-
-def _labelled_face_item(event: DetectionEvent) -> dict[str, Any]:
-    """A `face` crop Kibble's own classifier (or a human, via `kibble/faces/label`) filed under
-    a cat -- the agent carries the name on the event itself (`ai::Feed::set_face_cat`). This is
-    the only sighting evidence there is when the vendor cloud is off and no `track` ever
-    arrives, and it is exactly what the cats tile's "last here" is measured from, so the timeline
-    must show it too or the two disagree. The image is the event's own crop, served by the HTTP
-    image view's `event` kind."""
-    return {
-        "kind": "identified",
-        "ts": event.ts,
-        "cat": event.cat,
-        "paired_class": "face",
-        "image": event.image,
-        "image_kind": "event",
-    }
-
-
-def _eat_compare_pair(event: DetectionEvent) -> dict[str, Any]:
-    """The dish photos LibreFeed takes at the start and end of an `eat`, as the card's
-    `comparePairFor` expects them. Only ever attached to an `eat`: a `visit` has no meal to
-    compare, and adding empty keys to every row would make "no pair captured" and "not the
-    kind of row that has one" indistinguishable. Omitted entirely when neither side exists,
-    so a vendor-stack row can never grow a key its agent never sent."""
-    if event.cls != "eat":
-        return {}
-    pair = {k: v for k, v in (("image_before", event.image_before), ("image_after", event.image_after)) if v}
-    return pair
-
-
-def _direct_identified_item(event: DetectionEvent) -> dict[str, Any]:
-    """A `visit`/`eat` row that already carries its own `cat` -- LibreFeed's own onboard
-    identification (`ai::Feed`), which has no separate `track` event to pair against at all.
-    Same `identified` row shape as `_identified_item`/`_labelled_face_item`: `paired_class` is
-    the event's own class (`"eat"|"visit"`, so the card's "ate" vs "was here" verb still
-    works), `image`/`image_kind` point at the event's own crop exactly like
-    `_bare_detection_item` would. `score` -- LibreFeed's own identification confidence -- is
-    carried through only when the event actually has one, so a vendor-shaped event (which
-    never reaches this path -- see `timeline_items`) can never grow a spurious key."""
-    item: dict[str, Any] = {
-        "kind": "identified",
-        "ts": event.ts,
-        "cat": event.cat,
-        "paired_class": event.cls,
-        "image": event.image,
-        "image_kind": "event",
-    }
-    if event.score is not None:
-        item["score"] = event.score
-    item.update(_eat_compare_pair(event))
-    return item
-
-
-def _bare_detection_item(event: DetectionEvent, kind: str) -> dict[str, Any]:
-    """A `visit`/`eat` row no `track` claimed as its pairing image (see `timeline_items`).
-    `image` is the bare `GET /events/<name>` filename, for the HTTP image view's `kind="event"`
-    -- unchanged from every class's image reference before this row shape split by kind."""
-    return {"kind": kind, "ts": event.ts, "image": event.image, **_eat_compare_pair(event)}
-
-
-def _feed_item(record: FeedRecord) -> dict[str, Any]:
-    """`amount`/`hopper` are derived from `amount1`/`amount2` -- `agent/src/feed_capture.rs`'s
-    `FeedRecord` carries per-hopper portions, not a combined amount or a hopper label. Both are
-    `None` together only for a cycle with no claimable amount at all (genuinely unknown, not
-    zero) -- increasingly rare now that the agent associates scheduled cycles with the
-    scheduler's own configured amounts too, not just manual feeds."""
-    if record.amount1 is None and record.amount2 is None:
-        amount: int | None = None
-        hopper: str | None = None
-    else:
-        amount = (record.amount1 or 0) + (record.amount2 or 0)
-        has1, has2 = bool(record.amount1), bool(record.amount2)
-        hopper = HOPPER_BOTH if has1 and has2 else HOPPER_1 if has1 else HOPPER_2 if has2 else None
-    return {
-        "kind": "feed",
-        "ts": record.ts,
-        "amount": amount,
-        "hopper": hopper,
-        "before": record.before,
-        "after": record.after,
-        "manual": record.manual,
-        # False when the feeder dispensed but its MCU never returned the completed record --
-        # the amount above is what was asked for, not what the hardware measured. The card
-        # says so on the row rather than presenting a guess as a fact.
-        "confirmed": record.confirmed,
-    }
-
-
-def timeline_items(
-    events: Sequence[DetectionEvent],
-    feeds: Sequence[FeedRecord],
-    pet_ids: Mapping[str, str],
-    *,
-    include_visits: bool = False,
-) -> list[dict[str, Any]]:
-    """Merges detections and feed cycles into `kibble/timeline`'s row shape, newest first,
-    capped at `MAX_TIMELINE_ITEMS`.
-
-    Every `track` becomes an `identified` row (`_identified_item`) naming the vendor-resolved
-    cat, paired via `_track_pair` with the nearest qualifying `eat`/`visit` for its live
-    thumbnail. Whichever single `eat`/`visit` a track actually claims is dropped from also
-    appearing as its own bare row -- the identified row already carries its image, and the same
-    physical visit showing up twice is exactly the noise this split exists to remove. This is
-    the vendor stack's shape; LibreFeed never emits a `track` at all, so `tracks`/`pairs`/
-    `claimed_ids` are simply empty there and every LibreFeed event falls through to the loop
-    below untouched.
-
-    A `visit`/`eat` event not claimed by any track and carrying its own `cat` -- LibreFeed's
-    onboard identification, never a vendor shape -- becomes an `identified` row too
-    (`_direct_identified_item`), on either stack: a `track`-less feeder has no other way to
-    ever surface who it saw. An unclaimed, uncatted `eat` stays its own `eat` row: a cat at
-    the bowl nobody identified. An unclaimed, uncatted `visit` stays its own `visit` row,
-    included only when `include_visits` is true (default `False`): a bare "a cat came by"
-    with no identity and no feeding is the least useful row on the timeline -- note a catted
-    `visit` is never "bare", so it is never subject to that gate. A `face` event produces a
-    row only once it carries a `cat` (`_labelled_face_item`); an unlabelled one is
-    `kibble/faces/*` training material, not timeline activity.
-    """
-    tracks = [e for e in events if e.cls == "track"]
-    pairs = [_track_pair(track, events) for track in tracks]
-    claimed_ids = {id(pair) for pair in pairs if pair is not None}
-
-    items = [
-        _identified_item(track, pair, pet_ids) for track, pair in zip(tracks, pairs, strict=True)
-    ]
-    for event in events:
-        if event.cls == "face":
-            if event.cat:
-                items.append(_labelled_face_item(event))
-            continue
-        if event.cls not in ("eat", "visit") or id(event) in claimed_ids:
-            continue
-        if event.cat:
-            items.append(_direct_identified_item(event))
-        elif event.cls == "eat":
-            items.append(_bare_detection_item(event, "eat"))
-        elif include_visits:
-            items.append(_bare_detection_item(event, "visit"))
-    items.extend(_feed_item(f) for f in feeds)
-    items.sort(key=lambda item: item["ts"], reverse=True)
-    return items[:MAX_TIMELINE_ITEMS]
-
-
-def cats_items(cats: Sequence[CatInfo], pet_ids: Mapping[str, str]) -> list[dict[str, Any]]:
-    """DESIGN.md's `kibble/cats` row shape: adds `vendor_pet_id` (the reverse of the
-    `vendor_pet_ids` option -- `None` for a cat the operator hasn't mapped to a vendor id) and
-    `color_index` (this cat's 0-based rank in name-sorted order, the same order the rows come
-    back in -- one stable palette slot per enrolled cat, per DESIGN.md's colour tokens)."""
-    reverse = {name: pet_id for pet_id, name in pet_ids.items()}
-    ordered = sorted(cats, key=lambda c: c.name)
-    return [
-        {
-            "name": cat.name,
-            "samples": cat.samples,
-            "last_seen": cat.last_seen,
-            "avatar": cat.avatar,
-            "vendor_pet_id": reverse.get(cat.name),
-            "color_index": index,
-        }
-        for index, cat in enumerate(ordered)
-    ]
 
 
 @callback
 def _send_agent_error(
     connection: websocket_api.ActiveConnection, msg_id: int, err: KibbleError
 ) -> None:
-    """Maps a `KibbleError` from a cat/face/calibration mutation to the right WS error code: a
-    connection failure stays `feeder_unreachable` (the existing convention every other command
-    already uses); a named cat/sample the agent reports missing is `not_found`; an animal over
-    the bowl blocking a calibration point (`KibbleCalibrationBusyError`, `POST /calibration`'s
-    own 409) is `calibration_busy`, distinct enough from a generic rejection that the wizard
-    can say "wait for the bowl to clear" instead; anything else the agent rejected outright (a
-    bad name, an invalid JPEG, a malformed calibration step, ...) is `agent_rejected` carrying
-    the agent's own message."""
+    """Maps a `KibbleError` from a live device call (`kibble/cats`'s spool read, calibration)
+    to the right WS error code."""
     if isinstance(err, KibbleConnectionError):
         connection.send_error(msg_id, ERR_FEEDER_UNREACHABLE, str(err))
-    elif isinstance(err, KibbleNotFoundError):
-        connection.send_error(msg_id, ERR_NOT_FOUND, str(err))
     elif isinstance(err, KibbleCalibrationBusyError):
         connection.send_error(msg_id, ERR_CALIBRATION_BUSY, str(err))
     else:
         connection.send_error(msg_id, ERR_AGENT_REJECTED, str(err))
 
 
+# --- kibble/timeline / kibble/timeline/subscribe / kibble/event -------------------------------
+
+
+def _feed_view(coordinator: KibbleCoordinator, feed: dict[str, Any]) -> dict[str, Any]:
+    """One stored feed row's frozen per-hopper facts (`store.py`'s `_feed_timeline_dict`) ->
+    the timeline's public shape. `single` falls back to the coordinator's current mode for a
+    row recorded before this existed (`single` is `None` in the store); a side's `food` falls
+    back to the coordinator's current name for that hopper the same way, when that hopper was
+    unnamed at feed time -- naming it later also labels every past feed that never got a name
+    of its own, while a row that *did* record one keeps saying exactly that even after a
+    rename, which is what "recorded at ingest" (docs/37-hopper-full.md) actually buys.
+
+    In single mode there is one bin, so `sides` is always empty and `portions` is the whole
+    serving. Folding both live fallbacks in here, rather than only in the stored row, is what
+    makes a divider flip or a food rename change what `kibble/timeline/subscribe` sends, even
+    for a row whose own recorded facts never change."""
+    single = feed["single"]
+    if single is None:
+        single = coordinator.single_hopper
+    sides: list[dict[str, Any]] = []
+    if not single:
+        for n, amount, food in (
+            (1, feed["amount1"], feed["food1"]),
+            (2, feed["amount2"], feed["food2"]),
+        ):
+            if amount and amount > 0:
+                sides.append({"hopper": n, "portions": amount, "food": food or coordinator.hopper_food(n)})
+    return {
+        "portions": feed["portions"],
+        "scheduled": feed["scheduled"],
+        "confirmed": feed["confirmed"],
+        "single": single,
+        "sides": sides,
+    }
+
+
+def _render_feeds(coordinator: KibbleCoordinator, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Renders every timeline item's stored `feed` facts through `_feed_view`; a non-feed item
+    (an event row) passes through untouched. Applied to both the page and the subscribe
+    snapshot -- see `_feed_view`'s own docstring for why that snapshot must change on a divider
+    flip or a food rename."""
+    return [
+        {**item, "feed": _feed_view(coordinator, item["feed"])} if item.get("feed") else item
+        for item in items
+    ]
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "kibble/timeline",
         vol.Required("entry_id"): str,
-        vol.Optional("include_visits", default=False): bool,
+        vol.Optional("cursor"): str,
+        vol.Optional("limit", default=30): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=MAX_TIMELINE_ITEMS)
+        ),
     }
 )
 @websocket_api.async_response
@@ -327,16 +153,299 @@ async def ws_timeline(
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
-    pet_ids = parse_vendor_pet_ids(coordinator.entry.options.get(CONF_VENDOR_PET_IDS, ""))
-    data = coordinator.data
-    connection.send_result(
-        msg["id"],
-        {
-            "items": timeline_items(
-                data.events, data.feeds, pet_ids, include_visits=msg["include_visits"]
+    try:
+        page = await coordinator.store.async_timeline_page(
+            limit=msg["limit"], cursor=msg.get("cursor")
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_cursor", str(err))
+        return
+    connection.send_result(msg["id"], {**page, "items": _render_feeds(coordinator, page["items"])})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/timeline/subscribe", vol.Required("entry_id"): str}
+)
+@callback
+def ws_timeline_subscribe(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Subscribes to timeline changes. No rows are ever pushed here -- only `{"changed":
+    true}`; the client already owns pagination/cursors via `kibble/timeline` and just refetches
+    its current page on receipt.
+
+    Fires whenever the coordinator's data updates (an ingest pass, a label, a cats/training
+    mutation -- see `KibbleCoordinator.async_refresh_identity_snapshot`), but only actually
+    sends when the first page's contents differ from what was last sent, so a coordinator
+    update with nothing to do with the timeline (a `bowl_fill` tick) sends nothing. The check
+    itself is async (a store read), so the sync coordinator-listener callback schedules it as a
+    background task rather than blocking; a check already in flight absorbs any update that
+    lands while it runs, since it will see the latest state once it resolves.
+    """
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    state: dict[str, Any] = {"snapshot": None, "task": None}
+
+    async def _check_and_send() -> None:
+        try:
+            page = await coordinator.store.async_timeline_page(limit=MAX_TIMELINE_ITEMS, cursor=None)
+        except Exception:  # noqa: BLE001 -- a failed check must never crash the listener
+            _LOGGER.exception("kibble/timeline/subscribe check failed")
+            return
+        snapshot = _render_feeds(coordinator, page["items"])
+        if snapshot == state["snapshot"]:
+            return
+        state["snapshot"] = snapshot
+        connection.send_message(websocket_api.event_message(msg["id"], {"changed": True}))
+
+    @callback
+    def _on_update() -> None:
+        task = state["task"]
+        if task is not None and not task.done():
+            return
+        state["task"] = hass.async_create_task(_check_and_send())
+
+    connection.subscriptions[msg["id"]] = coordinator.async_add_listener(_on_update)
+    connection.send_result(msg["id"])
+    # The first check is the current rows, so a subscriber never has to also call
+    # `kibble/timeline` first just to learn whether it should.
+    _on_update()
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/event", vol.Required("entry_id"): str, vol.Required("uid"): str}
+)
+@websocket_api.async_response
+async def ws_event(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    detail = await coordinator.store.async_event_detail(msg["uid"])
+    if detail is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown event")
+        return
+    connection.send_result(msg["id"], detail)
+
+
+# --- kibble/label and whole-session review ------------------------------------------------------
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/label",
+        vol.Required("entry_id"): str,
+        vol.Required("uids"): vol.All([str], vol.Length(min=1)),
+        vol.Required("label"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_label(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Apply a timeline quick-pick to each whole session, then reconcile training in background."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        events, training_changed = await coordinator.store.async_label_events(msg["uids"], msg["label"])
+    except ValueError as err:
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+        return
+    connection.send_result(msg["id"], {"events": events})
+    if training_changed:
+        session_uids = [event["uid"] for event in events]
+        hass.async_create_task(_async_label_followup(coordinator, session_uids, msg["label"]))
+    else:
+        hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+
+
+async def _async_label_followup(coordinator: KibbleCoordinator, uids: list[str], label: str) -> None:
+    try:
+        await coordinator.store.async_reconcile_event_training(uids, label)
+        await coordinator.engine.async_rebuild()
+        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
+    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
+        _LOGGER.exception("kibble/label background training update failed")
+    await coordinator.async_refresh_identity_snapshot()
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/session/label",
+        vol.Required("entry_id"): str,
+        vol.Required("uid"): str,
+        vol.Optional("cats"): vol.All(
+            [{vol.Required("cat"): str, vol.Required("ate"): bool}], vol.Length(min=1)
+        ),
+        vol.Optional("verdict"): vol.In(("not_a_cat", "unknown")),
+    }
+)
+@websocket_api.async_response
+async def ws_session_label(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    if ("cats" in msg) == ("verdict" in msg):
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, "Send cats or verdict")
+        return
+    if "verdict" in msg:
+        try:
+            events, training_changed = await coordinator.store.async_label_events(
+                [msg["uid"]], msg["verdict"]
             )
-        },
-    )
+        except ValueError as err:
+            connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+            return
+        if not events:
+            connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
+            return
+        detail = await coordinator.store.async_event_detail(events[0]["uid"])
+        if detail is None:
+            connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
+            return
+        connection.send_result(msg["id"], detail)
+        if training_changed:
+            hass.async_create_task(
+                _async_label_followup(coordinator, [events[0]["uid"]], msg["verdict"])
+            )
+        else:
+            hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+        return
+    cats = [(item["cat"], item["ate"]) for item in msg["cats"]]
+    try:
+        detail = await coordinator.store.async_session_cats(msg["uid"], cats)
+    except ValueError as err:
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+        return
+    if detail is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
+        return
+    connection.send_result(msg["id"], detail)
+    hass.async_create_task(_async_session_followup(coordinator, detail["event"]["uid"]))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/session/subject",
+        vol.Required("entry_id"): str,
+        vol.Required("uid"): str,
+        vol.Required("sid"): int,
+        vol.Required("label"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_session_subject(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        scores = await coordinator.engine.async_subject_scores(msg["uid"])
+        detail = await coordinator.store.async_session_subject(
+            msg["uid"], msg["sid"], msg["label"], scores
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+        return
+    if detail is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
+        return
+    connection.send_result(msg["id"], detail)
+    hass.async_create_task(_async_session_followup(coordinator, detail["event"]["uid"]))
+
+
+async def _async_session_followup(coordinator: KibbleCoordinator, uid: str) -> None:
+    try:
+        await coordinator.store.async_reconcile_session_training(uid)
+        await coordinator.engine.async_rebuild()
+        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
+    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
+        _LOGGER.exception("kibble/session background training update failed")
+    await coordinator.async_refresh_identity_snapshot()
+
+
+# --- kibble/sample/label -------------------------------------------------------------------------
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/sample/label",
+        vol.Required("entry_id"): str,
+        vol.Required("sample_uid"): str,
+        vol.Required("label"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_sample_label(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    session_uid = await coordinator.store.async_session_uid_for_sample(msg["sample_uid"])
+    if session_uid is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown sample")
+        return
+    try:
+        scores = await coordinator.engine.async_subject_scores(session_uid)
+        sample = await coordinator.store.async_label_sample(msg["sample_uid"], msg["label"], scores)
+    except ValueError as err:
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+        return
+    if sample is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown sample")
+        return
+    connection.send_result(msg["id"], {"sample": sample})
+    hass.async_create_task(_async_sample_label_followup(coordinator, session_uid))
+
+
+async def _async_sample_label_followup(coordinator: KibbleCoordinator, uid: str) -> None:
+    try:
+        await coordinator.store.async_reconcile_session_training(uid)
+        await coordinator.engine.async_rebuild()
+        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
+    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
+        _LOGGER.exception("kibble/sample/label background training update failed")
+    await coordinator.async_refresh_identity_snapshot()
+
+
+# --- kibble/review --------------------------------------------------------------------------
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/review",
+        vol.Required("entry_id"): str,
+        vol.Optional("cursor"): str,
+        vol.Optional("limit", default=24): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=MAX_REVIEW_ITEMS)
+        ),
+    }
+)
+@websocket_api.async_response
+async def ws_review(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        page = await coordinator.store.async_review_page(
+            limit=msg["limit"], cursor=msg.get("cursor"), retention_cutoff=coordinator.retention_cutoff()
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_cursor", str(err))
+        return
+    connection.send_result(msg["id"], page)
+
+
+# --- kibble/cats / kibble/cats/add / kibble/cats/delete ----------------------------------------
 
 
 @websocket_api.websocket_command(
@@ -349,8 +458,62 @@ async def ws_cats(
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
-    pet_ids = parse_vendor_pet_ids(coordinator.entry.options.get(CONF_VENDOR_PET_IDS, ""))
-    connection.send_result(msg["id"], {"cats": cats_items(coordinator.data.cats, pet_ids)})
+    identity = coordinator.data.identity
+    cats: list[dict[str, Any]] = []
+    for row in await coordinator.store.async_cats():
+        name = row["name"]
+        counts = await coordinator.store.async_training_counts(name)
+        avatar_info = await coordinator.store.async_avatar_info(name)
+        learning_paused = await coordinator.store.async_auto_learn_paused(name)
+        stats = identity.cats.get(name)
+        cats.append(
+            {
+                "name": name,
+                "color": row["color"],
+                "avatar": avatar_info["avatar"],
+                "avatar_custom": avatar_info["custom"],
+                "learning_paused": learning_paused,
+                "training": counts,
+                "accuracy": coordinator.engine.loo_accuracy(name),
+                "last_seen": stats.last_seen if stats else None,
+                "last_meal": stats.last_meal if stats else None,
+                "meals_today": _meals_today(stats),
+                "present": stats.present if stats else False,
+            }
+        )
+    storage = await coordinator.store.async_storage_summary(coordinator.retention_days())
+    try:
+        spool = await coordinator.client.spool_stats()
+        storage["device_spool"] = {"used_bytes": spool.used_bytes, "cap_bytes": spool.cap_bytes}
+    except KibbleError:
+        storage["device_spool"] = None
+    connection.send_result(msg["id"], {"cats": cats, "storage": storage})
+
+
+def _meals_today(stats: Any) -> int:
+    if stats is None:
+        return 0
+    start = dt_util.start_of_local_day()
+    return sum(1 for ts in stats.recent_meals if dt_util.utc_from_timestamp(ts) >= start)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/cats/add",
+        vol.Required("entry_id"): str,
+        vol.Required("name"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_cats_add(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    await coordinator.store.async_add_cat(msg["name"])
+    await coordinator.async_refresh_identity_snapshot()
+    connection.send_result(msg["id"], {})
 
 
 @websocket_api.websocket_command(
@@ -367,131 +530,129 @@ async def ws_cats_delete(
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
-    try:
-        result = await coordinator.async_delete_cat(msg["name"])
-    except KibbleError as err:
-        _send_agent_error(connection, msg["id"], err)
-        return
-    connection.send_result(msg["id"], result)
-
-
-@websocket_api.websocket_command(
-    {vol.Required("type"): "kibble/faces/pending", vol.Required("entry_id"): str}
-)
-@websocket_api.async_response
-async def ws_faces_pending(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-) -> None:
-    coordinator = _resolve_coordinator(hass, connection, msg)
-    if coordinator is None:
-        return
-    pet_ids = parse_vendor_pet_ids(coordinator.entry.options.get(CONF_VENDOR_PET_IDS, ""))
-    try:
-        crops = await coordinator.client.pending_faces()
-    except KibbleError as err:
-        connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
-        return
-    connection.send_result(
-        msg["id"],
-        {
-            "crops": [
-                {
-                    "name": crop.name,
-                    "ts": crop.ts,
-                    "vendor_pet_id": crop.vendor_pet_id,
-                    "vendor_cat": _vendor_cat(crop.vendor_pet_id, pet_ids),
-                    "guess": (
-                        {"cat": crop.guess.cat, "score": crop.guess.score}
-                        if crop.guess is not None
-                        else None
-                    ),
-                }
-                for crop in crops
-            ]
-        },
-    )
+    await coordinator.store.async_delete_cat(msg["name"])
+    await coordinator.async_refresh_identity_snapshot()
+    connection.send_result(msg["id"], {})
 
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "kibble/faces/samples",
+        vol.Required("type"): "kibble/cats/avatar/set",
+        vol.Required("entry_id"): str,
+        vol.Required("cat"): str,
+        vol.Required("asset_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_cats_avatar_set(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """"Choose one of this cat's existing photos" as its avatar -- copies `asset_id` (a
+    training or archived-media asset already belonging to this entry) into a dedicated
+    `avatars/` file (`store.set_cat_avatar_from_asset`), so it survives that source asset
+    later being evicted or purged. `ERR_NOT_FOUND` for an unknown cat or an `asset_id` that
+    doesn't resolve to a real file under this entry."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    avatar = await coordinator.store.async_set_cat_avatar_from_asset(msg["cat"], msg["asset_id"])
+    if avatar is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown cat or photo")
+        return
+    connection.send_result(msg["id"], {"avatar": avatar})
+    hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/cats/avatar/clear",
         vol.Required("entry_id"): str,
         vol.Required("cat"): str,
     }
 )
 @websocket_api.async_response
-async def ws_faces_samples(
+async def ws_cats_avatar_clear(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
+    """Clears a custom avatar override, falling back to the newest trained photo
+    (`store._avatar_state`'s auto-pick) -- or to the monogram, for a cat with neither."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
-    try:
-        samples = await coordinator.client.faces_samples(msg["cat"])
-    except KibbleError as err:
-        connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
+    cleared = await coordinator.store.async_clear_cat_avatar(msg["cat"])
+    if not cleared:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown cat")
         return
-    connection.send_result(
-        msg["id"], {"samples": [{"name": s.name, "ts": s.ts} for s in samples]}
-    )
+    avatar_info = await coordinator.store.async_avatar_info(msg["cat"])
+    connection.send_result(msg["id"], {"avatar": avatar_info["avatar"]})
+    hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+
+
+# --- kibble/training / kibble/training/remove --------------------------------------------------
 
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "kibble/faces/upload",
+        vol.Required("type"): "kibble/training",
         vol.Required("entry_id"): str,
         vol.Required("cat"): str,
-        vol.Required("jpeg_b64"): str,
+        vol.Optional("cursor"): str,
+        vol.Optional("limit", default=24): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=MAX_TRAINING_ITEMS)
+        ),
     }
 )
 @websocket_api.async_response
-async def ws_faces_upload(
+async def ws_training(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """`jpeg_b64` is the browser's already-cropped-to-224x224 JPEG, base64-encoded for the WS
-    JSON envelope -- decoded here, back to raw bytes, before ever reaching the agent."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
     try:
-        jpeg = base64.b64decode(msg["jpeg_b64"], validate=True)
-    except binascii.Error as err:
-        # A malformed envelope, not an agent rejection -- the agent never sees this request.
-        # Caught here (not left to `websocket_api`'s generic handler) so a bad payload gets a
-        # clean `invalid_format` error instead of an "Unknown error" logged with a traceback.
-        connection.send_error(msg["id"], websocket_api.ERR_INVALID_FORMAT, str(err))
+        page = await coordinator.store.async_training_page(
+            cat=msg["cat"], limit=msg["limit"], cursor=msg.get("cursor")
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_cursor", str(err))
         return
-    try:
-        result = await coordinator.async_upload_face_sample(msg["cat"], jpeg)
-    except KibbleError as err:
-        _send_agent_error(connection, msg["id"], err)
-        return
-    connection.send_result(msg["id"], result)
+    connection.send_result(msg["id"], page)
 
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "kibble/faces/delete_sample",
+        vol.Required("type"): "kibble/training/remove",
         vol.Required("entry_id"): str,
-        vol.Required("cat"): str,
-        vol.Required("name"): str,
+        vol.Required("uids"): [str],
     }
 )
 @websocket_api.async_response
-async def ws_faces_delete_sample(
+async def ws_training_remove(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """The cats card's own remove action for an uploaded sample (`upload-*.jpg`), which has no
-    pending-queue entry for `unlabel_face` to move it back to."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
+    removed = await coordinator.store.async_training_remove(msg["uids"])
+    connection.send_result(msg["id"], {"removed": removed})
+    if removed:
+        hass.async_create_task(_async_training_remove_followup(coordinator))
+
+
+async def _async_training_remove_followup(coordinator: KibbleCoordinator) -> None:
     try:
-        result = await coordinator.async_delete_face_sample(msg["cat"], msg["name"])
-    except KibbleError as err:
-        _send_agent_error(connection, msg["id"], err)
-        return
-    connection.send_result(msg["id"], result)
+        await coordinator.engine.async_rebuild()
+        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("kibble/training/remove background rebuild failed")
+    await coordinator.async_refresh_identity_snapshot()
+
+
+# --- kibble/vision/last, kibble/vision/areas(/set), kibble/vision/bowl(/set),
+# kibble/calibration(/action) -------------------------------------------------------------------
+# Unrelated to the AI pipeline; unchanged except that `vision/areas` dropped its unused
+# "include" side (see `kibble-detection-areas-dialog.ts`'s header) and gained a `vision/bowl`
+# sibling for the daemon's separate, previously card-invisible `bowl_roi`.
 
 
 @websocket_api.websocket_command(
@@ -501,17 +662,23 @@ async def ws_faces_delete_sample(
 async def ws_vision_last(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """`GET /vision/last` straight from the agent, on demand -- like `kibble/faces/pending`/
-    `kibble/faces/samples` above, never through the coordinator's poll cycle, but for a
-    different reason: an open card polls this roughly once a second to keep its live
-    detection-box overlay in step with the video, far tighter than `DEFAULT_SCAN_INTERVAL`,
-    and caching a fetch this frequent in `KibbleData` would mean either slowing every other
-    entity's refresh to match or serving the overlay stale between polls.
+    """`GET /vision/last` straight from the agent, on demand: an open card polls this roughly
+    once a second to keep its live detection-box overlay in step with the video, far tighter
+    than `DEFAULT_SCAN_INTERVAL`, and caching a fetch this frequent in `KibbleData` would mean
+    either slowing every other entity's refresh to match or serving the overlay stale between
+    polls.
 
     `KibbleNotFoundError` -- an agent old enough to predate this brand-new route -- folds into
-    the same `{"frame": None}` reply as the agent's own "nothing analysed yet" `null`: the
-    card has nothing to draw either way, so this is not `ERR_FEEDER_UNREACHABLE` like a real
-    connection failure below."""
+    the same `{"frame": None}` reply as the agent's own "nothing analysed yet" `null`: the card
+    has nothing to draw either way, so this is not `ERR_FEEDER_UNREACHABLE` like a real
+    connection failure below.
+
+    Each detection with a real (non-null) `sid` gets a `cat` field (docs/42-multi-cat.md):
+    one cheap indexed store lookup (`vision_cats_for_event`, off the event loop) keyed by the
+    frame's own `event_id`, reused across every detection in this one frame -- never a second
+    query per detection. A detection with no `sid` (clutter, tentative, no open track) is left
+    exactly as the agent sent it: no `cat` key added at all, matching "missing event_id/sid ->
+    leave cat absent"."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
@@ -522,7 +689,107 @@ async def ws_vision_last(
     except KibbleError as err:
         connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
         return
+    if isinstance(frame, dict) and isinstance(frame.get("event_id"), int):
+        detections = frame.get("detections")
+        if isinstance(detections, list):
+            # Names are a nicety on top of the boxes: a failed lookup must never cost the card
+            # its whole overlay, so it degrades to the frame exactly as the feeder sent it.
+            try:
+                cats_by_sid = await coordinator.store.async_vision_cats_for_event(frame["event_id"])
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Live cat names unavailable for event %s", frame["event_id"], exc_info=True)
+                cats_by_sid = None
+            if cats_by_sid is not None:
+                for detection in detections:
+                    if isinstance(detection, dict) and isinstance(detection.get("sid"), int):
+                        detection["cat"] = cats_by_sid.get(detection["sid"])
     connection.send_result(msg["id"], {"frame": frame})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/vision/areas", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def ws_vision_areas(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Read the daemon's normalized ignore-mask detection rectangles on demand."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        areas = await coordinator.client.vision_areas()
+    except KibbleError as err:
+        connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
+        return
+    connection.send_result(msg["id"], {"exclude": areas.exclude})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/vision/areas/set",
+        vol.Required("entry_id"): str,
+        vol.Required("exclude"): [[vol.Coerce(float)]],
+    }
+)
+@websocket_api.async_response
+async def ws_vision_areas_set(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Replace the daemon's ignore-mask set with one feeder request."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        areas = await coordinator.client.set_vision_areas(msg["exclude"])
+    except KibbleError as err:
+        _send_agent_error(connection, msg["id"], err)
+        return
+    connection.send_result(msg["id"], {"exclude": areas.exclude})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/vision/bowl", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def ws_vision_bowl(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Read the daemon's bowl zone (`bowl_roi`) on demand -- separate from `vision/areas`
+    because the daemon itself keeps it on a different route (`GET /vision`, not
+    `GET /vision/areas`); see `KibbleClient.vision_bowl_roi`'s own docstring."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        bowl_roi = await coordinator.client.vision_bowl_roi()
+    except KibbleError as err:
+        connection.send_error(msg["id"], ERR_FEEDER_UNREACHABLE, str(err))
+        return
+    connection.send_result(msg["id"], {"bowl_roi": bowl_roi})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/vision/bowl/set",
+        vol.Required("entry_id"): str,
+        vol.Required("bowl_roi"): [vol.Coerce(float)],
+    }
+)
+@websocket_api.async_response
+async def ws_vision_bowl_set(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Replace the daemon's bowl zone with one feeder request."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        bowl_roi = await coordinator.client.set_vision_bowl_roi(msg["bowl_roi"])
+    except KibbleError as err:
+        _send_agent_error(connection, msg["id"], err)
+        return
+    connection.send_result(msg["id"], {"bowl_roi": bowl_roi})
 
 
 @websocket_api.websocket_command(
@@ -534,13 +801,12 @@ async def ws_calibration(
 ) -> None:
     """`GET /calibration` straight off the coordinator's already-polled `KibbleData.
     calibration` -- small, and changed only by the wizard's own actions rather than on the
-    device's own clock, so this reads the poll cache exactly like `kibble/cats` above rather
-    than fetching on demand like `kibble/faces/pending`/`kibble/vision/last`.
+    device's own clock, so this reads the poll cache rather than fetching on demand.
 
-    `None` (an agent old enough to predate this route, or the vendor stack) reports as the
-    same `{"hoppers": [null, null]}` shape a fresh LibreFeed daemon gives for two hoppers it
-    has never calibrated -- the wizard has nothing to draw either way, so this is not a WS
-    error like a real connection failure would be."""
+    `None` (an agent old enough to predate this route, or the vendor stack) reports as the same
+    `{"hoppers": [null, null]}` shape a fresh LibreFeed daemon gives for two hoppers it has
+    never calibrated -- the wizard has nothing to draw either way, so this is not a WS error
+    like a real connection failure would be."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
@@ -568,10 +834,10 @@ async def ws_calibration_action(
     """One calibration-wizard step (`action` is `begin`/`point`/`full`/`inherit`/`clear`),
     forwarded to `POST /calibration` via `KibbleCoordinator.async_calibration_action` (which
     refreshes immediately on success, so the follow-up `kibble/calibration` read every wizard
-    step makes never sees a stale curve -- see that method's own docstring). `portions`/
-    `from`/`note` are forwarded exactly when `msg` carries them; the daemon itself validates
-    which fields a given `action` needs and 400s for a wrong combination, the same trust-the-
-    agent shape `set_led`/`set_desiccant` already use rather than re-validating here.
+    step makes never sees a stale curve -- see that method's own docstring). `portions`/`from`/
+    `note` are forwarded exactly when `msg` carries them; the daemon itself validates which
+    fields a given `action` needs and 400s for a wrong combination, the same trust-the-agent
+    shape `set_led`/`set_desiccant` already use rather than re-validating here.
 
     `KibbleCalibrationBusyError` (409, an animal is over the bowl right now) maps to its own
     `calibration_busy` WS error via `_send_agent_error`, distinct from a generic
@@ -597,12 +863,24 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
     component-level `async_setup` -- commands are process-global, registering them per config
     entry would try to register the same command more than once."""
     websocket_api.async_register_command(hass, ws_timeline)
+    websocket_api.async_register_command(hass, ws_timeline_subscribe)
+    websocket_api.async_register_command(hass, ws_event)
+    websocket_api.async_register_command(hass, ws_label)
+    websocket_api.async_register_command(hass, ws_session_label)
+    websocket_api.async_register_command(hass, ws_session_subject)
+    websocket_api.async_register_command(hass, ws_sample_label)
+    websocket_api.async_register_command(hass, ws_review)
     websocket_api.async_register_command(hass, ws_cats)
+    websocket_api.async_register_command(hass, ws_cats_add)
     websocket_api.async_register_command(hass, ws_cats_delete)
-    websocket_api.async_register_command(hass, ws_faces_pending)
-    websocket_api.async_register_command(hass, ws_faces_samples)
-    websocket_api.async_register_command(hass, ws_faces_upload)
-    websocket_api.async_register_command(hass, ws_faces_delete_sample)
+    websocket_api.async_register_command(hass, ws_cats_avatar_set)
+    websocket_api.async_register_command(hass, ws_cats_avatar_clear)
+    websocket_api.async_register_command(hass, ws_training)
+    websocket_api.async_register_command(hass, ws_training_remove)
+    websocket_api.async_register_command(hass, ws_vision_areas)
+    websocket_api.async_register_command(hass, ws_vision_areas_set)
+    websocket_api.async_register_command(hass, ws_vision_bowl)
+    websocket_api.async_register_command(hass, ws_vision_bowl_set)
     websocket_api.async_register_command(hass, ws_vision_last)
     websocket_api.async_register_command(hass, ws_calibration)
     websocket_api.async_register_command(hass, ws_calibration_action)

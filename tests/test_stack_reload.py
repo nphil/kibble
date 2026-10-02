@@ -11,7 +11,7 @@ one), so most of these are plain sync tests.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from kibble.api import KibbleConnectionError
@@ -21,10 +21,13 @@ from kibble.stacks import Stack
 
 def _bare_coordinator(*, last_confirmed_stack: Stack | None) -> KibbleCoordinator:
     """A real (uninitialized) `KibbleCoordinator` with only what `_check_stack_change`/
-    `_async_update_data` read set by hand."""
+    `_async_update_data` read set by hand. `async_create_task` closes whatever coroutine
+    `_schedule_ingest` hands it (ingest itself is out of scope here) but still records the
+    call, so `async_reload`'s plain string return value passes through untouched for the
+    reload-scheduling assertions below."""
     coord = object.__new__(KibbleCoordinator)
     coord.hass = SimpleNamespace(
-        async_create_task=Mock(),
+        async_create_task=Mock(side_effect=lambda coro: coro.close() if hasattr(coro, "close") else None),
         config_entries=SimpleNamespace(async_reload=Mock(return_value="reload-coro")),
     )
     coord.entry = SimpleNamespace(entry_id="entry1")
@@ -33,11 +36,12 @@ def _bare_coordinator(*, last_confirmed_stack: Stack | None) -> KibbleCoordinato
     coord.data = None
     coord.consecutive_failures = 0
     coord.last_error = None
+    coord._ingest_task = None
     return coord
 
 
 def _data(detected_stack: Stack | None) -> SimpleNamespace:
-    return SimpleNamespace(detected_stack=detected_stack)
+    return SimpleNamespace(detected_stack=detected_stack, events=(), feeds=())
 
 
 # --- _check_stack_change: the core reload-on-change decision -----------------------------------
@@ -179,4 +183,7 @@ async def test_a_successful_poll_confirming_a_new_stack_reloads_exactly_once(
 
     assert result is fresh
     coord.hass.config_entries.async_reload.assert_called_once_with("entry1")
-    coord.hass.async_create_task.assert_called_once_with("reload-coro")
+    # `async_create_task` also carries the always-scheduled ingest task after every successful
+    # cycle now (docs/36-ai-pipeline.md) -- assert the reload is among its calls, not that it
+    # is the only one.
+    assert call("reload-coro") in coord.hass.async_create_task.call_args_list

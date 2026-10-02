@@ -107,6 +107,7 @@ def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
     coord = object.__new__(KibbleCoordinator)
     coord.client = client
     coord.entry = SimpleNamespace(options={})
+    coord.data = None
     return coord
 
 
@@ -123,10 +124,6 @@ async def test_get_desiccant_404_leaves_desiccant_none_while_the_rest_of_the_pol
         desiccant=AsyncMock(side_effect=KibbleNotFoundError("not found")),
         wifi=AsyncMock(return_value=object()),
         wifi_scan=AsyncMock(return_value=[]),
-        cats=AsyncMock(return_value=[]),
-        identify=AsyncMock(return_value=object()),
-        review_face=AsyncMock(return_value=object()),
-        pending_faces=AsyncMock(return_value=[]),
         clips=AsyncMock(return_value=[]),
         feeds=AsyncMock(return_value=[]),
         events=AsyncMock(return_value=[]),

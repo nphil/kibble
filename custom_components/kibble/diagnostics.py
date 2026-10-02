@@ -42,6 +42,8 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics for a config entry."""
     coordinator = entry.runtime_data
     data = coordinator.data
+    vision_judge = coordinator.ingestor.vision_judge
+    coral_status = coordinator.engine.coral_status
 
     return async_redact_data(
         {
@@ -72,6 +74,24 @@ async def async_get_config_entry_diagnostics(
                     if coordinator.update_interval is None
                     else coordinator.update_interval.total_seconds()
                 ),
+            },
+            # docs/40-vision-judge.md: `None` in every test fixture that never wires one up
+            # (mirrors `Ingestor.vision_judge`'s own docstring); a real setup always has one.
+            "vision_judge": {
+                "enabled": vision_judge.enabled if vision_judge is not None else False,
+                "model": vision_judge.model if vision_judge is not None else None,
+                "last_error": vision_judge.last_error if vision_judge is not None else None,
+                "verdict_counts": await coordinator.store.async_judge_diagnostics(),
+                "cat_descriptions": await coordinator.store.async_cat_descriptions(),
+            },
+            # docs/41-coral-recognition.md: `coral_status` is `None` whenever `coralhub_url`
+            # is unset for this entry -- the histogram recognizer is the only backend then,
+            # same "off means off, no second system running" shape `vision_judge` has above.
+            "coral": {
+                "backend": coordinator.engine.backend,
+                "configured": coral_status.configured if coral_status is not None else False,
+                "available": coral_status.available if coral_status is not None else False,
+                "last_error": coral_status.last_error if coral_status is not None else None,
             },
             "data": asdict(data) if data is not None else None,
         },

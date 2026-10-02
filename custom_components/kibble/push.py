@@ -34,14 +34,11 @@ from typing import Any
 import aiohttp
 
 from .api import (
-    CatInfo,
     ClipInfo,
     CloudState,
     DetectionEvent,
     FeedRecord,
     FeederState,
-    IdentifyResult,
-    ReviewFace,
     ScheduleState,
     WifiNetwork,
     WifiState,
@@ -84,8 +81,8 @@ class Frame:
 
 # Field name (as the agent's `push::Field::name`, == `KibbleData` attribute) -> parser of the
 # exact `GET` body for that field. Kept as a table so a missing entry is a test failure, not a
-# silently ignored field. `pending_faces` is the raw `GET /faces/pending` list; `KibbleData`
-# stores its length, as the poll path does.
+# silently ignored field. `cats`/`identify`/`review_face`/`pending_faces` no longer exist as
+# push bodies (docs/36-ai-pipeline.md: identity moved entirely to HA's own store/ingest).
 _PARSERS: dict[str, Callable[[Any], Any]] = {
     "state": FeederState.from_json,
     "schedule": ScheduleState.from_json,
@@ -93,16 +90,10 @@ _PARSERS: dict[str, Callable[[Any], Any]] = {
     "cloud": CloudState.from_json,
     "wifi": WifiState.from_json,
     "wifi_scan": lambda body: tuple(WifiNetwork.from_json(n) for n in body),
-    "cats": lambda body: tuple(CatInfo.from_json(c) for c in body),
-    "identify": IdentifyResult.from_json,
-    "review_face": ReviewFace.from_json,
-    "pending_faces": lambda body: len(body),
     "clips": lambda body: tuple(ClipInfo.from_json(c) for c in body),
     "feeds": lambda body: tuple(FeedRecord.from_json(f) for f in body),
     "events": lambda body: tuple(DetectionEvent.from_json(e) for e in body),
 }
-# `KibbleData` attribute for each frame field where the two names differ.
-_ATTR = {"pending_faces": "pending_face_count"}
 SNAPSHOT_FIELDS = frozenset(_PARSERS)
 
 
@@ -116,7 +107,7 @@ def parse_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
         parser = _PARSERS.get(name)
         if parser is None or body is None:
             continue
-        parsed[_ATTR.get(name, name)] = parser(body)
+        parsed[name] = parser(body)
     return parsed
 
 

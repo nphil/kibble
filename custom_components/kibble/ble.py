@@ -50,6 +50,7 @@ async def async_feed(
     amount: int,
     feed_id: str | None = None,
     cancel: bool = False,
+    amount2: int | None = None,
 ) -> bool:
     """Write a Kibble feed frame to `address` via whichever Bluetooth proxy currently sees it.
 
@@ -57,12 +58,15 @@ async def async_feed(
     write completed but nothing notified back (expected until a Kibble `ctrl` replacement is
     the one answering on-device). Raises `BleFeedError` for anything that means the command
     almost certainly never reached the device at all.
+
+    `amount2`, for `hopper="both"`, is hopper 2's own independent share of a split feed --
+    see `frame.hopper_amounts`. `None` (the default) dispenses `amount` from each side.
     """
     ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
     if ble_device is None:
         raise BleFeedError(f"{address} is not visible to any Bluetooth proxy right now")
 
-    amount1, amount2 = hopper_amounts(hopper, amount)
+    amount1, amount2 = hopper_amounts(hopper, amount, amount2)
     frame = encode_feed_frame(cancel=cancel, feed_id=feed_id, amount1=amount1, amount2=amount2)
 
     notified = asyncio.Event()

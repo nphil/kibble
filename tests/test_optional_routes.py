@@ -1,10 +1,9 @@
 """Direct regression test for coordinator.py's `_optional` helper: LibreFeed serves only part
 of `kibbled`'s HTTP API today (`/state`, `/feeds`, `/wifi`, `/cloud`, `/mode`, `/schedule` --
-more routes are coming), so `_fetch_all`'s other reads (`config`, `wifi_scan`, `cats`,
-`identify`, `review_face`, `pending_faces`, `clips`, `feeds`, `events`, `schedule`) must not
-fail the whole poll cycle when the agent 404s a route it hasn't grown yet. Any other
-`KibbleError` (connection refused, timeout, a real 5xx) must still fail the poll exactly as
-before -- only a 404 is optional.
+more routes are coming), so `_fetch_all`'s other reads (`config`, `wifi_scan`, `clips`,
+`feeds`, `events`, `schedule`) must not fail the whole poll cycle when the agent 404s a route
+it hasn't grown yet. Any other `KibbleError` (connection refused, timeout, a real 5xx) must
+still fail the poll exactly as before -- only a 404 is optional.
 
 Same fake-client/bare-coordinator style as `test_stack_select.py`'s
 `test_get_mode_failure_leaves_stack_none_while_the_rest_of_the_poll_still_updates`: a real,
@@ -26,15 +25,19 @@ from kibble.coordinator import KibbleCoordinator
 def _coordinator_for_fetch(client: AsyncMock) -> KibbleCoordinator:
     """A real (uninitialized) `KibbleCoordinator` with only what `_fetch_all`/
     `_async_update_data` read set by hand -- same `object.__new__` approach as
-    `test_coordinator_availability.py`/`test_stack_select.py`."""
+    `test_coordinator_availability.py`/`test_stack_select.py`. `hass.async_create_task` closes
+    the ingest coroutine `_schedule_ingest` hands it rather than running it: ingest itself is
+    exercised in `test_ingest_scheduling.py`-style coverage elsewhere, and an unclosed
+    coroutine would otherwise warn."""
     coord = object.__new__(KibbleCoordinator)
-    coord.hass = object()
+    coord.hass = SimpleNamespace(async_create_task=lambda coro: coro.close())
     coord.client = client
     coord.entry = SimpleNamespace(entry_id="entry1", title="Cat Feeder", options={})
     coord.data = None
     coord.consecutive_failures = 0
     coord.last_error = None
     coord._last_confirmed_stack = None
+    coord._ingest_task = None
     return coord
 
 
@@ -50,10 +53,6 @@ def _librefeed_client(**overrides: AsyncMock) -> AsyncMock:
         mode=AsyncMock(return_value=StackState.from_json({"running": "librefeed"})),
         wifi=AsyncMock(return_value=object()),
         wifi_scan=AsyncMock(return_value=[]),
-        cats=AsyncMock(return_value=[]),
-        identify=AsyncMock(return_value=object()),
-        review_face=AsyncMock(return_value=object()),
-        pending_faces=AsyncMock(return_value=[]),
         clips=AsyncMock(return_value=[]),
         feeds=AsyncMock(return_value=[]),
         events=AsyncMock(return_value=[]),
@@ -63,16 +62,14 @@ def _librefeed_client(**overrides: AsyncMock) -> AsyncMock:
     return client
 
 
-async def test_404_on_cats_and_events_yields_empty_tuples_and_the_poll_succeeds() -> None:
+async def test_404_on_events_yields_an_empty_tuple_and_the_poll_succeeds() -> None:
     client = _librefeed_client(
-        cats=AsyncMock(side_effect=KibbleNotFoundError("/cats not supported by this agent")),
-        events=AsyncMock(side_effect=KibbleNotFoundError("/events not supported by this agent")),
+        events=AsyncMock(side_effect=KibbleNotFoundError("/events not supported by this agent"))
     )
     coord = _coordinator_for_fetch(client)
 
     data = await coord._async_update_data()
 
-    assert data.cats == ()
     assert data.events == ()
     # The poll itself was treated as a success -- no failure recorded, exactly like
     # `test_coordinator_availability.py`'s `test_successful_cycle_resets_failures_and_returns_fresh_data`.
@@ -80,13 +77,13 @@ async def test_404_on_cats_and_events_yields_empty_tuples_and_the_poll_succeeds(
     assert coord.last_error is None
 
 
-async def test_connection_error_on_cats_still_fails_the_poll() -> None:
+async def test_connection_error_on_events_still_fails_the_poll() -> None:
     """Unlike a 404, a genuine connection failure on an optional route must not be swallowed --
     `_optional` only catches `KibbleNotFoundError`. With no prior snapshot to fall back on,
     `_handle_poll_failure` raises immediately (see `test_coordinator_availability.py`'s
     `test_failure_with_no_prior_data_raises_immediately_even_on_the_first_attempt`)."""
     client = _librefeed_client(
-        cats=AsyncMock(side_effect=KibbleConnectionError("agent.local: connection refused"))
+        events=AsyncMock(side_effect=KibbleConnectionError("agent.local: connection refused"))
     )
     coord = _coordinator_for_fetch(client)
 

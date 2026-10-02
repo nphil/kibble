@@ -60,6 +60,18 @@
       },
       "replace_desiccant": {
         "name": "Replace desiccant"
+      },
+      "hopper_1_full": {
+        "name": "Hopper 1 full"
+      },
+      "hopper_2_full": {
+        "name": "Hopper 2 full"
+      },
+      "hopper_full": {
+        "name": "Both hoppers full"
+      },
+      "call_cats": {
+        "name": "Call the cats"
       }
     },
     "event": {
@@ -101,9 +113,6 @@
       }
     },
     "image": {
-      "pending_face": {
-        "name": "Pending face"
-      },
       "dish_before": {
         "name": "Dish before feed"
       },
@@ -112,6 +121,9 @@
       },
       "last_detection": {
         "name": "Last detection"
+      },
+      "cat_avatar": {
+        "name": "{cat_name} avatar"
       }
     },
     "light": {
@@ -219,12 +231,6 @@
       "last_seen_pet": {
         "name": "Last seen pet"
       },
-      "identification_score": {
-        "name": "Identification score"
-      },
-      "pending_faces": {
-        "name": "Pending faces"
-      },
       "clips": {
         "name": "Stored clips"
       },
@@ -252,11 +258,35 @@
           "inherited": "Inherited",
           "uncalibrated": "Uncalibrated"
         }
+      },
+      "hopper_1_remaining": {
+        "name": "Hopper 1 remaining"
+      },
+      "hopper_2_remaining": {
+        "name": "Hopper 2 remaining"
+      },
+      "cat_last_seen": {
+        "name": "{cat_name} last seen"
+      },
+      "cat_last_meal": {
+        "name": "{cat_name} last meal"
+      },
+      "cat_meals_today": {
+        "name": "{cat_name} meals today"
+      },
+      "cat_recognition": {
+        "name": "{cat_name} recognition"
+      },
+      "recognition": {
+        "name": "Recognition"
       }
     },
     "switch": {
       "night": {
         "name": "Night vision"
+      },
+      "auto_learn": {
+        "name": "Learn automatically"
       },
       "microphone": {
         "name": "Microphone"
@@ -311,14 +341,14 @@
       },
       "detection_overlay_ignored": {
         "name": "Overlay ignored detections"
+      },
+      "hopper_divider": {
+        "name": "Hopper divider"
       }
     },
     "select": {
       "wifi": {
         "name": "Wi-Fi network"
-      },
-      "label_face": {
-        "name": "Label face"
       },
       "selected_sound": {
         "name": "Selected notification sound"
@@ -330,7 +360,7 @@
         "name": "Stack",
         "state": {
           "vendor": "Petkit stack",
-          "librefeed": "LibreFeed"
+          "librefeed": "KibbleOS"
         }
       },
       "camera_indicator": {
@@ -351,6 +381,12 @@
       },
       "do_not_disturb_hours": {
         "name": "Do-not-disturb hours"
+      },
+      "hopper_1_food": {
+        "name": "Hopper 1 food"
+      },
+      "hopper_2_food": {
+        "name": "Hopper 2 food"
       }
     }
   },
@@ -365,11 +401,15 @@
         },
         "hopper": {
           "name": "Hopper",
-          "description": "Which auger to run. The divider may be removed, in which case both draw from one bin."
+          "description": "Which hopper to run. With the divider fitted, \"both\" dispenses the amount from each hopper; with it removed there is one shared bin and \"both\" dispenses the amount from it once."
         },
         "amount": {
           "name": "Amount",
           "description": "Portions to dispense."
+        },
+        "amount2": {
+          "name": "Amount (hopper 2)",
+          "description": "Portions to dispense from hopper 2, when hopper is \"both\" and a different split from hopper 1 is wanted. Defaults to the same as Amount."
         },
         "id": {
           "name": "Feed ID",
@@ -557,98 +597,6 @@
         }
       }
     },
-    "label_face": {
-      "name": "Label face",
-      "description": "Move a pending face crop into a cat's permanent storage and train the identifier on it.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to label a crop on."
-        },
-        "crop_id": {
-          "name": "Crop ID",
-          "description": "The pending crop's filename, from image.cat_feeder_pending_face's attributes or GET /faces/pending."
-        },
-        "cat": {
-          "name": "Cat",
-          "description": "The cat's name, or \"other\"/\"not_a_cat\" to skip training on this crop."
-        }
-      }
-    },
-    "unlabel_face": {
-      "name": "Unlabel face",
-      "description": "Move a labelled crop back into the pending review queue, the exact inverse of Label face.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to unlabel a crop on."
-        },
-        "cat": {
-          "name": "Cat",
-          "description": "The cat the crop is currently labelled under."
-        },
-        "name": {
-          "name": "Crop name",
-          "description": "The labelled sample's filename."
-        }
-      }
-    },
-    "upload_face_sample": {
-      "name": "Upload face sample",
-      "description": "Add an externally-supplied, already-cropped 224x224 JPEG photo as a labelled training sample for a cat.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to upload a sample to."
-        },
-        "cat": {
-          "name": "Cat",
-          "description": "The cat to train. Must already exist."
-        },
-        "jpeg_b64": {
-          "name": "JPEG (base64)",
-          "description": "Base64-encoded, already-cropped 224x224 JPEG bytes."
-        }
-      }
-    },
-    "add_cat": {
-      "name": "Add cat",
-      "description": "Pre-register a cat with zero samples, so it appears as a label option before its first crop is labelled.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to add a cat to."
-        },
-        "name": {
-          "name": "Name",
-          "description": "The new cat's name."
-        }
-      }
-    },
-    "delete_cat": {
-      "name": "Delete cat",
-      "description": "Remove a cat, every one of its labelled samples, and its trained classifier model.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to delete a cat from."
-        },
-        "name": {
-          "name": "Name",
-          "description": "The cat's name to delete."
-        }
-      }
-    },
-    "identify": {
-      "name": "Identify now",
-      "description": "Force an immediate identification of the newest pending crop and refresh the last-seen-pet sensor.",
-      "fields": {
-        "device_id": {
-          "name": "Feeder",
-          "description": "The feeder to identify."
-        }
-      }
-    },
     "save_clip": {
       "name": "Save clip",
       "description": "Download audio from an HA media source or URL, convert it, and store it on the feeder as a named clip.",
@@ -701,7 +649,7 @@
     },
     "beep": {
       "name": "Beep",
-      "description": "Play the MCU buzzer once (LibreFeed-only).",
+      "description": "Play the MCU buzzer once (KibbleOS only).",
       "fields": {
         "device_id": {
           "name": "Feeder",
@@ -721,9 +669,19 @@
         }
       }
     },
+    "call_cats": {
+      "name": "Call the cats",
+      "description": "Play the feeding cue through the feeder's speaker on demand (KibbleOS only). Does not dispense food.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to call."
+        }
+      }
+    },
     "set_desiccant": {
       "name": "Set desiccant",
-      "description": "Set the desiccant pack's remaining days or its rated replacement interval (LibreFeed-only).",
+      "description": "Set the desiccant pack's remaining days or its rated replacement interval (KibbleOS only).",
       "fields": {
         "device_id": {
           "name": "Feeder",
@@ -738,26 +696,49 @@
           "description": "How many days a fresh desiccant pack is rated to last."
         }
       }
+    },
+    "clear_training": {
+      "name": "Clear training photos",
+      "description": "Remove training photos and rebuild the identity model. Never touches event history.",
+      "fields": {
+        "device_id": {
+          "name": "Feeder",
+          "description": "The feeder to update."
+        },
+        "cat": {
+          "name": "Cat",
+          "description": "A cat's name, or \"all\" for every enrolled cat."
+        },
+        "keep_uploads": {
+          "name": "Keep uploaded photos",
+          "description": "Keep photos you uploaded yourself; remove everything else."
+        }
+      }
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Video source, Bluetooth fallback, schedule writes & vendor pet ids",
-        "description": "The feeder serves its video to one consumer only — Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.\n\nSchedule-card writes (add/edit/remove/toggle) are refused until you turn this on — the MCU's per-entry time encoding is still unconfirmed, so a wrong table could dispense at the wrong time or amount.\n\nThe feeder's own identifier reports the Petkit cloud pet id it was enrolled under, never a name. List `id=name` pairs (the id shows as `pet_id` on the last detection sensor) so that cat's presence sensor also follows the vendor's identification.",
+        "title": "Video, Bluetooth, history & schedule settings",
+        "description": "The feeder serves its video to one consumer only: Scrypted. Paste Scrypted's rebroadcast URL for the feeder here so Home Assistant consumes that instead of opening a second stream on the device. Leave empty to use the device directly.\n\nIf the feeder's BLE MAC is known (once a Bluetooth proxy has seen it advertise), feed commands fall back to Bluetooth whenever the agent's Wi-Fi API is unreachable. Leave empty to disable the fallback.\n\nSchedule-card writes (add/edit/remove/toggle) are refused until you turn this on — the MCU's per-entry time encoding is still unconfirmed, so a wrong table could dispense at the wrong time or amount.\n\nEvidence, the event journal and training live in Home Assistant's own storage now, not on the feeder. Choose how long to keep them.\n\nPaste Scrypted's own address (e.g. http://192.168.1.69:11080) to show a short video clip of each meal in the timeline, recorded by Scrypted's Events Recorder. Leave empty to show only photos.\n\nPaste the vision judge's own address (e.g. http://192.168.1.69:9292/v1) to send each meal or uncertain visit's photos to a second-opinion vision model that can hide a false alarm or fix a name the built-in recognizer is unsure about. It never changes what counts as a meal, and it never trains the recognizer by itself. Leave empty (the default) to disable it. The model field selects which model alias to ask for; the feeder integration's own bake-off publishes a dedicated \"qwen3-vl-4b\" model.\n\nLeaving CoralHub's server address blank keeps cat recognition exactly as it is today, using the feeder's built-in recognizer. Filling in CoralHub's own address (plus its API token, if CoralHub has one set) lets Kibble use CoralHub's Google Coral hardware for more accurate cat recognition. If CoralHub is ever unreachable, Kibble automatically falls back to today's built-in recognizer.",
         "data": {
           "stream_url": "Rebroadcast RTSP URL",
           "ble_address": "Feeder BLE MAC address",
           "enable_schedule_writes": "Allow schedule card writes (unconfirmed encoding)",
-          "vendor_pet_ids": "Vendor pet ids (id=name, comma separated)",
-          "stream_entity": "Camera entity to stream from (optional)"
+          "stream_entity": "Camera entity to stream from (optional)",
+          "retention_days": "Keep feeder history for",
+          "scrypted_clips_url": "Scrypted clips server (optional)",
+          "vision_judge_url": "Vision judge server (optional)",
+          "vision_judge_model": "Vision judge model alias",
+          "coralhub_url": "CoralHub server (optional)",
+          "coralhub_token": "CoralHub API token"
         }
       }
     },
     "error": {
       "not_rtsp": "Must be an rtsp:// URL.",
       "not_mac": "Must be a MAC address, e.g. AA:BB:CC:DD:EE:FF.",
-      "bad_pet_ids": "Each entry must be <numeric id>=<name>, e.g. 101320712=Kitty"
+      "not_http": "Must be an http:// or https:// URL."
     }
   },
   "exceptions": {
@@ -767,11 +748,17 @@
     "speaker_busy": {
       "message": "The feeder's speaker is already in use (another clip, or the vendor app): {error}"
     },
+    "cue_cooldown": {
+      "message": "Call the cats is on cooldown, try again in a moment: {error}"
+    },
     "unknown_device": {
       "message": "{device_id} is not a Kibble feeder."
     },
     "device_required": {
       "message": "Say which feeder: {count} are set up, so device_id is required."
+    },
+    "unknown_cat": {
+      "message": "{cat} is not an enrolled cat."
     },
     "schedule_writes_disabled": {
       "message": "Schedule writing is disabled until the time encoding is confirmed — see docs/schedule."
@@ -779,11 +766,11 @@
     "unknown_schedule_entry": {
       "message": "No schedule entry with ID {entry_id}."
     },
-    "no_pending_face": {
-      "message": "No pending face to label right now."
-    },
     "invalid_jpeg_data": {
       "message": "The uploaded photo data isn't valid: {error}"
+    },
+    "feed_button_zero_amount": {
+      "message": "This feed button's own amount is set to 0 portions, so there's nothing to dispense."
     }
   },
   "issues": {

@@ -14,7 +14,7 @@ from typing import NoReturn
 
 from homeassistant.exceptions import HomeAssistantError
 
-from .api import KibbleSpeakerBusyError
+from .api import KibbleCueCooldownError, KibbleSpeakerBusyError
 from .const import DOMAIN
 
 
@@ -36,5 +36,17 @@ def raise_speaker_busy(err: KibbleSpeakerBusyError) -> NoReturn:
     raise HomeAssistantError(
         translation_domain=DOMAIN,
         translation_key="speaker_busy",
+        translation_placeholders={"error": str(err)},
+    ) from err
+
+
+def raise_cue_cooldown(err: KibbleCueCooldownError) -> NoReturn:
+    """`POST /cue`'s per-call debounce (`api.py`'s 429 handling, `speaker::SpeakerOwner::
+    try_start_call`) rejected a call within `CALL_COOLDOWN` of the last one -- a real, if
+    transient, condition distinct enough from a generic agent failure to get its own message
+    (see `strings.json`'s `cue_cooldown`)."""
+    raise HomeAssistantError(
+        translation_domain=DOMAIN,
+        translation_key="cue_cooldown",
         translation_placeholders={"error": str(err)},
     ) from err

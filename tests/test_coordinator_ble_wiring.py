@@ -47,5 +47,22 @@ async def test_configured_address_calls_ble_async_feed_with_matching_arguments(
     await attempt()
 
     recorded.assert_awaited_once_with(
-        HASS, "AA:BB:CC:DD:EE:FF", hopper="both", amount=12, feed_id="feed-1"
+        HASS, "AA:BB:CC:DD:EE:FF", hopper="both", amount=12, feed_id="feed-1", amount2=None
+    )
+
+
+async def test_configured_address_forwards_an_explicit_amount2(monkeypatch) -> None:
+    """The one-line addition this batch makes to `_ble_feed`'s own wiring: a genuine split
+    reaches `ble.async_feed` as a real `amount2`, not silently dropped."""
+    recorded = AsyncMock()
+    monkeypatch.setattr(ble, "async_feed", recorded)
+
+    fake_self = _fake_coordinator({CONF_BLE_ADDRESS: "AA:BB:CC:DD:EE:FF"})
+    attempt = KibbleCoordinator._ble_feed(fake_self, "both", 4, "feed-2", 7)
+    assert attempt is not None
+
+    await attempt()
+
+    recorded.assert_awaited_once_with(
+        HASS, "AA:BB:CC:DD:EE:FF", hopper="both", amount=4, feed_id="feed-2", amount2=7
     )

@@ -37,8 +37,8 @@ def _device(*identifiers: tuple[str, str]) -> SimpleNamespace:
 
 
 async def test_the_entrys_own_live_feeder_device_cannot_be_removed() -> None:
-    entry = _entry("20251204DJ0534")
-    device = _device(("kibble", "20251204DJ0534"))
+    entry = _entry("20250101XX0001")
+    device = _device(("kibble", "20250101XX0001"))
 
     allowed = await _kibble_init.async_remove_config_entry_device(object(), entry, device)
 
@@ -47,7 +47,7 @@ async def test_the_entrys_own_live_feeder_device_cannot_be_removed() -> None:
 
 async def test_an_orphan_device_with_an_empty_serial_can_be_removed() -> None:
     """The exact empty-serial-orphan shape this hook exists for."""
-    entry = _entry("20251204DJ0534")
+    entry = _entry("20250101XX0001")
     device = _device(("kibble", ""))
 
     allowed = await _kibble_init.async_remove_config_entry_device(object(), entry, device)
@@ -56,7 +56,7 @@ async def test_an_orphan_device_with_an_empty_serial_can_be_removed() -> None:
 
 
 async def test_an_orphan_device_from_a_stale_replaced_serial_can_be_removed() -> None:
-    entry = _entry("20251204DJ0534")
+    entry = _entry("20250101XX0001")
     device = _device(("kibble", "some-old-replaced-serial"))
 
     allowed = await _kibble_init.async_remove_config_entry_device(object(), entry, device)
@@ -67,8 +67,8 @@ async def test_an_orphan_device_from_a_stale_replaced_serial_can_be_removed() ->
 async def test_a_device_with_no_kibble_identifier_at_all_can_be_removed() -> None:
     """Defensive: a device registered under this config entry via some other integration's
     identifier (not expected in practice, but the hook must not assume one is always present)."""
-    entry = _entry("20251204DJ0534")
-    device = _device(("other_domain", "20251204DJ0534"))
+    entry = _entry("20250101XX0001")
+    device = _device(("other_domain", "20250101XX0001"))
 
     allowed = await _kibble_init.async_remove_config_entry_device(object(), entry, device)
 

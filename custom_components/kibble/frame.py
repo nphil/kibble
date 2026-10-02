@@ -72,19 +72,26 @@ class FeedFrame:
     amount2: int
 
 
-def hopper_amounts(hopper: str, amount: int) -> tuple[int, int]:
-    """`hopper`/`amount` (the HA service's vocabulary) -> `(amount1, amount2)`.
+def hopper_amounts(hopper: str, amount: int, amount2: int | None = None) -> tuple[int, int]:
+    """`hopper`/`amount`/`amount2` (the HA service's vocabulary) -> `(amount1, amount2)`.
 
-    Mirrors `agent/src/main.rs::feed()`'s match arms exactly. The HTTP path's translation
-    happens on-device, in the agent; the BLE path bypasses the agent entirely, so this is not
-    reusing that logic, it is a second copy of it -- kept honest by `test_ble_frame.py`.
+    The BLE path bypasses any on-device agent entirely, so this has always been its own copy
+    of the (hopper, amount) -> (amount1, amount2) translation rather than a reuse of one --
+    kept honest by `test_ble_frame.py`. `amount2` mirrors `compat.rs::feed`'s own handling
+    (the daemon's HTTP `/feed`, which already accepts a distinct `amount2` for hopper="both"):
+    `None` (the default -- every pre-existing caller) duplicates `amount` onto both bytes,
+    exactly like the single-amount vendor agent this function used to mirror exclusively;
+    given explicitly, it becomes hopper 2's own independent byte, since the wire struct this
+    frame carries (`_FEED_STRUCT`) already has two independent one-byte fields and needs no
+    change to carry a genuine split. Ignored outright for a single hopper ("1"/"2"): there is
+    only one side to feed, so a stray amount2 can never partially apply.
     """
     if hopper == "1":
         return amount, 0
     if hopper == "2":
         return 0, amount
     if hopper == "both":
-        return amount, amount
+        return amount, amount if amount2 is None else amount2
     raise FrameError(f'hopper must be "1", "2" or "both", got {hopper!r}')
 
 

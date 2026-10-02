@@ -56,6 +56,7 @@ from .const import (
     MAX_SURPLUS_STANDARD,
     MIN_AMOUNT,
     MIN_DETECT_INTERVAL_S,
+    MIN_HOPPER_AMOUNT,
     MIN_SENSITIVITY,
     MIN_SURPLUS_STANDARD,
 )
@@ -164,11 +165,19 @@ async def async_setup_entry(
 
 
 class KibbleFeedAmount(KibbleEntity, NumberEntity, RestoreEntity):
-    """How many portions the matching feed button dispenses."""
+    """How many portions the matching feed button dispenses.
+
+    The combined control (`feed_amount`, hopper="both", single-hopper mode's only amount
+    control) keeps `MIN_AMOUNT` as its own floor -- it always means "dispense something". The
+    two per-hopper controls (`feed_amount_hopper_1`/`_2`) allow `MIN_HOPPER_AMOUNT` (0)
+    instead: kibble-card.ts's dual-hopper hero sets these two directly now, one row per
+    hopper, and 0 means "nothing from this hopper" -- left out of the `kibble.feed` call
+    entirely (`dual-feed.ts`), never sent to the device as a 0-portion dispense. `button.py`'s
+    `KibbleFeedButton` (the per-hopper quick-feed buttons, unaffected by this batch otherwise)
+    refuses to press at 0 for the same reason -- see its own docstring."""
 
     entity_description: KibbleAmountDescription
 
-    _attr_native_min_value = MIN_AMOUNT
     _attr_native_max_value = MAX_AMOUNT
     _attr_native_step = 1
     _attr_mode = NumberMode.BOX
@@ -176,7 +185,11 @@ class KibbleFeedAmount(KibbleEntity, NumberEntity, RestoreEntity):
     def __init__(self, coordinator, description: KibbleAmountDescription) -> None:
         super().__init__(coordinator, description.key)
         self.entity_description = description
-        self._value = float(MIN_AMOUNT)
+        self._value = float(self.native_min_value)
+
+    @property
+    def native_min_value(self) -> float:
+        return MIN_AMOUNT if self.entity_description.hopper == HOPPER_BOTH else MIN_HOPPER_AMOUNT
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()

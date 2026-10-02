@@ -123,6 +123,50 @@ async def test_writes_the_correctly_translated_frame_to_the_write_characteristic
     assert decoded.cancel is False
 
 
+async def test_writes_a_genuine_split_when_amount2_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: `hopper="both"` plus a distinct `amount2` must reach the wire as two
+    different bytes, not `amount` duplicated onto both -- the BLE fallback's own parity with
+    the daemon's HTTP `/feed` (`compat.rs`), which already supports the same split."""
+    _patch_device_found(monkeypatch)
+    fake_client = _FakeBleakClient()
+
+    async def _connect(*_args, **_kwargs):
+        return fake_client
+
+    monkeypatch.setattr(ble, "establish_connection", _connect)
+
+    ok = await ble.async_feed(
+        hass=object(), address=ADDRESS, hopper="both", amount=5, amount2=2, feed_id="split-test"
+    )
+
+    assert ok is True
+    uuid, data, _response = fake_client.writes[0]
+    assert uuid == CHAR_WRITE_UUID
+    decoded = decode_feed_frame(data)
+    assert (decoded.amount1, decoded.amount2) == (5, 2)
+
+
+async def test_omitted_amount2_still_duplicates_amount_for_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pre-existing caller never passed amount2 at all -- confirms that path is
+    unchanged end-to-end, not just at the `hopper_amounts` unit level."""
+    _patch_device_found(monkeypatch)
+    fake_client = _FakeBleakClient()
+
+    async def _connect(*_args, **_kwargs):
+        return fake_client
+
+    monkeypatch.setattr(ble, "establish_connection", _connect)
+
+    await ble.async_feed(hass=object(), address=ADDRESS, hopper="both", amount=6)
+
+    decoded = decode_feed_frame(fake_client.writes[0][1])
+    assert (decoded.amount1, decoded.amount2) == (6, 6)
+
+
 async def test_returns_false_when_notify_never_arrives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

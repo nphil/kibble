@@ -23,14 +23,19 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 
 
 def _bare_coordinator(*, data=None, consecutive_failures: int = 0) -> KibbleCoordinator:
-    """A real (uninitialized) `KibbleCoordinator` with only what the methods under test read."""
+    """A real (uninitialized) `KibbleCoordinator` with only what the methods under test read.
+    `hass.async_create_task` closes whatever coroutine `_schedule_ingest` hands it after a
+    successful cycle -- ingest itself is out of scope here."""
     coord = object.__new__(KibbleCoordinator)
-    coord.hass = object()
+    coord.hass = SimpleNamespace(
+        async_create_task=lambda coro: coro.close() if hasattr(coro, "close") else None
+    )
     coord.entry = SimpleNamespace(entry_id="entry1", title="Cat Feeder")
     coord.client = AsyncMock()
     coord.data = data
     coord.consecutive_failures = consecutive_failures
     coord.last_error = None
+    coord._ingest_task = None
     return coord
 
 
@@ -208,7 +213,7 @@ async def test_successful_cycle_resets_failures_and_returns_fresh_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coord = _bare_coordinator(data=object(), consecutive_failures=2)
-    fresh = SimpleNamespace(detected_stack=None)
+    fresh = SimpleNamespace(detected_stack=None, events=(), feeds=())
     monkeypatch.setattr(coord, "_fetch_all", AsyncMock(return_value=fresh))
 
     result = await coord._async_update_data()

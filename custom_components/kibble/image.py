@@ -1,5 +1,5 @@
-"""Image entities for Kibble: the pending-face crop to label next, and the before/after dish
-snapshot pair from the most recent feed cycle (`agent/src/feed_capture.rs`)."""
+"""Image entities for Kibble: the newest identified crop, and the before/after dish snapshot
+pair from the most recent feed cycle (`agent/src/feed_capture.rs`)."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ from homeassistant.components.image import ImageEntity, ImageEntityDescription
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.util import dt as dt_util
+from homeassistant.util import dt as dt_util, slugify
 
-from .api import DetectionEvent, FeedRecord, KibbleError, ReviewFace
+from .api import FeedRecord, KibbleError
 from .const import CONF_HOST, CONF_PORT
-from .coordinator import KibbleConfigEntry
+from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity
 from .stacks import applies_to
+from .store import DeviceIdentitySummary, _utc_date
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,8 +50,6 @@ async def async_setup_entry(
 ) -> None:
     stack = entry.runtime_data.data.detected_stack
     entities: list[ImageEntity] = []
-    if applies_to(Platform.IMAGE, "pending_face", stack):
-        entities.append(KibblePendingFaceImage(hass, entry))
     if applies_to(Platform.IMAGE, "last_detection_image", stack):
         entities.append(KibbleLastDetectionImage(hass, entry))
     entities.extend(
@@ -60,114 +59,127 @@ async def async_setup_entry(
     )
     async_add_entities(entities)
 
+    if not applies_to(Platform.IMAGE, "cat_avatar", stack):
+        return
 
-def _image_url(entry: KibbleConfigEntry, review: ReviewFace, pending_face_count: int) -> str | None:
-    """The agent's `GET /faces/current` URL, with the crop's status/name *and* the current
-    pending-queue length folded into a cache-busting query parameter -- `agent/src/main.rs`
-    ignores the parameter's value, but `ImageEntity` only refetches (and only bumps its "last
-    updated" timestamp, which is this entity's *state*) when this URL *string* itself changes,
-    so encoding *which* crop is showing into it is what makes a new crop actually appear
-    without a manual refresh. `pending_face_count` matters on its own: `review_face` names only
-    the oldest pending crop (or the most recent label once the queue is empty), so a new crop
-    arriving behind it, or an unlabel that isn't the current one, changes the *count* without
-    changing *review_face* at all -- cards watching this entity's state to know when to refetch
-    `kibble/faces/pending` need every pending-list mutation to bump it, not only ones that
-    reshuffle the front of the queue. `None` (no URL at all) only when nothing has ever been
-    captured."""
-    if review.name is None:
-        return None
-    host = entry.data[CONF_HOST]
-    port = entry.data[CONF_PORT]
-    cache_key = quote(f"{review.status}-{review.name}-{pending_face_count}", safe="")
-    return f"http://{host}:{port}/faces/current?id={cache_key}"
-
-
-class KibblePendingFaceImage(KibbleEntity, ImageEntity):
-    """The oldest pending crop awaiting a label, or the most recently labelled one once the
-    queue is empty (`agent/src/faces.rs`'s `review_target`) -- so the picture is never blank
-    once caught up. Paired with `select.cat_feeder_label_face`, which acts on the same crop."""
-
-    _attr_translation_key = "pending_face"
-
-    def __init__(self, hass: HomeAssistant, entry: KibbleConfigEntry) -> None:
-        KibbleEntity.__init__(self, entry.runtime_data, "pending_face")
-        ImageEntity.__init__(self, hass)
-        self._entry = entry
-        data = entry.runtime_data.data
-        self._attr_image_url = _image_url(entry, data.review_face, data.pending_face_count)
-        self._attr_image_last_updated = dt_util.utcnow()
+    # Per-cat avatar entities are created dynamically from the identity engine's roster, same
+    # as `binary_sensor.py`'s `KibbleCatPresentBinarySensor` -- there is no fixed list at
+    # integration setup, since cats are enrolled over time.
+    coordinator = entry.runtime_data
+    known_cats: set[str] = set()
 
     @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.coordinator.data
-        url = _image_url(self._entry, data.review_face, data.pending_face_count)
-        if url != self._attr_image_url:
-            self._attr_image_url = url
-            self._cached_image = None
-            self._attr_image_last_updated = dt_util.utcnow()
-        super()._handle_coordinator_update()
+    def _add_new_cats() -> None:
+        new = [name for name in coordinator.data.identity.cats if name not in known_cats]
+        if not new:
+            return
+        known_cats.update(new)
+        async_add_entities([KibbleCatAvatarImage(hass, coordinator, name) for name in new])
 
-    @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        review = self.coordinator.data.review_face
-        attrs = {"status": review.status}
-        if review.cat is not None:
-            attrs["cat"] = review.cat
-        return attrs
-
-
-def _detection_url(entry: KibbleConfigEntry, name: str) -> str:
-    host = entry.data[CONF_HOST]
-    port = entry.data[CONF_PORT]
-    return f"http://{host}:{port}/events/{quote(name, safe='')}"
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_cats))
+    _add_new_cats()  # cats already known at setup time
 
 
 class KibbleLastDetectionImage(KibbleEntity, ImageEntity):
-    """The crop from the feeder's most recent onboard-AI detection that produced one
-    (`GET /events`, classes `visit`/`eat`/`face`). A `track` event -- the vendor's own
-    identification -- carries no crop and must not blank this out, so the newest event *with an
-    image* wins, not the newest event.
+    """The best body crop of the newest event HA's own identity engine could name -- the same
+    engine `sensor.*_last_seen_pet` reads (`store.identity_summary`'s `last_detection_thumb`),
+    so the two can never disagree.
 
-    Already a JPEG on the device, so unlike the dish snapshots this needs no H.264 transcode --
-    the URL is handed straight to Home Assistant. `image_last_updated` uses the detection's own
-    capture timestamp, so the frontend refetches exactly when a new detection lands rather than
-    on every poll."""
+    Overrides `async_image` to read the already-archived crop straight off the store rather
+    than routing through an external URL and HA's remote-image proxy: the bytes are already
+    local, so there is nothing to fetch."""
 
     _attr_translation_key = "last_detection"
 
     def __init__(self, hass: HomeAssistant, entry: KibbleConfigEntry) -> None:
         KibbleEntity.__init__(self, entry.runtime_data, "last_detection_image")
         ImageEntity.__init__(self, hass)
-        self._entry = entry
-        self._event: DetectionEvent | None = None
-        self._apply(entry.runtime_data.data.events)
+        self._asset_id: str | None = None
+        self._apply(entry.runtime_data.data.identity)
 
-    def _apply(self, events: tuple[DetectionEvent, ...]) -> None:
-        with_image = [e for e in events if e.image]
-        event = max(with_image, key=lambda e: (e.ts, e.seq)) if with_image else None
-        if event is None:
-            self._attr_image_url = None
-            self._attr_image_last_updated = None
-            self._event = None
+    def _apply(self, identity: DeviceIdentitySummary) -> None:
+        thumb = identity.last_detection_thumb
+        asset_id = thumb["id"] if thumb else None
+        if asset_id == self._asset_id:
             return
-        self._event = event
-        self._attr_image_url = _detection_url(self._entry, event.image)
-        self._attr_image_last_updated = dt_util.utc_from_timestamp(event.ts)
+        self._asset_id = asset_id
+        self._cached_image = None
+        self._attr_image_last_updated = (
+            dt_util.utc_from_timestamp(identity.last_seen_pet_ts)
+            if identity.last_seen_pet_ts is not None
+            else None
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        previous = self._attr_image_url
-        self._apply(self.coordinator.data.events)
-        if self._attr_image_url != previous:
-            self._cached_image = None
+        self._apply(self.coordinator.data.identity)
         super()._handle_coordinator_update()
 
     @property
     def extra_state_attributes(self) -> dict[str, str | None]:
-        if self._event is None:
-            return {}
-        return {"class": self._event.cls, "cat": self._event.cat}
+        return {"cat": self.coordinator.data.identity.last_seen_pet}
 
+    async def async_image(self) -> bytes | None:
+        if self._asset_id is None:
+            return None
+        path = self.coordinator.store.asset_path(self._asset_id)
+        if path is None:
+            return None
+        try:
+            return await self.hass.async_add_executor_job(path.read_bytes)
+        except FileNotFoundError:
+            return None
+
+
+
+class KibbleCatAvatarImage(KibbleEntity, ImageEntity):
+    """This cat's current avatar photo -- a custom pick if the user set one, else the newest
+    trained photo (`store._avatar_state`), or nothing at all until either exists. Created
+    dynamically as the identity engine's cat roster grows, exactly like `binary_sensor.py`'s
+    `KibbleCatPresentBinarySensor` (see that class's own docstring); reads the same cached
+    `CatStats.avatar`/`avatar_updated` that `store.identity_summary` already computes per cat
+    (`_avatar_state`, shared with `kibble/cats`'s own `avatar` field), so this entity's picture
+    and the card's never disagree and this entity never makes its own live store call."""
+
+    _attr_translation_key = "cat_avatar"
+
+    def __init__(self, hass: HomeAssistant, coordinator: KibbleCoordinator, cat_name: str) -> None:
+        KibbleEntity.__init__(self, coordinator, f"cat_avatar_{slugify(cat_name)}")
+        ImageEntity.__init__(self, hass)
+        self._cat_name = cat_name
+        # Display-only capitalisation -- see `KibbleCatPresentBinarySensor`'s own comment.
+        display = cat_name[:1].upper() + cat_name[1:] if cat_name else cat_name
+        self._attr_translation_placeholders = {"cat_name": display}
+        self._asset_id: str | None = None
+        self._apply(coordinator.data.identity)
+
+    def _apply(self, identity: DeviceIdentitySummary) -> None:
+        stats = identity.cats.get(self._cat_name)
+        asset_id = stats.avatar if stats else None
+        if asset_id == self._asset_id:
+            return
+        self._asset_id = asset_id
+        self._cached_image = None
+        updated_ts = stats.avatar_updated if stats else None
+        self._attr_image_last_updated = (
+            dt_util.utc_from_timestamp(updated_ts) if updated_ts is not None else None
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._apply(self.coordinator.data.identity)
+        super()._handle_coordinator_update()
+
+    async def async_image(self) -> bytes | None:
+        if self._asset_id is None:
+            return None
+        path = self.coordinator.store.asset_path(self._asset_id)
+        if path is None:
+            return None
+        try:
+            return await self.hass.async_add_executor_job(path.read_bytes)
+        except FileNotFoundError:
+            return None
 
 def _latest_dish_snapshot(
     feeds: tuple[FeedRecord, ...], side: str
@@ -179,7 +191,12 @@ def _latest_dish_snapshot(
     shot next to the other showing feed #7's -- can't happen."""
     if not feeds:
         return None, None
-    record = feeds[-1]  # GET /feeds is oldest-first (agent/src/feed_capture.rs's list_records)
+    # By timestamp, never by position. This read `feeds[-1]` on the strength of the vendor
+    # agent returning oldest-first; LibreFeed returns newest-first, so both dish entities spent
+    # days pinned to the OLDEST record on the device -- a chime test from 2026-09-18 -- while
+    # every real feed came and went. `sensor.py` already sorts defensively for exactly this
+    # reason; this was the one place still trusting an agent's ordering.
+    record = max(feeds, key=lambda r: r.ts)
     name = record.before if side == "before" else record.after
     if name is None:
         return None, None
@@ -300,6 +317,16 @@ class KibbleDishImage(KibbleEntity, ImageEntity):
     async def async_image(self) -> bytes | None:
         if self._name is None:
             return None
+        if self._jpeg is None and self._attr_image_last_updated is not None:
+            # Ingest archives feed photos into HA's own store and acknowledges them, after which
+            # the feeder no longer has them: the archived copy is the one to show.
+            date = _utc_date(int(self._attr_image_last_updated.timestamp()))
+            path = self.coordinator.store.asset_path(f"{date}/{self._name}")
+            if path is not None:
+                try:
+                    self._jpeg = await self.hass.async_add_executor_job(path.read_bytes)
+                except FileNotFoundError:
+                    pass
         if self._jpeg is None:
             try:
                 self._jpeg = await _feed_snapshot_jpeg(self.hass, self._entry, self._name)

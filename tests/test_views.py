@@ -1,38 +1,61 @@
-"""`views.py`'s `KibbleImageView`: name/cat path-safety, entry_id resolution, per-`kind`
-dispatch (including the `feed` kind's ffmpeg-decode reuse and the `track` kind's numeric-name
-requirement), auth requirement, cache headers, and 404/502 mapping. Same duck-typed style as
-the rest of this suite -- a `SimpleNamespace` stand-in for the aiohttp `Request` (just
-`.app[KEY_HASS]`, which is all `get()` reads off it) rather than a real HTTP server.
+"""`views.py`'s `KibbleMediaView`: `store.resolve_asset_path`'s own path-safety rules (the
+real check backing every dispatch below, not a view-local reimplementation), entry_id
+resolution (unknown/unloaded entry -> 404), and the view's own 404/content-type/cache-header
+behavior around it. Same duck-typed style as the rest of this suite -- a `SimpleNamespace`
+stand-in for the aiohttp `Request` (just `.app[KEY_HASS]`, which is all `get()` reads off it)
+rather than a real HTTP server; `test_image_view_http.py` covers the real router and route
+pattern end to end.
 """
 
 from __future__ import annotations
 
-import time
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from homeassistant.components.http import KEY_HASS
 from homeassistant.config_entries import ConfigEntryState
-from kibble.api import KibbleConnectionError, KibbleNotFoundError
 from kibble.const import DOMAIN
-from kibble.views import CACHE_CONTROL, KibbleImageView, _is_safe_name
+from kibble.store import resolve_asset_path
+from kibble.views import CACHE_CONTROL, KibbleMediaView
 
-# --- _is_safe_name -------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("name", ["1789580000-101321488.jpg", "a.jpg", "Kitty"])
-def test_is_safe_name_accepts_ordinary_names(name: str) -> None:
-    assert _is_safe_name(name) is True
+# --- store.resolve_asset_path: the path-safety KibbleMediaView actually relies on -------------
 
 
-@pytest.mark.parametrize("name", ["", "..", "../../etc/passwd", "a/b.jpg", "a\\b.jpg", ".hidden"])
-def test_is_safe_name_rejects_traversal_and_hidden_names(name: str) -> None:
-    assert _is_safe_name(name) is False
+def test_resolve_asset_path_serves_a_legitimate_multi_segment_media_asset(tmp_path: Path) -> None:
+    media = tmp_path / "media" / "2026-09-24"
+    media.mkdir(parents=True)
+    (media / "e1201-s1-body.jpg").write_bytes(b"jpeg")
+
+    assert resolve_asset_path(tmp_path, "2026-09-24/e1201-s1-body.jpg") == media / "e1201-s1-body.jpg"
 
 
-# --- KibbleImageView.get ----------------------------------------------------------------------
+def test_resolve_asset_path_serves_a_training_asset_without_the_media_prefix(tmp_path: Path) -> None:
+    training = tmp_path / "training" / "kitty"
+    training.mkdir(parents=True)
+    (training / "abc-body.jpg").write_bytes(b"jpeg")
+
+    assert resolve_asset_path(tmp_path, "training/kitty/abc-body.jpg") == training / "abc-body.jpg"
+
+
+@pytest.mark.parametrize(
+    "asset_id",
+    [
+        "",
+        "..",
+        "../secrets.txt",
+        "2026-09-24/../../../etc/passwd",
+        "/etc/passwd",
+        "a/../../b.jpg",
+    ],
+)
+def test_resolve_asset_path_rejects_empty_traversal_and_absolute_ids(tmp_path: Path, asset_id: str) -> None:
+    assert resolve_asset_path(tmp_path, asset_id) is None
+
+
+# --- KibbleMediaView.get ------------------------------------------------------------------------
 
 
 def _fake_request(hass: SimpleNamespace) -> SimpleNamespace:
@@ -40,205 +63,71 @@ def _fake_request(hass: SimpleNamespace) -> SimpleNamespace:
 
 
 def _fake_hass(entry: SimpleNamespace | None) -> SimpleNamespace:
-    return SimpleNamespace(config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)))
+    return SimpleNamespace(
+        config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)),
+        async_add_executor_job=AsyncMock(side_effect=lambda fn: fn()),
+    )
 
 
-def _fake_entry(client, state=ConfigEntryState.LOADED) -> SimpleNamespace:
-    return SimpleNamespace(domain=DOMAIN, state=state, runtime_data=SimpleNamespace(client=client))
+def _fake_entry(store, state: ConfigEntryState = ConfigEntryState.LOADED) -> SimpleNamespace:
+    return SimpleNamespace(domain=DOMAIN, state=state, runtime_data=SimpleNamespace(store=store))
 
 
 def test_requires_auth_is_true() -> None:
-    """The whole point of this view over `image.py`'s existing direct-URL entities: a card not
-    on the feeder's LAN needs HA's own auth, not the agent's (nonexistent) auth."""
-    assert KibbleImageView.requires_auth is True
+    """The whole point of this view over `image.py`'s direct-URL entities: a card not on the
+    feeder's LAN needs HA's own auth, and every asset is served from local disk regardless."""
+    assert KibbleMediaView.requires_auth is True
 
 
 async def test_get_404s_for_an_unknown_entry() -> None:
-    view = KibbleImageView()
-    request = _fake_request(_fake_hass(None))
-    resp = await view.get(request, entry_id="bogus", name="a.jpg", kind="event")
+    view = KibbleMediaView()
+    resp = await view.get(_fake_request(_fake_hass(None)), "bogus-entry-id", "a.jpg")
     assert resp.status == HTTPStatus.NOT_FOUND
 
 
 async def test_get_404s_for_an_entry_not_currently_loaded() -> None:
-    view = KibbleImageView()
-    entry = _fake_entry(AsyncMock(), state=ConfigEntryState.NOT_LOADED)
-    resp = await view.get(_fake_request(_fake_hass(entry)), entry_id="e1", name="a.jpg", kind="event")
+    view = KibbleMediaView()
+    entry = _fake_entry(store=Mock(), state=ConfigEntryState.SETUP_RETRY)
+    resp = await view.get(_fake_request(_fake_hass(entry)), "e1", "a.jpg")
     assert resp.status == HTTPStatus.NOT_FOUND
 
 
-@pytest.mark.parametrize("name", ["..", "../x.jpg", "a/b.jpg"])
-async def test_get_404s_for_an_unsafe_name(name: str) -> None:
-    view = KibbleImageView()
-    entry = _fake_entry(AsyncMock())
-    resp = await view.get(_fake_request(_fake_hass(entry)), entry_id="e1", name=name, kind="event")
+async def test_get_404s_when_the_store_rejects_the_asset_id() -> None:
+    """A traversal/absolute-path attempt: `store.asset_path` (== `resolve_asset_path`) already
+    returned `None`, and the view never even tries to read a file."""
+    view = KibbleMediaView()
+    store = Mock(asset_path=Mock(return_value=None))
+    entry = _fake_entry(store=store)
+
+    resp = await view.get(_fake_request(_fake_hass(entry)), "e1", "../etc/passwd")
+
+    assert resp.status == HTTPStatus.NOT_FOUND
+    store.asset_path.assert_called_once_with("../etc/passwd")
+
+
+async def test_get_404s_when_the_resolved_file_is_missing() -> None:
+    """The store named a real path, but the file itself is gone (e.g. retention purged it
+    between two requests) -- `FileNotFoundError` must 404, never propagate."""
+
+    def _raise() -> bytes:
+        raise FileNotFoundError()
+
+    view = KibbleMediaView()
+    entry = _fake_entry(store=Mock(asset_path=Mock(return_value=SimpleNamespace(read_bytes=_raise))))
+
+    resp = await view.get(_fake_request(_fake_hass(entry)), "e1", "2026-09-24/gone.jpg")
+
     assert resp.status == HTTPStatus.NOT_FOUND
 
 
-async def test_get_404s_for_an_unsafe_cat() -> None:
-    view = KibbleImageView()
-    entry = _fake_entry(AsyncMock())
-    resp = await view.get(
-        _fake_request(_fake_hass(entry)), entry_id="e1", name="a.jpg", kind="sample", cat=".."
-    )
-    assert resp.status == HTTPStatus.NOT_FOUND
+async def test_get_serves_the_resolved_bytes_with_jpeg_content_type_and_immutable_cache() -> None:
+    view = KibbleMediaView()
+    path = SimpleNamespace(read_bytes=lambda: b"\xff\xd8jpeg-bytes")
+    entry = _fake_entry(store=Mock(asset_path=Mock(return_value=path)))
 
+    resp = await view.get(_fake_request(_fake_hass(entry)), "e1", "2026-09-24/e1-s1-body.jpg")
 
-async def test_get_404s_for_an_unknown_kind() -> None:
-    view = KibbleImageView()
-    entry = _fake_entry(AsyncMock())
-    resp = await view.get(_fake_request(_fake_hass(entry)), entry_id="e1", name="a.jpg", kind="bogus")
-    assert resp.status == HTTPStatus.NOT_FOUND
-
-
-@pytest.mark.parametrize(
-    ("kind", "client_attr", "extra_kwargs"),
-    [
-        ("event", "event_bytes", {}),
-        ("pending", "pending_bytes", {}),
-    ],
-)
-async def test_get_serves_a_passthrough_jpeg_with_the_right_content_type_and_cache_header(
-    kind: str, client_attr: str, extra_kwargs: dict
-) -> None:
-    client = AsyncMock()
-    getattr(client, client_attr).return_value = b"\xff\xd8jpeg-bytes"
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind=kind, **extra_kwargs)
-    assert resp.status == HTTPStatus.OK
-    assert resp.content_type == "image/jpeg"
-    assert resp.headers["Cache-Control"] == CACHE_CONTROL
-    assert resp.body == b"\xff\xd8jpeg-bytes"
-    getattr(client, client_attr).assert_awaited_once_with("a.jpg")
-
-
-async def view_get(
-    entry: SimpleNamespace, *, kind: str, cat: str | None = None, name: str = "a.jpg"
-):
-    view = KibbleImageView()
-    kwargs = {"entry_id": "e1", "name": name, "kind": kind}
-    if cat is not None:
-        kwargs["cat"] = cat
-    return await view.get(_fake_request(_fake_hass(entry)), **kwargs)
-
-
-async def test_get_track_kind_calls_track_image_bytes_with_ts_as_int() -> None:
-    client = AsyncMock(track_image_bytes=AsyncMock(return_value=b"\xff\xd8live-jpeg"))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="track", name="1789528799")
-    assert resp.status == HTTPStatus.OK
-    assert resp.content_type == "image/jpeg"
-    assert resp.headers["Cache-Control"] == CACHE_CONTROL
-    assert resp.body == b"\xff\xd8live-jpeg"
-    client.track_image_bytes.assert_awaited_once_with(1789528799)
-
-
-async def test_get_track_kind_404s_for_a_non_numeric_name() -> None:
-    client = AsyncMock()
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="track", name="not-a-timestamp")
-    assert resp.status == HTTPStatus.NOT_FOUND
-    client.track_image_bytes.assert_not_awaited()
-
-
-async def test_get_404s_when_no_track_image_is_paired() -> None:
-    client = AsyncMock(track_image_bytes=AsyncMock(side_effect=KibbleNotFoundError("gone")))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="track", name="123")
-    assert resp.status == HTTPStatus.NOT_FOUND
-
-
-async def test_get_track_kind_does_not_cache_before_the_pairing_window_settles() -> None:
-    """A `track` image's pairing (`websocket._track_pair`) can still change until
-    `ts + TRACK_PAIR_LOOKAHEAD_SECONDS`: a later, closer `eat`/`visit` recorded after this
-    exact request could still join the window and become the new answer for the same `ts`.
-    Caching it as immutable this early would let a browser keep serving a stale pairing
-    forever, even once the agent itself would answer differently."""
-    client = AsyncMock(track_image_bytes=AsyncMock(return_value=b"\xff\xd8live-jpeg"))
-    entry = _fake_entry(client)
-    recent_ts = int(time.time())
-    resp = await view_get(entry, kind="track", name=str(recent_ts))
-    assert resp.status == HTTPStatus.OK
-    assert resp.headers["Cache-Control"] == "no-store"
-
-
-async def test_get_sample_kind_calls_the_client_with_both_cat_and_name() -> None:
-    client = AsyncMock(sample_bytes=AsyncMock(return_value=b"sample-jpeg"))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="sample", cat="Kitty")
-    assert resp.status == HTTPStatus.OK
-    client.sample_bytes.assert_awaited_once_with("Kitty", "a.jpg")
-
-
-async def test_get_feed_kind_serves_librefeeds_real_jpeg_directly_with_no_ffmpeg_decode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The actual 2026-09-18 bug: LibreFeed's `GET /feeds/<name>` already answers with a real
-    JPEG (confirmed against the live device), but this view used to force every `feed` fetch
-    through an H.264-only ffmpeg decode regardless, which 404s decoding a JPEG as raw H.264.
-    `_is_jpeg`'s magic-byte check must skip the decode entirely for real JPEG bytes."""
-    decode = AsyncMock()
-    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", decode)
-    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\xff\xd8jpeg-bytes"))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="feed")
     assert resp.status == HTTPStatus.OK
     assert resp.body == b"\xff\xd8jpeg-bytes"
-    client.feed_bytes.assert_awaited_once_with("a.jpg")
-    decode.assert_not_awaited()
-
-
-async def test_get_feed_kind_reuses_the_ffmpeg_h264_decode_for_a_still_vendor_stack_agent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A feeder still running the vendor kibbled stack serves a raw H.264 keyframe at this same
-    URL, not a JPEG -- told apart by `_is_jpeg`'s magic-byte check, never by guessing which
-    stack answered."""
-    decode = AsyncMock(return_value=b"decoded-jpeg")
-    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", decode)
-    monkeypatch.setattr("kibble.image._feed_snapshot_url", lambda entry, name: f"http://x/feeds/{name}")
-    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\x00\x00\x00\x01not-a-jpeg"))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="feed")
-    assert resp.status == HTTPStatus.OK
-    assert resp.body == b"decoded-jpeg"
-    decode.assert_awaited_once()
-    client.event_bytes.assert_not_awaited()
-
-
-async def test_get_feed_kind_404s_when_ffmpeg_decode_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`_h264_keyframe_to_jpeg` reports a decode failure as `None`, not an exception."""
-    monkeypatch.setattr("kibble.image._h264_keyframe_to_jpeg", AsyncMock(return_value=None))
-    monkeypatch.setattr("kibble.image._feed_snapshot_url", lambda entry, name: "http://x/feeds/a.jpg")
-    client = AsyncMock(feed_bytes=AsyncMock(return_value=b"\x00\x00\x00\x01not-a-jpeg"))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="feed")
-    assert resp.status == HTTPStatus.NOT_FOUND
-
-
-async def test_get_feed_kind_404s_when_the_client_reports_the_file_is_gone() -> None:
-    client = AsyncMock(feed_bytes=AsyncMock(side_effect=KibbleNotFoundError("gone")))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="feed")
-    assert resp.status == HTTPStatus.NOT_FOUND
-
-
-async def test_get_feed_kind_502s_when_the_feeder_is_unreachable() -> None:
-    client = AsyncMock(feed_bytes=AsyncMock(side_effect=KibbleConnectionError("down")))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="feed")
-    assert resp.status == HTTPStatus.BAD_GATEWAY
-
-
-async def test_get_404s_when_the_client_reports_the_crop_is_gone() -> None:
-    client = AsyncMock(event_bytes=AsyncMock(side_effect=KibbleNotFoundError("gone")))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="event")
-    assert resp.status == HTTPStatus.NOT_FOUND
-
-
-async def test_get_502s_when_the_feeder_is_unreachable() -> None:
-    client = AsyncMock(event_bytes=AsyncMock(side_effect=KibbleConnectionError("down")))
-    entry = _fake_entry(client)
-    resp = await view_get(entry, kind="event")
-    assert resp.status == HTTPStatus.BAD_GATEWAY
+    assert resp.content_type == "image/jpeg"
+    assert resp.headers["Cache-Control"] == CACHE_CONTROL

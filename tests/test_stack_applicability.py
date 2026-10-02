@@ -15,9 +15,10 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from kibble.api import CloudState, FeederState, IdentifyResult, ReviewFace, ScheduleState, StackState, WifiState
+from kibble.api import CloudState, FeederState, ScheduleState, StackState, WifiState
 from kibble.const import CONF_HOST, CONF_PORT
 from kibble.stacks import ENTITY_STACKS, Stack, applies_to, detect_stack
+from kibble.store import CatStats, DeviceIdentitySummary
 from homeassistant.const import Platform
 
 HOST = "192.168.4.85"
@@ -41,11 +42,13 @@ ALL_PLATFORMS = [
 ]
 
 
-def _fake_data(*, detected_stack: Stack | None, cats: tuple = ()) -> SimpleNamespace:
+def _fake_data(*, detected_stack: Stack | None, cats: tuple[str, ...] = ()) -> SimpleNamespace:
     """A duck-typed `KibbleData` with every field every platform's `async_setup_entry` or the
     entities it constructs reads at construction time, real `api.py` dataclasses throughout
     (`from_json({})` for sensible zero-value defaults) so nothing downstream sees a bare
-    `SimpleNamespace` where it expects a real shape."""
+    `SimpleNamespace` where it expects a real shape. `identity.cats` is a name -> `CatStats`
+    mapping, exactly what `store.DeviceIdentitySummary` carries and every per-cat entity loop
+    (`binary_sensor.py`/`sensor.py`) iterates."""
     return SimpleNamespace(
         state=FeederState.from_json({"serial": SERIAL, "firmware": "1.0.0"}),
         schedule=ScheduleState.from_json({"entries": []}),
@@ -55,16 +58,13 @@ def _fake_data(*, detected_stack: Stack | None, cats: tuple = ()) -> SimpleNames
         detected_stack=detected_stack,
         led=None,
         desiccant=None,
+        calibration=None,
         wifi=WifiState.from_json({}),
         wifi_scan=(),
-        cats=cats,
-        identify=IdentifyResult.from_json({}),
-        review_face=ReviewFace.from_json({}),
-        pending_face_count=0,
         clips=(),
         feeds=(),
         events=(),
-        sightings=(),
+        identity=DeviceIdentitySummary(cats={name: CatStats() for name in cats}),
     )
 
 
@@ -170,22 +170,22 @@ def test_applies_to_disambiguates_the_same_bare_key_on_different_platforms() -> 
 # --- Full per-platform entity sets: vendor / librefeed / undetermined -------------------------
 
 EXPECTED_VENDOR: dict[Platform, set[str]] = {
-    Platform.SWITCH: {"night", "microphone", "cloud"},
+    Platform.SWITCH: {"night", "microphone", "cloud", "hopper_divider", "auto_learn"},
     Platform.NUMBER: {"feed_amount", "feed_amount_hopper_1", "feed_amount_hopper_2"},
-    Platform.SELECT: {"wifi", "label_face", "stack"},
-    Platform.TEXT: set(),
+    Platform.SELECT: {"wifi", "stack"},
+    Platform.TEXT: {"hopper_1_food", "hopper_2_food"},
     Platform.BUTTON: {"feed", "feed_hopper_1", "feed_hopper_2", "cancel_feed"},
     Platform.EVENT: set(),
     Platform.SENSOR: {
         "bowl_fill", "hopper_1_level", "hopper_2_level", "desiccant_days", "firmware",
         "ble_firmware", "factor1", "factor2", "schedule", "schedule_card_state", "next_feed",
         "cloud_connection", "control_path", "wifi", "wifi_signal", "last_seen_pet",
-        "identification_score", "pending_faces", "clips", "last_detection", "detections_today",
+        "clips", "last_detection", "detections_today", "recognition",
     },
     Platform.CAMERA: {"camera"},
     Platform.LIGHT: {"status_light"},
     Platform.MEDIA_PLAYER: {"speaker"},
-    Platform.IMAGE: {"pending_face", "last_detection_image", "dish_before", "dish_after"},
+    Platform.IMAGE: {"last_detection_image", "dish_before", "dish_after"},
     # Static entities only -- `cat_present_*` is dynamic (its own dedicated test below) and the
     # generic sweep here always runs with zero enrolled cats.
     Platform.BINARY_SENSOR: {"feeding", "eating", "reachable", "hopper_1_empty", "hopper_2_empty"},
@@ -224,12 +224,10 @@ async def test_undetermined_stack_creates_the_full_superset_like_before_this_mod
 
 
 async def test_binary_sensor_cat_present_is_created_on_every_stack_including_undetermined() -> None:
-    """The one dynamically-created-per-cat platform: `GET /cats` is kibbled's own
-    `agent/src/faces.rs` `Gallery`, both stacks, so the virtual `"cat_present"` gate must never
-    suppress it."""
-    cats = (SimpleNamespace(name="Whiskers"),)
+    """The one dynamically-created-per-cat platform: enrolled cats live in HA's own store, both
+    stacks, so the virtual `"cat_present"` gate must never suppress it."""
     for stack in (Stack.VENDOR, Stack.LIBREFEED, None):
-        keys = await _entity_keys(Platform.BINARY_SENSOR, stack, cats=cats)
+        keys = await _entity_keys(Platform.BINARY_SENSOR, stack, cats=("Whiskers",))
         assert "cat_present_whiskers" in keys, (stack, keys)
 
 

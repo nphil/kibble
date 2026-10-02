@@ -1,17 +1,19 @@
-"""`bowl_fill` has two possible sources and the distinction is load-bearing.
+"""`bowl_fill` has two possible camera-measured sources and the distinction is load-bearing.
 
 With the Petkit cloud disabled -- which is this project's whole point -- the vendor never
 refreshes its own `BOWL_FILL_1` word, so it reads as invalid forever (kibble `docs/34`). kibbled
 therefore computes its own estimate from the camera and reports it as `bowl_fill_local`, and this
-sensor shows whichever reading actually exists, saying which one it is.
+sensor shows whichever reading actually exists. Both camera paths report `source: "measured"` --
+the third possible source, `"estimate"`, is `bowl_fill.py`'s own post-feed projection and is
+covered by `test_bowl_fill.py` instead.
 """
 
 from __future__ import annotations
 
-from kibble.api import FeederState
-from kibble.sensor import SENSORS
+from types import SimpleNamespace
 
-BOWL_FILL = next(d for d in SENSORS if d.key == "bowl_fill")
+from kibble.api import FeederState
+from kibble.sensor import KibbleBowlFillSensor
 
 
 def _state(**overrides) -> FeederState:
@@ -29,20 +31,36 @@ def _state(**overrides) -> FeederState:
     return FeederState.from_json(payload)
 
 
+def _sensor(state: FeederState, estimate=None) -> KibbleBowlFillSensor:
+    """Same `object.__new__` approach as the rest of this suite -- only what `native_value`/
+    `extra_state_attributes` actually read is set by hand."""
+    ent = object.__new__(KibbleBowlFillSensor)
+    ent.coordinator = SimpleNamespace(
+        data=SimpleNamespace(state=state),
+        bowl_fill_estimate=estimate,
+        bowl_fill_per_portion=lambda bucket: (4.0, 0),
+    )
+    return ent
+
+
 def test_the_vendors_own_reading_wins_when_it_exists() -> None:
     state = _state(bowl_fill=46, bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
+    ent = _sensor(state)
 
-    assert BOWL_FILL.value(state) == 46
-    assert BOWL_FILL.attributes(state) == {"source": "feeder"}
+    assert ent.native_value == 46
+    attrs = ent.extra_state_attributes
+    assert attrs["source"] == "measured"
+    assert "measured_at" not in attrs
 
 
 def test_kibbles_own_estimate_fills_in_when_the_vendor_has_none() -> None:
     """The cloud-disabled steady state: without this fallback the entity is permanently unknown."""
     state = _state(bowl_fill=None, bowl_fill_local=[23, 1789638583], bowl_fill_local_frame_unix=1789636208)
+    ent = _sensor(state)
 
-    assert BOWL_FILL.value(state) == 23
-    attrs = BOWL_FILL.attributes(state)
-    assert attrs["source"] == "kibble"
+    assert ent.native_value == 23
+    attrs = ent.extra_state_attributes
+    assert attrs["source"] == "measured"
     # The frame's own time, not when the score was computed: it says when the bowl looked like
     # that, which is the only honest caption for a camera estimate of a bowl nobody has visited.
     assert attrs["measured_at"] == "2026-09-17T09:10:08+00:00"
@@ -50,9 +68,22 @@ def test_kibbles_own_estimate_fills_in_when_the_vendor_has_none() -> None:
 
 def test_unknown_stays_unknown_with_neither_reading() -> None:
     state = _state()
+    ent = _sensor(state)
 
-    assert BOWL_FILL.value(state) is None
-    assert BOWL_FILL.attributes(state)["source"] == "kibble"
+    assert ent.native_value is None
+    assert ent.extra_state_attributes["source"] == "measured"
+
+
+def test_an_active_estimate_overrides_the_raw_reading_and_reports_its_own_source() -> None:
+    """While a post-feed projection is outstanding, it -- not whatever the camera currently
+    reports -- is what the entity shows, tagged so the card can say "about N%"."""
+    state = _state(bowl_fill=46)
+    ent = _sensor(state, estimate=(58.4, {"fill_per_portion": [4.0, 4.0], "samples": [1, 0]}))
+
+    assert ent.native_value == 58
+    attrs = ent.extra_state_attributes
+    assert attrs["source"] == "estimate"
+    assert attrs["fill_per_portion"] == [4.0, 4.0]
 
 
 # --- `bowl_empty`: the verdict an automation may act on -----------------------------------

@@ -108,6 +108,10 @@ def _all_facts() -> list[EntityFact]:
         facts.append(_fact_from_description("number", desc))
     for desc in button.FEEDS:
         facts.append(_fact_from_description("button", desc))
+    for desc in button.MARK_HOPPER_FULL:
+        facts.append(_fact_from_description("button", desc))
+    for desc in sensor.HOPPER_REMAINING_SENSORS:
+        facts.append(_fact_from_description("sensor", desc))
     for desc in image.DISH_IMAGES:
         facts.append(_fact_from_description("image", desc))
 
@@ -118,8 +122,6 @@ def _all_facts() -> list[EntityFact]:
     facts.append(_fact_from_class("sensor", sensor.KibbleWifiNetworkSensor))
     facts.append(_fact_from_class("sensor", sensor.KibbleWifiSignalSensor))
     facts.append(_fact_from_class("sensor", sensor.KibbleLastSeenPetSensor))
-    facts.append(_fact_from_class("sensor", sensor.KibbleIdentificationScoreSensor))
-    facts.append(_fact_from_class("sensor", sensor.KibblePendingFacesSensor))
     facts.append(_fact_from_class("sensor", sensor.KibbleClipsSensor))
     facts.append(_fact_from_class("sensor", sensor.KibbleScheduleSensor))
     facts.append(_fact_from_class("sensor", sensor.KibbleScheduleCardStateSensor))
@@ -129,10 +131,8 @@ def _all_facts() -> list[EntityFact]:
     facts.append(_fact_from_class("switch", switch.KibbleCloudSwitch))
     facts.append(_fact_from_class("button", button.KibbleCancelButton))
     facts.append(_fact_from_class("select", select.KibbleWifiSelect))
-    facts.append(_fact_from_class("select", select.KibbleLabelFaceSelect))
     facts.append(_fact_from_class("media_player", media_player.KibbleSpeaker))
     facts.append(_fact_from_class("camera", camera.KibbleCamera))
-    facts.append(_fact_from_class("image", image.KibblePendingFaceImage))
     return facts
 
 
