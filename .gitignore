@@ -2,6 +2,7 @@ target/
 __pycache__/
 *.pyc
 .venv/
+.venv-ha/
 .pytest_cache/
 tools/aacenc/.build/
 tools/aacenc/build-arm/

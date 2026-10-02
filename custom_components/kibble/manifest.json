@@ -5,6 +5,13 @@
     "@nphil"
   ],
   "config_flow": true,
+  "dependencies": [
+    "bluetooth",
+    "ffmpeg",
+    "http",
+    "media_source",
+    "websocket_api"
+  ],
   "documentation": "https://github.com/nphil/kibble",
   "integration_type": "device",
   "iot_class": "local_push",
@@ -13,12 +20,5 @@
     "bleak>=0.20.0",
     "bleak-retry-connector>=3.0.0"
   ],
-  "version": "0.29.0",
-  "dependencies": [
-    "bluetooth",
-    "ffmpeg",
-    "http",
-    "media_source",
-    "websocket_api"
-  ]
+  "version": "0.29.1"
 }

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Kibble">
+  <title>Kibble</title>
+  <!-- Same geometry as tools/render_brand.py (light variant). -->
+  <rect width="256" height="256" rx="56" fill="#F4A452"/>
+  <!-- the cat: two ears (triangles pulled in by 5, stroked 10 wide so the corners round) and a head -->
+  <g fill="#3A2C28" stroke="#3A2C28" stroke-width="10" stroke-linejoin="round">
+    <polygon points="68,50.5 78.7,83.1 101,63.5"/>
+    <polygon points="188,50.5 177.3,83.1 155,63.5"/>
+  </g>
+  <circle cx="128" cy="116" r="64" fill="#3A2C28"/>
+  <!-- eyes, looking up a little -->
+  <ellipse cx="106" cy="124" rx="11" ry="14" fill="#FFF6E8"/>
+  <ellipse cx="150" cy="124" rx="11" ry="14" fill="#FFF6E8"/>
+  <circle cx="106" cy="121" r="6" fill="#3A2C28"/>
+  <circle cx="150" cy="121" r="6" fill="#3A2C28"/>
+  <!-- the bowl, and the kibble in its opening -->
+  <path d="M54 164 A74 46 0 0 0 202 164 Z" fill="#FFF6E8"/>
+  <ellipse cx="128" cy="164" rx="75" ry="12" fill="#DE8A3A"/>
+</svg>
