@@ -145,14 +145,18 @@ class KibblePush:
         """Connect and yield frames until the socket ends. The first frame is always `hello`;
         a `hello` with an unknown `proto` closes the socket and raises `KibblePushUnsupported`."""
         try:
-            self._ws = await self._session.ws_connect(
-                self._url,
-                heartbeat=HEARTBEAT_SECONDS,
-                receive_timeout=RECEIVE_TIMEOUT_SECONDS,
-                timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT_SECONDS),
-                max_msg_size=MAX_FRAME_BYTES,
-                autoping=True,
-            )
+            # Bounded: the session's own default would let a feeder that accepts the TCP
+            # connection but never answers the upgrade hold this for minutes. A timeout lands in
+            # the transient branch below and the coordinator retries with backoff.
+            async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+                self._ws = await self._session.ws_connect(
+                    self._url,
+                    heartbeat=HEARTBEAT_SECONDS,
+                    receive_timeout=RECEIVE_TIMEOUT_SECONDS,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT_SECONDS),
+                    max_msg_size=MAX_FRAME_BYTES,
+                    autoping=True,
+                )
         except aiohttp.WSServerHandshakeError as err:
             # The port answered HTTP but refused the upgrade: an agent that is not ours or
             # predates push. Permanent for this agent build -- the coordinator stops trying.
@@ -161,7 +165,7 @@ class KibblePush:
             # Includes "connection refused": also what a *restarting* agent looks like for a
             # few seconds, so this is never treated as permanent -- the coordinator retries
             # with backoff, and the fallback poll (plain HTTP) decides availability meanwhile.
-            raise KibblePushClosed(f"connect failed: {err}") from err
+            raise KibblePushClosed(f"connect failed: {err or type(err).__name__}") from err
 
         ws = self._ws
         try:

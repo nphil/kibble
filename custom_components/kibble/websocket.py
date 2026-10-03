@@ -72,7 +72,17 @@ def _resolve_coordinator(
     if entry.state is not ConfigEntryState.LOADED:
         connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Entry not loaded")
         return None
-    return entry.runtime_data
+    coordinator = entry.runtime_data
+    if coordinator.data is None:
+        # LOADED, but the feeder has not answered its first poll yet (`__init__.py`'s
+        # `async_setup_entry`): the answer an entry that is still setting up has always got.
+        # Commands read the snapshot and `kibble/timeline/subscribe` listens to its updates --
+        # a listener added now would also start a polling schedule beside the first poll.
+        connection.send_error(
+            msg["id"], websocket_api.ERR_NOT_FOUND, "Entry not loaded yet: the feeder has not replied"
+        )
+        return None
+    return coordinator
 
 
 @callback

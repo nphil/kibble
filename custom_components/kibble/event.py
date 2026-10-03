@@ -19,7 +19,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
-from .entity import KibbleEntity
+from .entity import KibbleEntity, async_when_data_ready
 from .stacks import applies_to
 
 # Read-only, coordinator-backed: nothing here writes to the device. See coordinator.py's
@@ -51,6 +51,12 @@ async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    async_when_data_ready(entry, lambda: _add_entities(entry, async_add_entities))
+
+
+def _add_entities(
+    entry: KibbleConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     coordinator = entry.runtime_data
     stack = coordinator.data.detected_stack

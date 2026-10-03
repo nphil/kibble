@@ -9,7 +9,7 @@ rules:
       Push-based: the agent's WebSocket (port 8766, agent/src/push.rs) delivers every field
       the moment it changes and the coordinator sets update_interval=None while it is
       connected. The 45 s HTTP poll remains only as the fallback when the socket is down and
-      as the first-contact check (test-before-setup). docs/33-local-push.md.
+      as the first-contact poll (see test-before-setup). docs/33-local-push.md.
   brands:
     status: exempt
     comment: |
@@ -64,8 +64,15 @@ rules:
     status: done
     comment: config_flow.py's async_step_user calls client.state() before creating the entry.
   test-before-setup:
-    status: done
-    comment: async_config_entry_first_refresh() raises ConfigEntryNotReady on a failed first poll (HA-native behavior, unmodified).
+    status: exempt
+    comment: |
+      Deliberately not done during setup. Home Assistant reports "started" only once every
+      integration's setup has returned, and this feeder's first poll takes 8-18 s (17.7 s measured
+      at a real restart), so async_setup_entry returns within a 5 s budget (SETUP_BUDGET_SECONDS)
+      and the first poll finishes in a task the config entry owns, retrying until the feeder
+      answers -- no ConfigEntryNotReady. The entities that need its answer are created when it
+      arrives. test-before-configure above still proves the feeder answers before the entry is
+      created. docs/30-quality-scale-audit.md, "Startup".
   unique-config-entry:
     status: done
     comment: async_set_unique_id(state.serial) + _abort_if_unique_id_configured in config_flow.py.

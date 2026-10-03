@@ -3,9 +3,10 @@ below as the fallback and the first-contact check.
 
 ## Push (docs/33-local-push.md)
 
-After the first successful poll proves the HTTP API (`async_config_entry_first_refresh`,
-rule `test-before-setup`), `async_start_push` opens the agent's push socket (`push.py`) in a
-background task owned by the config entry. Mirrors `homeassistant.components.wled`'s
+After the first successful poll proves the HTTP API (`async_poll_until_first_data`, see "The
+first poll runs in the background" below), `async_start_push` opens the agent's push socket
+(`push.py`) in a background task owned by the config entry. Mirrors
+`homeassistant.components.wled`'s
 `_use_websocket`/`listen` line for line: while the socket is up `update_interval` is `None`
 (no scheduled polls at all) and every frame lands through `async_set_updated_data`; the moment
 it drops, `update_interval` is restored, an immediate refresh is requested, and the task
@@ -66,9 +67,10 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   raise past the threshold sets `UpdateFailed.retry_after` to a capped exponential backoff -- a
   feeder that has been down for minutes does not need polling every `DEFAULT_SCAN_INTERVAL`, and
   backing off reduces load on whatever eventually restarts it (the device or its network).
-  `async_config_entry_first_refresh` is deliberately exempt from all of the above: with no prior
-  snapshot to fall back on, a failure there is unconditionally raised on the first attempt, which
-  HA turns into `ConfigEntryNotReady` (see `__init__.py`) -- correct, since there is nothing to
+  The first poll is deliberately exempt from all of the above: with no prior snapshot to fall
+  back on, a failure is raised on every attempt (`_handle_poll_failure`) -- and
+  `async_poll_until_first_data` simply tries again in the background (next section) instead of
+  Home Assistant turning it into `ConfigEntryNotReady` -- correct, since there is nothing to
   show either way.
 - Every HTTP call in this module funnels through one `KibbleClient`, which serialises them with
   its own `asyncio.Lock` (see `api.py`'s module docstring) -- there is only ever one Kibble
@@ -77,6 +79,28 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   several requests to the same, or different, endpoints concurrently. The one long-lived
   connection is the push socket, and it is deliberately on a *different port and thread* on
   the agent (`agent/src/push.rs`) so it can never hold the HTTP server's single connection slot.
+
+## The first poll runs in the background (the setup budget)
+
+Home Assistant reports "started" only after every integration's `async_setup_entry` has
+returned, and this feeder's first poll is a dozen serial calls to a slow device (8-18s; 17.7s
+measured at a real restart), so awaiting it inside setup held the whole restart up. Setup now
+gives that poll no more than what is left of `const.SETUP_BUDGET_SECONDS`: `__init__.py` starts
+`async_poll_until_first_data` in a task the config entry owns and waits at most that long for
+it. A feeder that answers in time leaves setup looking exactly as it always did; a slow, absent
+or rebooting one delays nothing -- and no longer raises `ConfigEntryNotReady` either, since
+Home Assistant's retry back-off (5s growing to 80s) would only postpone the recovery. The task
+retries on its own (`FIRST_POLL_RETRY_MIN`..`FIRST_POLL_RETRY_MAX`), and the moment a poll
+lands it runs the entity creation the platforms queued, starts the push channel and does the
+rest of the start-up work that needs a snapshot.
+
+Until then `data` is `None` and nothing may read through it. Every entity is built from `data`
+(serial, firmware, which stack is running), so the platforms are still forwarded during setup,
+as Home Assistant requires, but each only *queues* its entity creation
+(`entity.async_when_data_ready` -> `async_on_first_data`); the services and websocket commands
+answer "the feeder has not replied yet" instead of reading a missing snapshot. Nothing is
+invented meanwhile: the entities simply do not exist yet, and Home Assistant shows the entity
+registry's restored/unavailable placeholders for them.
 
 ## Stack-gated entities and reload-on-change (stacks.py)
 
@@ -186,6 +210,14 @@ PUSH_BACKOFF_MAX = 60.0
 # While connected, ask for a full snapshot this often: one small frame that bounds staleness
 # for any field the agent might fail to mark. Far cheaper than a poll cycle.
 PUSH_RESYNC_SECONDS = 600.0
+
+# Background first poll (`async_poll_until_first_data`): the wait after a failed attempt,
+# doubling per failure up to the cap and jittered (the same shape as the push reconnect above).
+# It replaces Home Assistant's own setup-retry delay (5s growing to 80s): the floor is that same
+# 5s, because a poll that just failed usually means the device is struggling; the cap is lower
+# than 80s so a feeder that was off at startup is picked up soon after it is back.
+FIRST_POLL_RETRY_MIN = 5.0
+FIRST_POLL_RETRY_MAX = 30.0
 
 type KibbleConfigEntry = ConfigEntry[KibbleCoordinator]
 
@@ -384,6 +416,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # per-platform forwarding loop. Populated once, after `async_setup_entry` forwards
         # every platform; `async_unload_entry` only unloads what is in here.
         self.loaded_platforms: list[Platform] = []
+        # The background first-poll task (`__init__.py` starts it) and the platforms' entity
+        # creation still waiting for that poll's data -- see the module docstring's "The first
+        # poll runs in the background". `async_cancel_startup` stops the one, forgets the other.
+        self.startup_task: asyncio.Task[None] | None = None
+        self._first_data_callbacks: list[Callable[[], None]] = []
         # See the module docstring's availability policy.
         self.consecutive_failures = 0
         self.last_error: str | None = None
@@ -425,6 +462,58 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
             if learned is not None:
                 self._bowl_fill_learned[bucket] = learned
         await self.engine.async_rebuild()
+
+    async def async_poll_until_first_data(self) -> None:
+        """Polls until one poll succeeds -- so `data` exists -- retrying a failed attempt after a
+        capped, jittered exponential back-off (`FIRST_POLL_RETRY_MIN`..`MAX`). Returns only then,
+        however long that takes: a feeder that was off when Home Assistant started is picked up
+        within one back-off of coming back, not after Home Assistant's own setup-retry delay.
+
+        This is `async_config_entry_first_refresh` without the raise: that call insists the
+        entry is still mid-setup, and `__init__.py` deliberately lets setup return before this
+        finishes. `async_refresh` does the rest -- it logs the first failure once and the
+        recovery -- and `_async_update_data`'s own accounting still applies (no snapshot to
+        fall back on, so every failed attempt raises and counts)."""
+        backoff = FIRST_POLL_RETRY_MIN
+        while self.data is None:
+            await self.async_refresh()
+            if self.data is not None:
+                return
+            _LOGGER.debug("First poll failed (%s); trying again in about %.0f s", self.last_error, backoff)
+            await asyncio.sleep(backoff + random.uniform(0, backoff / 2))
+            backoff = min(backoff * 2, FIRST_POLL_RETRY_MAX)
+
+    @callback
+    def async_on_first_data(self, setup: Callable[[], None]) -> None:
+        """Queues `setup` to run once, right after the first poll lands. The platforms reach this
+        through `entity.async_when_data_ready`, which runs `setup` at once when `data` is already
+        there. Dropped without running if the entry is unloaded first (`async_cancel_startup`)."""
+        self._first_data_callbacks.append(setup)
+
+    @callback
+    def async_run_first_data_callbacks(self) -> None:
+        """Runs the entity creation the platforms queued while `data` was still `None`, in the
+        order they were queued. One platform's failure is logged and the rest still run -- the
+        isolation `__init__.py`'s `_async_forward_platforms_isolated` gives them at setup."""
+        queued, self._first_data_callbacks = self._first_data_callbacks, []
+        for setup in queued:
+            try:
+                setup()
+            except Exception:  # noqa: BLE001 -- deliberately broad, see docstring
+                _LOGGER.exception(
+                    "Creating a platform's Kibble entities failed; the other platforms still got theirs"
+                )
+
+    async def async_cancel_startup(self) -> None:
+        """Stops the background first-poll task and forgets any entity creation still waiting for
+        data. First thing on unload: left running, that task could land its poll between the
+        platforms being unloaded and Home Assistant cancelling it, and add entities to a
+        platform that no longer exists."""
+        task, self.startup_task = self.startup_task, None
+        self._first_data_callbacks.clear()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})
 
     def async_start_retention(self) -> Callable[[], None]:
         """Runs one retention purge now (background task) and schedules an hourly one for the
@@ -608,10 +697,10 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         it reports the same stack as before (no-op below) or the new one (reload, below) --
         there is no reachable state in between that could trigger a spurious reload.
 
-        The very first confirmation (`_last_confirmed_stack` still `None`, e.g. right after
-        `async_config_entry_first_refresh`) only records a baseline; "changed from nothing" is
-        not a change `async_setup_entry` needs to rerun for, since it already ran once against
-        this exact first reading.
+        The very first confirmation (`_last_confirmed_stack` still `None`, e.g. right after the
+        first poll) only records a baseline; "changed from nothing" is not a change the
+        platforms need to rerun for, since their entity creation runs against this exact first
+        reading.
 
         Reloading is scheduled as a background task, never awaited here: `_async_update_data`
         is a bound method *of* the coordinator a reload would tear down and replace -- awaiting
@@ -695,8 +784,8 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         """Below `CONSECUTIVE_FAILURES_FOR_UNAVAILABLE`, with a prior snapshot to fall back on:
         re-serve it so `last_update_success`/entity availability don't flip for what is, per the
         module docstring, this device's ordinary noise floor. At or past the threshold, or with
-        no prior snapshot (the very first refresh -- see `async_config_entry_first_refresh`),
-        raise so HA's own coordinator marks entities unavailable for real."""
+        no prior snapshot (the very first poll -- `async_poll_until_first_data` keeps retrying
+        it), raise so HA's own coordinator marks entities unavailable for real."""
         self.consecutive_failures += 1
         self.last_error = str(err) or repr(err)
         if self.data is not None and self.consecutive_failures < CONSECUTIVE_FAILURES_FOR_UNAVAILABLE:

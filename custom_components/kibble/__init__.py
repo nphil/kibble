@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -86,12 +87,18 @@ from .const import (
     SERVICE_SCHEDULE_SET_ENABLED,
     SERVICE_SET_DESICCANT,
     SERVICE_WIFI_CONNECT,
+    SETUP_BUDGET_SECONDS,
 )
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .coral_client import CoralHubClient
 from .coral_identity import CoralRecognizer
 from .eating_clips import ClipLinker
-from .errors import raise_agent_action_failed, raise_cue_cooldown, raise_speaker_busy
+from .errors import (
+    raise_agent_action_failed,
+    raise_cue_cooldown,
+    raise_feeder_not_ready,
+    raise_speaker_busy,
+)
 from .ingest import IdentityEngine, Ingestor
 from .judge import VisionJudge
 from .store import KibbleStore
@@ -370,18 +377,25 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
-    """Set up one feeder.
+    """Set up one feeder, returning within `SETUP_BUDGET_SECONDS` however the feeder is doing.
+
+    What setup does itself is all local: build the objects, open the store, forward every
+    platform. The feeder's first poll -- a dozen serial calls to a slow device, 8-18s -- runs in
+    a task the entry owns (`_async_finish_setup`), and setup waits for it only for what is left
+    of the budget. If it lands in time, setup returns with every entity in place, exactly as it
+    always did. If it does not, setup returns anyway: the entities that need the poll's answer
+    (every platform's, through `entity.async_when_data_ready`) are created when it lands, the
+    entity registry's restored/unavailable placeholders stand in until then, and the services
+    and websocket commands say the feeder has not replied yet. A feeder that has not answered no
+    longer raises `ConfigEntryNotReady` -- the task keeps trying, and Home Assistant's own retry
+    delay would only postpone the recovery. See coordinator.py's module docstring, "The first
+    poll runs in the background".
 
     Platform setup is isolated per-platform by `_async_forward_platforms_isolated` (see its own
     docstring). If every platform fails there is nothing this entry usefully provides, so that
     case still fails setup outright.
-
-    The coordinator's own first refresh, above, is deliberately NOT isolated the same way: with
-    no data fetched yet, no platform has anything to show, so splitting that one failure nine
-    ways would not add any real isolation -- it would just spread one "nothing works yet"
-    outcome across nine try/except blocks. Its failure already raises `ConfigEntryNotReady`
-    (via `async_config_entry_first_refresh`), which is the correct, standard signal either way.
     """
+    started = hass.loop.time()
     client = KibbleClient(
         async_get_clientsession(hass), entry.data[CONF_HOST], entry.data[CONF_PORT]
     )
@@ -405,10 +419,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
         # reach production right away (`CoralRecognizer.async_backfill`'s own docstring), and
         # that means calling back into the `IdentityEngine` this recognizer is itself part of.
         coral_recognizer.on_progress = engine.async_rebuild
+    entry.runtime_data = coordinator
     await coordinator.async_setup_store()
     # Fills any blank cat coat description (Contract 3), as its own background task -- never
     # blocking entry setup, since a busy-model deferral (docs/40-vision-judge.md) can now take
-    # up to an hour. Started before the first refresh so the very first verdicts have a chance
+    # up to an hour. Started before the first poll so the very first verdicts have a chance
     # to see real descriptions instead of blank roster lines, but never awaited here.
     entry.async_create_background_task(
         hass, vision_judge.ensure_descriptions(), name="kibble vision judge descriptions"
@@ -421,8 +436,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
         entry.async_create_background_task(
             hass, coral_recognizer.async_backfill(), name="kibble coral embedding backfill"
         )
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
 
     loaded = await _async_forward_platforms_isolated(hass, entry, PLATFORMS)
     coordinator.loaded_platforms = loaded
@@ -431,31 +444,80 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _async_register_services(hass)
-
-    # Local push: started only after the poll above proved the HTTP API and every platform
-    # exists to receive frames. Torn down on unload and on HA stop (wled's pattern).
-    coordinator.async_start_push()
+    # Everything `_async_finish_setup` starts is torn down here on unload (and the push socket
+    # also on HA stop -- wled's pattern); each of these is safe to run if it never got that far.
     entry.async_on_unload(coordinator.async_cancel_push)
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, coordinator.async_stop_push)
     )
-    entry.async_on_unload(coordinator.async_start_retention())
     entry.async_on_unload(clip_linker.async_cancel)
-    await clip_linker.async_relink_recent()
     entry.async_on_unload(vision_judge.async_cancel)
-    # Startup backfill (docs/40-vision-judge.md, item 4): re-offers every still-eligible closed
-    # event from the last 48h to the judge -- same restart-survival idea as `clip_linker`'s own
-    # sweep just above, since the in-memory debounce/schedule map is lost on every restart.
-    await vision_judge.async_backfill_eligible()
+
+    startup = entry.async_create_background_task(
+        hass,
+        _async_finish_setup(hass, entry, coordinator, clip_linker, vision_judge),
+        name="kibble first poll and start-up",
+    )
+    coordinator.startup_task = startup
+    await asyncio.wait(
+        {startup}, timeout=max(0.0, SETUP_BUDGET_SECONDS - (hass.loop.time() - started))
+    )
+    if not startup.done():
+        _LOGGER.info(
+            "The feeder has not finished its first poll within the %.0f s setup budget; carrying "
+            "on in the background -- its entities appear as soon as it answers",
+            SETUP_BUDGET_SECONDS,
+        )
     return True
 
 
+async def _async_finish_setup(
+    hass: HomeAssistant,
+    entry: KibbleConfigEntry,
+    coordinator: KibbleCoordinator,
+    clip_linker: ClipLinker,
+    vision_judge: VisionJudge,
+) -> None:
+    """Everything setup used to wait for before it returned, as a task the entry owns: the
+    first full poll (retried until the feeder answers), the entities that need its answer, and
+    the start-up work that needs a snapshot -- in the order setup always ran them. Cancelled by
+    `async_unload_entry`, and by Home Assistant when it stops."""
+    await coordinator.async_poll_until_first_data()
+    if hass.is_stopping:
+        # The stop event has already come and gone; a push socket opened now would outlive it.
+        return
+    if entry.state is not ConfigEntryState.SETUP_IN_PROGRESS:
+        _LOGGER.info("The feeder answered its first poll; creating its entities")
+    coordinator.async_run_first_data_callbacks()
+
+    # Local push: started only after the poll above proved the HTTP API and every platform
+    # exists to receive frames. Torn down on unload and on HA stop (see `async_setup_entry`).
+    coordinator.async_start_push()
+    entry.async_on_unload(coordinator.async_start_retention())
+    # The two restart-survival sweeps are best-effort: nothing is waiting on them any more, so
+    # a failure in one is logged and must not stop the other.
+    #  - `clip_linker`: relinks every closed eat session from the last `RELINK_LOOKBACK_S` that
+    #    still has no clip.
+    #  - `vision_judge` (docs/40-vision-judge.md, item 4): re-offers every still-eligible closed
+    #    event from the last 48h to the judge, since the in-memory debounce/schedule map is lost
+    #    on every restart.
+    for sweep in (clip_linker.async_relink_recent, vision_judge.async_backfill_eligible):
+        try:
+            await sweep()
+        except Exception:  # noqa: BLE001 -- deliberately broad, see above
+            _LOGGER.exception("A Kibble start-up sweep failed (%s)", sweep.__qualname__)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
+    coordinator = entry.runtime_data
+    # First of all: a first-poll task still running could land its poll after the platforms
+    # below are unloaded and create entities for platforms that no longer exist.
+    await coordinator.async_cancel_startup()
     unloaded = await hass.config_entries.async_unload_platforms(
-        entry, entry.runtime_data.loaded_platforms
+        entry, coordinator.loaded_platforms
     )
     if unloaded:
-        await entry.runtime_data.store.async_close()
+        await coordinator.store.async_close()
     return unloaded
 
 
@@ -476,6 +538,19 @@ async def async_remove_config_entry_device(
 
 
 def _coordinator_for_device(hass: HomeAssistant, device_id: str | None) -> KibbleCoordinator:
+    """The coordinator a service call targets (see `_find_coordinator_for_device`), once its
+    feeder has answered its first poll. Until then `coordinator.data` is `None` (see
+    `async_setup_entry`) and every service reads or acts through that snapshot, so the call is
+    refused here, once, with a message that says why."""
+    coordinator = _find_coordinator_for_device(hass, device_id)
+    if coordinator.data is None:
+        raise_feeder_not_ready(coordinator.entry.title)
+    return coordinator
+
+
+def _find_coordinator_for_device(
+    hass: HomeAssistant, device_id: str | None
+) -> KibbleCoordinator:
     """Resolve a service call's target device to its coordinator. No `device_id` (the schedule
     card's adapter never sends one) resolves to the only loaded feeder; with several set up the
     caller has to say which."""

@@ -17,7 +17,9 @@ socket a gap in either patch would otherwise reach for.
 
 from __future__ import annotations
 
+import asyncio
 import io
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,16 +28,27 @@ import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from PIL import Image
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+import custom_components.kibble as kibble_mod
 import custom_components.kibble.coordinator as coordinator_mod
 import custom_components.kibble.crop_geometry as crop_geometry_mod
 from custom_components.kibble import PLATFORMS
-from custom_components.kibble.api import KibbleClient, KibbleNotFoundError
-from custom_components.kibble.const import CONF_HOST, CONF_PORT, DOMAIN, HOPPER_BOTH
+from custom_components.kibble.api import KibbleClient, KibbleConnectionError, KibbleNotFoundError
+from custom_components.kibble.const import (
+    CONF_HOST,
+    CONF_PORT,
+    DOMAIN,
+    HOPPER_BOTH,
+    SERVICE_FEED,
+    SERVICE_SET_DESICCANT,
+    SETUP_BUDGET_SECONDS,
+)
 from custom_components.kibble.push import KibblePushUnsupported
 
 # The real production entry id this will eventually run against (per the assignment).
@@ -721,3 +734,274 @@ async def test_diagnostics_runs_clean_and_redacts_identifying_fields(
     assert diagnostics["data"]["wifi"]["ssid"] == REDACTED
     assert set(diagnostics["coordinator"]["loaded_platforms"]) == {p.value for p in PLATFORMS}
     assert diagnostics["coordinator"]["feeder_reachable"] is True
+
+
+# --- startup budget: setup returns fast whatever the feeder is doing -----------------------
+
+
+class _FeederDoor:
+    """A door in front of every read the fake feeder answers, for the tests that need it slow,
+    absent or refusing. Closed, a `GET` simply waits (a feeder that never answers);
+    `refuse_state_polls` fails that many `GET /state` calls with a connection error first (a
+    feeder that is switched off). Every write is recorded, so a test can prove nothing was
+    actuated."""
+
+    def __init__(self) -> None:
+        self.open = asyncio.Event()
+        self.refuse_state_polls = 0
+        self.state_polls = 0
+        self.writes: list[tuple[str, str]] = []
+
+
+@pytest.fixture
+def feeder_door(monkeypatch: pytest.MonkeyPatch, fake_agent: FakeFeeder) -> _FeederDoor:
+    door = _FeederDoor()
+    answer = KibbleClient._request  # `fake_agent`'s canned feeder
+
+    async def through_the_door(
+        self: KibbleClient, method: str, path: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        if method != "GET":
+            door.writes.append((method, path))
+            return await answer(self, method, path, *args, **kwargs)
+        if path == "/state":
+            door.state_polls += 1
+            if door.refuse_state_polls:
+                door.refuse_state_polls -= 1
+                raise KibbleConnectionError("connection refused")
+        await door.open.wait()
+        return await answer(self, method, path, *args, **kwargs)
+
+    monkeypatch.setattr(KibbleClient, "_request", through_the_door)
+    return door
+
+
+async def _setup_with_budget(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, budget: float
+) -> MockConfigEntry:
+    """Sets the entry up under a short setup budget (each of these tests would otherwise wait
+    the full five seconds). Setup must still succeed -- LOADED, never a retry -- whatever the
+    feeder is doing."""
+    monkeypatch.setattr(kibble_mod, "SETUP_BUDGET_SECONDS", budget)
+    entry = _make_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.LOADED
+    return entry
+
+
+async def test_setup_returns_within_the_setup_budget_when_the_feeder_never_answers(
+    hass: HomeAssistant, enable_custom_integrations: None, feeder_door: _FeederDoor
+) -> None:
+    """The measured problem: setup waited for the feeder's whole first poll (17.7 s at a real
+    restart), and Home Assistant reports "started" only after every integration's setup has
+    returned. A feeder that never answers (the door never opens) may now cost setup no more
+    than `SETUP_BUDGET_SECONDS`. The component and its dependencies are set up before the
+    clock starts, so the number is this entry's own `async_setup_entry`."""
+    assert await async_setup_component(hass, DOMAIN, {})
+    entry = _make_entry()
+    entry.add_to_hass(hass)
+
+    started = time.monotonic()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < SETUP_BUDGET_SECONDS + 0.5
+    assert entry.state is ConfigEntryState.LOADED
+    coordinator = entry.runtime_data
+    # Home Assistant requires every platform to be forwarded during setup, answered or not...
+    assert set(coordinator.loaded_platforms) == set(PLATFORMS)
+    # ...but the first poll is still going in the background, and nothing was invented meanwhile.
+    assert coordinator.data is None
+    assert not coordinator.startup_task.done()
+    assert er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id) == []
+
+
+async def test_entities_appear_when_the_first_poll_lands_after_setup_returned(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every platform queued its entity creation while there was no data; when the feeder
+    finally answers, each platform creates its entities against what that poll found -- the
+    LibreFeed stack here, so the LibreFeed-only hopper entities exist -- and the push channel
+    (which needs a snapshot to merge into) is started."""
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    coordinator = entry.runtime_data
+    registry = er.async_get(hass)
+    assert coordinator.data is None
+    assert er.async_entries_for_config_entry(registry, entry.entry_id) == []
+    assert not coordinator.push_unsupported  # push has not even been tried yet
+
+    feeder_door.open.set()  # the feeder finally answers
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert coordinator.data is not None
+    assert coordinator.startup_task.done()
+    assert coordinator.consecutive_failures == 0
+    for platform, key in (
+        ("button", "feed"),  # on both stacks
+        ("button", "hopper_full"),  # LibreFeed only
+        ("sensor", "hopper_1_remaining"),  # LibreFeed only
+        ("switch", "hopper_divider"),
+    ):
+        entity_id = registry.async_get_entity_id(platform, DOMAIN, f"{SERIAL}_{key}")
+        assert entity_id is not None, f"{platform}.{key} was never created"
+        assert hass.states.get(entity_id).state != STATE_UNAVAILABLE
+    assert coordinator.push_unsupported  # the fake agent offers none: it was tried, once data existed
+
+
+async def test_nothing_is_written_to_the_feeder_when_it_answers_after_setup(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coming back from "no answer" must not actuate anything: no feed, no setting, no schedule
+    write -- entities appearing and restoring their remembered values (the hopper divider, the
+    food names) only touch Home Assistant. The one write the integration makes on its own is
+    ingest acknowledging evidence it has already stored (`DELETE /events/...`)."""
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    assert feeder_door.writes == []
+
+    feeder_door.open.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.runtime_data.data is not None
+    assert {(method, path.split("/")[1]) for method, path in feeder_door.writes} <= {
+        ("DELETE", "events")
+    }
+    assert fake_agent.feed_calls == []
+    assert fake_agent.hopper_full_calls == []
+
+
+async def test_a_feeder_that_refuses_the_first_polls_is_retried_in_the_background(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feeder that is switched off at Home Assistant's start used to fail setup with
+    `ConfigEntryNotReady` and wait out Home Assistant's own retry delay (up to 80 s). Now setup
+    succeeds, the first poll keeps trying on its own, and the entities appear as soon as one
+    attempt gets through -- the entry is never in a setup-retry state."""
+    monkeypatch.setattr(coordinator_mod, "FIRST_POLL_RETRY_MIN", 0.2)
+    monkeypatch.setattr(coordinator_mod, "FIRST_POLL_RETRY_MAX", 0.2)
+    feeder_door.open.set()
+    feeder_door.refuse_state_polls = 2
+
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    coordinator = entry.runtime_data
+    assert coordinator.data is None  # still waiting out the first back-off
+    assert coordinator.consecutive_failures >= 1
+
+    # Diagnostics -- what a user can still pull while the feeder has been unreachable since
+    # boot -- works throughout, and says why.
+    from custom_components.kibble.diagnostics import async_get_config_entry_diagnostics
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["data"] is None
+    assert diagnostics["coordinator"]["feeder_reachable"] is False
+    assert "connection refused" in diagnostics["coordinator"]["last_error"]
+
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert feeder_door.state_polls == 3  # two refused, the third got through
+    assert coordinator.data is not None
+    assert coordinator.consecutive_failures == 0
+    registry = er.async_get(hass)
+    assert registry.async_get_entity_id("button", DOMAIN, f"{SERIAL}_feed") is not None
+
+
+async def test_unloading_before_the_first_poll_lands_cancels_it_and_creates_nothing(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first poll still in flight when the entry is unloaded (a reload, an options change,
+    removal) must be cancelled before the platforms are unloaded -- otherwise it could land in
+    between and add entities to platforms that no longer exist."""
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    coordinator = entry.runtime_data
+    startup = coordinator.startup_task
+    assert not startup.done()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    assert startup.cancelled()
+
+    feeder_door.open.set()  # too late: nothing is left to hear it
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert coordinator.data is None
+    assert er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id) == []
+
+
+async def test_services_and_websocket_refuse_until_the_feeder_has_replied(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+    hass_ws_client,
+) -> None:
+    """Every service and websocket command reads or acts through the first poll's snapshot, so
+    until it exists they say so instead of failing on a missing one -- the websocket with the
+    answer an entry still being set up has always got -- and nothing reaches the feeder. Both
+    work as soon as the feeder has answered."""
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    client = await hass_ws_client(hass)
+
+    with pytest.raises(HomeAssistantError) as refused:
+        await hass.services.async_call(DOMAIN, SERVICE_SET_DESICCANT, {"days_left": 5}, blocking=True)
+    assert refused.value.translation_key == "feeder_not_ready"
+    assert refused.value.translation_placeholders == {"name": entry.title}
+
+    await client.send_json_auto_id({"type": "kibble/timeline", "entry_id": entry.entry_id})
+    early = await client.receive_json()
+    assert not early["success"]
+    assert early["error"]["code"] == "not_found"
+    assert feeder_door.writes == []
+
+    feeder_door.open.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    await client.send_json_auto_id({"type": "kibble/timeline", "entry_id": entry.entry_id})
+    assert (await client.receive_json())["success"]
+    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, SERIAL), entry.entry_id)
+    await hass.services.async_call(
+        DOMAIN, SERVICE_FEED, {"device_id": device.id, "amount": 1}, blocking=True
+    )
+    await hass.async_block_till_done()  # the feed's own refresh and ingest pass
+    assert len(fake_agent.feed_calls) == 1
+
+
+async def test_a_stack_change_after_startup_still_reloads_into_the_new_stacks_entities(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reload-on-change contract (`stacks.py`) is unchanged by the background first poll:
+    the poll that confirms the feeder is running the other stack reloads the entry, and the
+    reloaded entry's platforms build their entities against the new stack -- the LibreFeed-only
+    hopper entities are no longer provided, the both-stacks ones are."""
+    registry = er.async_get(hass)
+    hopper_full = registry.async_get_entity_id("button", DOMAIN, f"{SERIAL}_hopper_full")
+    feed = registry.async_get_entity_id("button", DOMAIN, f"{SERIAL}_feed")
+    assert hass.states.get(hopper_full).state != STATE_UNAVAILABLE
+
+    # Ingest is not what this test is about, and the old coordinator's own pass would still be
+    # reading the store as the reload closes it.
+    monkeypatch.setattr(configured_entry.runtime_data, "_schedule_ingest", lambda *args: None)
+    fake_agent.stack = "vendor"
+    await configured_entry.runtime_data.async_refresh()  # the poll that notices the switch
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert configured_entry.state is ConfigEntryState.LOADED
+    assert hass.states.get(feed).state != STATE_UNAVAILABLE
+    assert hass.states.get(hopper_full).state == STATE_UNAVAILABLE
+    assert hass.states.get(hopper_full).attributes.get("restored") is True

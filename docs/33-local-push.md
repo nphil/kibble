@@ -138,11 +138,11 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         self._push_task: asyncio.Task | None = None
 ```
 
-- `update_method` stays: it is the **fallback poll** (§2.6) and the first refresh
-  (`async_config_entry_first_refresh` proves the HTTP API before entities exist — rule
-  `test-before-setup`, unchanged).
-- After the first refresh, `async_setup_entry` starts the listen task with
-  `entry.async_create_background_task(...)` and registers
+- `update_method` stays: it is the **fallback poll** (§2.6) and the first poll (it proves the
+  HTTP API before entities exist; since 0.29.2 that runs in a background task rather than
+  inside `async_setup_entry` — see `docs/30-quality-scale-audit.md`, "Startup").
+- After the first poll lands, that same task starts the listen task with
+  `entry.async_create_background_task(...)`; `async_setup_entry` registers
   `entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close))`
   (wled `coordinator.py:129-135`; `__init__.py:66-67` disconnects on unload).
 - Listen loop (mirrors wled `listen()` line for line):
@@ -223,7 +223,7 @@ Explicit non-goals: no new entities, no entity renames, no change to the classif
 | `iot_class` | `local_polling` | `local_push` |
 | `appropriate-polling` | done | exempt — "push over WebSocket; polling is the fallback only" (wording as unifiprotect/wled) |
 | `entity-unavailable`, `log-when-unavailable` | done via coordinator | unchanged; coordinator logs the first failure |
-| `test-before-setup` | first refresh over HTTP | unchanged |
+| `test-before-setup` | first refresh over HTTP | unchanged by push (0.29.2 later moved the first poll into a background task: `docs/30-quality-scale-audit.md`) |
 | `parallel-updates` | `PARALLEL_UPDATES = 0` everywhere | unchanged |
 | `inject-websession` | done | push uses the same session |
 | `strict-typing`, `runtime-data`, `diagnostics` | done | diagnostics gains `push: {connected, last_frame_unix, reconnects}` |

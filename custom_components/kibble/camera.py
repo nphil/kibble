@@ -40,7 +40,7 @@ from .const import (
     DEFAULT_RTSP_PORT,
 )
 from .coordinator import KibbleConfigEntry
-from .entity import KibbleEntity
+from .entity import KibbleEntity, async_when_data_ready
 from .stacks import applies_to
 
 # One coordinator-backed entity; the stream itself is Scrypted's/the device's RTSP, entirely
@@ -53,6 +53,12 @@ async def async_setup_entry(
     hass: HomeAssistant,
     entry: KibbleConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    async_when_data_ready(entry, lambda: _add_entities(entry, async_add_entities))
+
+
+def _add_entities(
+    entry: KibbleConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     if applies_to(Platform.CAMERA, "camera", entry.runtime_data.data.detected_stack):
         async_add_entities([KibbleCamera(entry)])

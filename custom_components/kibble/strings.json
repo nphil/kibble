@@ -751,6 +751,9 @@
     "cue_cooldown": {
       "message": "Call the cats is on cooldown, try again in a moment: {error}"
     },
+    "feeder_not_ready": {
+      "message": "{name} has not answered since Home Assistant started, so it cannot be controlled yet. This clears by itself as soon as it responds; check that it is powered on and on Wi-Fi."
+    },
     "unknown_device": {
       "message": "{device_id} is not a Kibble feeder."
     },

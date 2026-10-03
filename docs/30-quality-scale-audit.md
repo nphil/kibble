@@ -52,10 +52,11 @@ Implemented in `coordinator.py`; full reasoning in that module's docstring. Summ
   repair issue (`feeder_unresponsive`) explaining *why*, which clears automatically on recovery.
   `UpdateFailed.retry_after` also kicks in an exponential backoff (capped at 60s) past this
   point, so a feeder down for minutes gets polled less aggressively.
-- The one exception: `async_config_entry_first_refresh` (the very first poll, no prior data to
-  fall back on) always raises immediately on failure — correctly, since HA turns that into
-  `ConfigEntryNotReady` and retries setup, which is the right signal when nothing has ever
-  worked yet.
+- The one exception: the very first poll (no prior data to fall back on) always raises
+  immediately on failure. Since 0.29.2 it no longer runs inside `async_setup_entry`, so HA does
+  not turn that into `ConfigEntryNotReady` and retry setup; `async_poll_until_first_data` tries
+  again in the background (5 s growing to 30 s) until the feeder answers — see "Startup: the
+  first poll runs in the background" below.
 - A new disabled-by-default (house rule 4) diagnostic binary sensor, `binary_sensor.…_reachable`
   (`device_class: connectivity`), deliberately overrides `available` to always be `True` so it
   keeps reporting *through* the tolerance window that hides everything else — it is the one
@@ -72,6 +73,48 @@ Regression test: `tests/test_coordinator_availability.py` (17 tests) exercises t
 no-prior-data-raises-immediately, backoff growth, repair-issue create/clear timing, and the
 aggregate `POLL_TIMEOUT` actually bounding a hung fetch.
 
+## Startup: the first poll runs in the background (0.29.2)
+
+Home Assistant reports "started" only after every integration's `async_setup_entry` has
+returned. This feeder's first poll is a dozen serial calls to a slow device (8–18 s; **17.7 s**
+measured at a real restart), and `async_setup_entry` used to await it, so one slow feeder held
+the whole restart up. Now:
+
+- `async_setup_entry` returns within `SETUP_BUDGET_SECONDS` (5 s) however the feeder is doing.
+  Measured against the previous release in the same harness: a feeder that never answers held
+  setup for 25.7 s and then failed into a setup retry; one taking 1.4 s per call held it 19.3 s.
+  Both now return in 5.0 s with the entry loaded.
+- Setup itself only does local work (open the store, forward every platform). The first poll
+  runs in a task the entry owns (`_async_finish_setup`), and setup waits for it only for what is
+  left of the budget — a feeder that answers in time leaves setup looking exactly as before.
+- Every platform's `async_setup_entry` hands its entity creation to
+  `entity.async_when_data_ready`: at once if the first poll has landed, otherwise the moment it
+  does. Entities are built from the poll's data (serial, firmware, running stack), so none is
+  created from a guess; until the poll lands the entity registry's restored/unavailable
+  placeholders stand in. The push channel, retention and the two restart sweeps start at the
+  same moment, in the order setup always ran them.
+- No `ConfigEntryNotReady` for a feeder that has not answered: the task retries by itself
+  (`FIRST_POLL_RETRY_MIN`..`MAX`, 5 s growing to 30 s), which recovers faster than HA's own
+  retry delay (up to 80 s). Setup still fails with `ConfigEntryNotReady` only when no platform
+  could be set up at all.
+- While there is no data, services answer `feeder_not_ready` and websocket commands answer
+  `not_found` ("Entry not loaded yet…") — the code an entry that is still setting up has always
+  got — so nothing reads a missing snapshot and nothing reaches the feeder. Diagnostics works
+  throughout (its `data` is `null` until the poll lands).
+- Unload cancels the task first, then unloads the platforms, so a poll cannot land in between
+  and create entities for platforms that are gone.
+- Rule `test-before-setup` is therefore deliberately not met any more (`quality_scale.yaml`
+  records it as exempt with this reason); `config_flow.py` still proves the feeder answers
+  before the entry is created.
+- Push's connect/upgrade handshake is also bounded to 10 s now (`CONNECT_TIMEOUT_SECONDS`): a
+  feeder that accepts the connection and never answers used to hold the push task for as long
+  as the shared HTTP session allowed.
+
+Tests: `tests_ha/test_setup.py` (setup within budget with a never-answering feeder, entities
+when the poll lands later, nothing written to the feeder meanwhile, background retry of refused
+polls, unload while the poll is pending, services/websocket refusing, stack-change reload) and
+`tests/test_first_poll.py` (retry back-off, queued creation, cancellation).
+
 ## Platform-isolation reality check (defect #2)
 
 `__init__.py`'s `_async_forward_platforms_isolated` forwards each platform on its own
@@ -86,11 +129,9 @@ it relies entirely on the fact that a single-element `gather` fails independentl
 `gather`.
 
 **What is genuinely NOT isolated, and why that's correct:**
-- The coordinator's *first* refresh (`await coordinator.async_config_entry_first_refresh()`)
-  happens once, before any platform is forwarded, and its failure still fails the whole entry
-  (via `ConfigEntryNotReady`). This is deliberate: with no data fetched yet, no platform has
-  anything to show regardless, so isolating this failure nine ways would only spread the same
-  "nothing works yet" outcome across nine `try`/`except` blocks for no benefit.
+- The coordinator's *first* poll is no longer part of setup at all (see "Startup" above), so
+  there is no first-refresh failure to isolate: a feeder that has not answered just means no
+  platform has created its entities yet, and every one of them does when it answers.
 - A hard config-entry-lifecycle exception (`ConfigEntryNotReady`/`ConfigEntryAuthFailed`) raised
   from *within* a platform's own `async_setup_entry` would be caught by the broad
   `except Exception` in `_async_forward_platforms_isolated` and merely logged, not given the

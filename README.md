@@ -159,6 +159,11 @@ they were recovered from, are in [docs/](docs/README.md).
 
 ## Known limits
 
+- After a Home Assistant restart Kibble does not hold Home Assistant's start-up up: it is ready
+  within 5 seconds, and its entities appear as soon as the feeder has answered its first full
+  status read (up to about 20 seconds on this slow device; longer if the feeder is off or still
+  booting, and Kibble keeps trying by itself). Until then they show as unavailable, and the
+  Kibble actions say the feeder has not replied yet.
 - Kibble does not find feeders on its own. Type the address in when you add the integration.
 - The schedule can be read freely, but the card's add/edit/remove actions are refused until you
   turn on **Allow schedule card writes**. The feeder's per-entry time encoding is still

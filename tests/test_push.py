@@ -223,6 +223,30 @@ async def test_connection_refused_is_retried_not_treated_as_unsupported(monkeypa
     assert not isinstance(excinfo.value, KibblePushUnsupported)
 
 
+async def test_a_connect_that_never_completes_is_cut_off_and_retried_not_waited_on_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feeder that accepts the TCP connection but never answers the websocket upgrade used to
+    hold the push task for as long as the HTTP session's own default allowed (minutes). The
+    connect is now bounded by `CONNECT_TIMEOUT_SECONDS`, and a timeout is the transient kind of
+    failure (`KibblePushClosed`, so the coordinator retries with backoff) -- never the permanent
+    `KibblePushUnsupported`."""
+    import kibble.push as push_module
+
+    monkeypatch.setattr(push_module, "CONNECT_TIMEOUT_SECONDS", 0.05)
+
+    class _Session:
+        async def ws_connect(self, *a, **k):
+            await asyncio.Event().wait()  # accepted the connection, never answers
+
+    push = push_module.KibblePush(_Session(), "h")
+    with pytest.raises(KibblePushClosed) as excinfo:
+        async with asyncio.timeout(2):  # a regression fails this test instead of hanging it
+            async for _ in push.listen():
+                pass
+    assert not isinstance(excinfo.value, KibblePushUnsupported)
+
+
 async def test_agent_without_push_leaves_polling_untouched(monkeypatch) -> None:
     coord = _bare_coordinator(monkeypatch, data=_data())
     monkeypatch.setattr(

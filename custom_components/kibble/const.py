@@ -76,6 +76,14 @@ DEFAULT_RTSP_PATH = "/sub"
 # schedule) changes meaningfully faster than that.
 DEFAULT_SCAN_INTERVAL = 45
 
+# `async_setup_entry` returns within this many seconds whatever the feeder is doing (answering
+# slowly, off, behind a busy network). Home Assistant reports "started" only once every
+# integration's setup has returned, and the feeder's own first poll takes 8-18s (the comment
+# above), so setup gives that poll only what is left of this budget; the poll itself carries on
+# in a task the config entry owns and the entities that need its answer are created when it
+# lands -- see `__init__.py`'s `async_setup_entry`.
+SETUP_BUDGET_SECONDS = 5.0
+
 MANUFACTURER = "Petkit"
 MODEL = "YumShare Dual 2"
 

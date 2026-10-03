@@ -205,7 +205,8 @@ async def test_handle_set_desiccant_resolves_the_only_loaded_feeder_when_device_
     """`device_id` is optional at the schema level (`SET_DESICCANT_SCHEMA`'s `vol.Optional`) --
     the handler must read it with `.get`, not `[]`, or a call that omits it would `KeyError`
     before ever reaching `_coordinator_for_device`'s own no-device-id resolution."""
-    coordinator = SimpleNamespace(async_set_desiccant=AsyncMock())
+    # `data` present = the feeder has answered its first poll; services refuse before that.
+    coordinator = SimpleNamespace(data=object(), async_set_desiccant=AsyncMock())
     entry = SimpleNamespace(state=_kibble_init.ConfigEntryState.LOADED, runtime_data=coordinator)
     hass = SimpleNamespace(
         config_entries=SimpleNamespace(async_entries=lambda domain: [entry]),

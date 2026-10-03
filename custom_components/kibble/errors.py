@@ -50,3 +50,16 @@ def raise_cue_cooldown(err: KibbleCueCooldownError) -> NoReturn:
         translation_key="cue_cooldown",
         translation_placeholders={"error": str(err)},
     ) from err
+
+
+def raise_feeder_not_ready(name: str) -> NoReturn:
+    """A service call reached a feeder that has not answered its first poll since Home Assistant
+    started (`__init__.py`'s `_coordinator_for_device`; coordinator.py's "The first poll runs in
+    the background"), so there is no snapshot to act through. Transient by construction -- it
+    clears the moment the feeder answers -- hence a message of its own (`strings.json`'s
+    `feeder_not_ready`) rather than a generic agent failure."""
+    raise HomeAssistantError(
+        translation_domain=DOMAIN,
+        translation_key="feeder_not_ready",
+        translation_placeholders={"name": name},
+    )

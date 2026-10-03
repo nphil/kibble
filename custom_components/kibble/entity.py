@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_HOST, CONF_PORT, DOMAIN, MANUFACTURER, MODEL
-from .coordinator import KibbleCoordinator
+from .coordinator import KibbleConfigEntry, KibbleCoordinator
+
+
+@callback
+def async_when_data_ready(entry: KibbleConfigEntry, setup: Callable[[], None]) -> None:
+    """Runs `setup` -- one platform's entity creation -- now if the feeder's first poll has
+    already landed, otherwise the moment it does.
+
+    Every entity is built from `coordinator.data` (serial, firmware, which stack is running, see
+    `KibbleEntity` and `stacks.applies_to`), so none can exist before that first poll; and
+    `__init__.py`'s `async_setup_entry` no longer waits for that poll beyond its setup budget
+    (coordinator.py's module docstring, "The first poll runs in the background"). Every platform
+    is therefore still forwarded during setup, as Home Assistant requires, and its
+    `async_setup_entry` hands the real work to this: a feeder that answered in time gets its
+    entities before setup returns, exactly as before, and a slow one gets them when it answers.
+
+    An exception from `setup` propagates when it runs at once (Home Assistant logs it against
+    the platform) and is logged by the coordinator when it runs later -- either way the other
+    platforms are untouched."""
+    coordinator = entry.runtime_data
+    if coordinator.data is not None:
+        setup()
+    else:
+        coordinator.async_on_first_data(setup)
 
 
 class KibbleEntity(CoordinatorEntity[KibbleCoordinator]):
