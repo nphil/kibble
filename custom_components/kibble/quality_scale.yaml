@@ -202,6 +202,10 @@ rules:
     comment: |
       New this pass: coordinator.py raises feeder_unresponsive (is_fixable=False, WARNING) the
       moment a poll crosses CONSECUTIVE_FAILURES_FOR_UNAVAILABLE, and clears it on recovery.
+      A feeder that has not answered at all since Home Assistant started raises the same issue
+      (same id, same threshold) as feeder_unresponsive_since_start -- its entry loads instead of
+      sitting in a setup-retry state, so this is how the user is told -- and it clears only when a
+      poll returns data.
       Deliberately the only repair issue added -- see docs/30-quality-scale-audit.md for why a
       "schedule writes disabled" issue was considered and rejected (repair-issues' own reasoning:
       "should not raise repair issues for just letting users know that something is wrong, which

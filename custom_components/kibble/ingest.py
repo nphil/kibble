@@ -103,6 +103,19 @@ class IdentityEngine:
         return None if self._coral is None else self._coral.status
 
     async def async_rebuild(self) -> None:
+        """Both recognizers, histogram first, then (if configured) CoralHub's -- what every
+        training change runs. Start-up calls the two halves separately instead
+        (`__init__.py`'s `_async_finish_setup`), because they cost very different things."""
+        await self.async_rebuild_histogram()
+        await self.async_rebuild_coral()
+
+    async def async_rebuild_histogram(self) -> None:
+        """The local recognizer only: reads the training set and builds `identity.Model` plus
+        its leave-one-out accuracy in the executor. No network, but not cheap either --
+        `loo_accuracy` builds one fresh model per training row, so it grows with the SQUARE of
+        the training set (measured here with synthetic features: 0.3 s at 160 samples, 3 s at
+        500, close to a minute at 1000) -- which is why start-up runs it in the entry's
+        background task rather than inside `async_setup_entry`."""
         training = await self._store.async_all_training_features()
 
         def _build() -> tuple[identity.Model, dict[str, float | None]]:
@@ -110,6 +123,13 @@ class IdentityEngine:
             return model, model.loo_accuracy()
 
         self._model, self._loo = await self._hass.async_add_executor_job(_build)
+
+    async def async_rebuild_coral(self) -> None:
+        """CoralHub's recognizer only (`CoralRecognizer.async_rebuild`), a no-op when Coral is
+        not configured. A network round trip: a health check of up to two 10 s attempts, then
+        a bounded batch of embedding requests, then its own leave-one-out build -- so it can
+        take tens of seconds when CoralHub is slow or off, and must never sit on the setup path.
+        """
         if self._coral is not None:
             await self._coral.async_rebuild()
 

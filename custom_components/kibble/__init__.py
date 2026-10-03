@@ -379,17 +379,20 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:
     """Set up one feeder, returning within `SETUP_BUDGET_SECONDS` however the feeder is doing.
 
-    What setup does itself is all local: build the objects, open the store, forward every
-    platform. The feeder's first poll -- a dozen serial calls to a slow device, 8-18s -- runs in
-    a task the entry owns (`_async_finish_setup`), and setup waits for it only for what is left
-    of the budget. If it lands in time, setup returns with every entity in place, exactly as it
-    always did. If it does not, setup returns anyway: the entities that need the poll's answer
-    (every platform's, through `entity.async_when_data_ready`) are created when it lands, the
-    entity registry's restored/unavailable placeholders stand in until then, and the services
-    and websocket commands say the feeder has not replied yet. A feeder that has not answered no
-    longer raises `ConfigEntryNotReady` -- the task keeps trying, and Home Assistant's own retry
-    delay would only postpone the recovery. See coordinator.py's module docstring, "The first
-    poll runs in the background".
+    What setup does itself is local and bounded: build the objects, open the SQLite store,
+    forward every platform. Everything that waits on something else runs in a task the entry
+    owns (`_async_finish_setup`), and setup waits for it only for what is left of the budget:
+    the cat-recognition model (its build grows with the square of the training set), CoralHub
+    (a network round trip, started from that task), and the feeder's first poll -- a dozen
+    serial calls to a slow device, 8-18s. If it all lands in time, setup returns with every
+    entity in place, exactly as it always did. If it does not, setup returns anyway: the
+    entities that need the poll's answer (every platform's, through
+    `entity.async_when_data_ready`) are created when it lands, the entity registry's
+    restored/unavailable placeholders stand in until then, and the services and websocket
+    commands say the feeder has not replied yet. A feeder that has not answered no longer raises
+    `ConfigEntryNotReady` -- the task keeps trying, and Home Assistant's own retry delay would
+    only postpone the recovery. See coordinator.py's module docstring, "The first poll runs in
+    the background".
 
     Platform setup is isolated per-platform by `_async_forward_platforms_isolated` (see its own
     docstring). If every platform fails there is nothing this entry usefully provides, so that
@@ -428,14 +431,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     entry.async_create_background_task(
         hass, vision_judge.ensure_descriptions(), name="kibble vision judge descriptions"
     )
-    if coral_recognizer is not None:
-        # Catches up every training row's and every still-reclassifiable sample's cached
-        # embedding, newest first, entirely in the background (docs/41-coral-recognition.md) --
-        # never blocks entry setup, same reasoning as the vision judge's own description
-        # backfill just above.
-        entry.async_create_background_task(
-            hass, coral_recognizer.async_backfill(), name="kibble coral embedding backfill"
-        )
 
     loaded = await _async_forward_platforms_isolated(hass, entry, PLATFORMS)
     coordinator.loaded_platforms = loaded
@@ -455,7 +450,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
 
     startup = entry.async_create_background_task(
         hass,
-        _async_finish_setup(hass, entry, coordinator, clip_linker, vision_judge),
+        _async_finish_setup(hass, entry, coordinator, clip_linker, vision_judge, coral_recognizer),
         name="kibble first poll and start-up",
     )
     coordinator.startup_task = startup
@@ -464,8 +459,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     )
     if not startup.done():
         _LOGGER.info(
-            "The feeder has not finished its first poll within the %.0f s setup budget; carrying "
-            "on in the background -- its entities appear as soon as it answers",
+            "Kibble's start-up (cat-recognition model, then the feeder's first poll) has not "
+            "finished within the %.0f s setup budget; carrying on in the background -- the "
+            "feeder's entities appear as soon as it answers",
             SETUP_BUDGET_SECONDS,
         )
     return True
@@ -477,11 +473,32 @@ async def _async_finish_setup(
     coordinator: KibbleCoordinator,
     clip_linker: ClipLinker,
     vision_judge: VisionJudge,
+    coral_recognizer: CoralRecognizer | None,
 ) -> None:
-    """Everything setup used to wait for before it returned, as a task the entry owns: the
-    first full poll (retried until the feeder answers), the entities that need its answer, and
-    the start-up work that needs a snapshot -- in the order setup always ran them. Cancelled by
-    `async_unload_entry`, and by Home Assistant when it stops."""
+    """Everything setup would otherwise wait for, as a task the entry owns, in this order: the
+    cat-recognition model, CoralHub's own start-up (a task of its own, started here, running
+    beside the poll), the first full poll (retried until the feeder answers), the entities that
+    need its answer, and the start-up work that needs a snapshot. Cancelled by
+    `async_unload_entry`, and by Home Assistant when it stops.
+
+    The model comes first because the first poll schedules the first ingest, and a verdict is
+    silently skipped while there is no model -- it has to exist by then, exactly as when setup
+    built it before the poll. A build that fails is logged and start-up goes on: the feeder, its
+    schedule and its feed buttons matter more than cat recognition, and any later rebuild
+    (every training change runs one) retries it."""
+    try:
+        await coordinator.engine.async_rebuild_histogram()
+    except Exception:  # noqa: BLE001 -- deliberately broad, see docstring
+        _LOGGER.exception(
+            "Building Kibble's cat-recognition model failed; cats are not recognised until a "
+            "later rebuild (any training change runs one) succeeds"
+        )
+    if coral_recognizer is not None:
+        coordinator.coral_task = entry.async_create_background_task(
+            hass,
+            _async_coral_startup(coordinator.engine, coral_recognizer),
+            name="kibble coral model rebuild and embedding backfill",
+        )
     await coordinator.async_poll_until_first_data()
     if hass.is_stopping:
         # The stop event has already come and gone; a push socket opened now would outlive it.
@@ -506,6 +523,24 @@ async def _async_finish_setup(
             await sweep()
         except Exception:  # noqa: BLE001 -- deliberately broad, see above
             _LOGGER.exception("A Kibble start-up sweep failed (%s)", sweep.__qualname__)
+
+
+async def _async_coral_startup(engine: IdentityEngine, recognizer: CoralRecognizer) -> None:
+    """CoralHub's half of start-up, in a task of its own so that neither setup nor the first poll
+    ever waits for it: the recognizer's health check and bounded embedding batch
+    (`IdentityEngine.async_rebuild_coral`), then the unbounded embedding backfill
+    (docs/41-coral-recognition.md), in the order setup always ran them. Until the rebuild
+    succeeds -- or for as long as CoralHub is down -- the histogram recognizer answers, exactly
+    as it does for any CoralHub outage. Cancelled first thing on unload
+    (`KibbleCoordinator.async_cancel_startup`), before the store it reads is closed."""
+    try:
+        await engine.async_rebuild_coral()
+    except Exception:  # noqa: BLE001 -- the backfill below keeps its own retry loop going
+        _LOGGER.exception(
+            "Building Kibble's CoralHub recognition model failed; the histogram recognizer "
+            "stays in charge until a later rebuild succeeds"
+        )
+    await recognizer.async_backfill()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bool:

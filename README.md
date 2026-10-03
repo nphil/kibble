@@ -163,7 +163,10 @@ they were recovered from, are in [docs/](docs/README.md).
   within 5 seconds, and its entities appear as soon as the feeder has answered its first full
   status read (up to about 20 seconds on this slow device; longer if the feeder is off or still
   booting, and Kibble keeps trying by itself). Until then they show as unavailable, and the
-  Kibble actions say the feeder has not replied yet.
+  Kibble actions say the feeder has not replied yet. If the feeder stays silent through three
+  attempts, Home Assistant's Repairs page shows a "not responding" notice, which clears by itself
+  when the feeder answers. An optional CoralHub that is slow or off never delays any of this:
+  cats are recognised by the built-in recognizer until it answers.
 - Kibble does not find feeders on its own. Type the address in when you add the integration.
 - The schedule can be read freely, but the card's add/edit/remove actions are refused until you
   turn on **Allow schedule card writes**. The feeder's per-entry time encoding is still

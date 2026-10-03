@@ -29,7 +29,8 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
+from homeassistant.helpers.translation import async_get_translations
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from PIL import Image
@@ -41,14 +42,19 @@ import custom_components.kibble.crop_geometry as crop_geometry_mod
 from custom_components.kibble import PLATFORMS
 from custom_components.kibble.api import KibbleClient, KibbleConnectionError, KibbleNotFoundError
 from custom_components.kibble.const import (
+    CONF_CORALHUB_URL,
     CONF_HOST,
     CONF_PORT,
     DOMAIN,
     HOPPER_BOTH,
+    ISSUE_FEEDER_UNRESPONSIVE,
+    ISSUE_FEEDER_UNRESPONSIVE_SINCE_START,
     SERVICE_FEED,
     SERVICE_SET_DESICCANT,
     SETUP_BUDGET_SECONDS,
 )
+from custom_components.kibble.coral_client import CoralHubClient
+from custom_components.kibble.ingest import IdentityEngine
 from custom_components.kibble.push import KibblePushUnsupported
 
 # The real production entry id this will eventually run against (per the assignment).
@@ -325,13 +331,15 @@ def vendor_fake_agent(monkeypatch: pytest.MonkeyPatch, hass: HomeAssistant) -> F
     return vendor_feeder
 
 
-def _make_entry(entry_id: str = ENTRY_ID, *, unique_id: str = SERIAL) -> MockConfigEntry:
+def _make_entry(
+    entry_id: str = ENTRY_ID, *, unique_id: str = SERIAL, options: dict[str, Any] | None = None
+) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         entry_id=entry_id,
         unique_id=unique_id,
         data={CONF_HOST: HOST, CONF_PORT: PORT},
-        options={},
+        options=options or {},
     )
 
 
@@ -777,13 +785,16 @@ def feeder_door(monkeypatch: pytest.MonkeyPatch, fake_agent: FakeFeeder) -> _Fee
 
 
 async def _setup_with_budget(
-    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, budget: float
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: float,
+    options: dict[str, Any] | None = None,
 ) -> MockConfigEntry:
     """Sets the entry up under a short setup budget (each of these tests would otherwise wait
     the full five seconds). Setup must still succeed -- LOADED, never a retry -- whatever the
     feeder is doing."""
     monkeypatch.setattr(kibble_mod, "SETUP_BUDGET_SECONDS", budget)
-    entry = _make_entry()
+    entry = _make_entry(options=options)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     assert entry.state is ConfigEntryState.LOADED
@@ -895,7 +906,9 @@ async def test_a_feeder_that_refuses_the_first_polls_is_retried_in_the_backgroun
     entry = await _setup_with_budget(hass, monkeypatch, 0.05)
     coordinator = entry.runtime_data
     assert coordinator.data is None  # still waiting out the first back-off
-    assert coordinator.consecutive_failures >= 1
+    async with asyncio.timeout(10):  # the first attempt follows the model build: wait for it
+        while coordinator.consecutive_failures < 1:
+            await asyncio.sleep(0.005)
 
     # Diagnostics -- what a user can still pull while the feeder has been unreachable since
     # boot -- works throughout, and says why.
@@ -1005,3 +1018,241 @@ async def test_a_stack_change_after_startup_still_reloads_into_the_new_stacks_en
     assert hass.states.get(feed).state != STATE_UNAVAILABLE
     assert hass.states.get(hopper_full).state == STATE_UNAVAILABLE
     assert hass.states.get(hopper_full).attributes.get("restored") is True
+
+
+# --- startup budget, part 2: nothing the model build or CoralHub does may hold setup ----------
+
+_CORALHUB_OPTIONS = {CONF_CORALHUB_URL: "http://coralhub.invalid:8080"}
+
+
+@pytest.fixture
+def coralhub_never_answers(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """A CoralHub whose health check is accepted and never answered -- the request the
+    start-up rebuild opens with, and the one that used to hold setup. Every other request fails
+    at once (as a real one would after its timeouts), so the first poll's ingest pass, which
+    also asks CoralHub for embeddings, can finish and a test can wait for it. Returns the
+    requests asked, in order."""
+    asked: list[tuple[str, str]] = []
+
+    async def health_hangs_the_rest_fail(
+        self: CoralHubClient, method: str, path: str, payload: Any
+    ) -> Any:
+        asked.append((method, path))
+        if path == "/api/v1/health":
+            await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(CoralHubClient, "_request", health_hangs_the_rest_fail)
+    return asked
+
+
+async def test_a_coralhub_that_never_answers_delays_neither_setup_nor_the_feeders_entities(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    fake_agent: FakeFeeder,
+    coralhub_never_answers: list[tuple[str, str]],
+) -> None:
+    """CoralHub is optional, off-box and slow to fail: its health check alone is up to two 10 s
+    attempts, and setup used to await it (inside the identity engine's rebuild) before it even
+    began the feeder's poll. A CoralHub that accepts the request and never answers must now cost
+    neither setup nor the feeder's entities anything: it is asked in a task of its own."""
+    entry = _make_entry(options=_CORALHUB_OPTIONS)
+    entry.add_to_hass(hass)
+
+    async with asyncio.timeout(SETUP_BUDGET_SECONDS + 1):  # a regression fails, not hangs
+        assert await hass.config_entries.async_setup(entry.entry_id)
+
+    assert entry.state is ConfigEntryState.LOADED
+    coordinator = entry.runtime_data
+    assert coordinator.data is not None  # the feeder's poll landed although CoralHub never answered
+    assert er.async_get(hass).async_get_entity_id("button", DOMAIN, f"{SERIAL}_feed") is not None
+    # ...and CoralHub really is being asked, in its own task, which is still waiting.
+    assert coralhub_never_answers.count(("GET", "/api/v1/health")) == 1
+    assert coordinator.coral_task is not None and not coordinator.coral_task.done()
+    await hass.async_block_till_done()  # the first poll's ingest pass, which uses the store
+
+
+async def test_unloading_while_coralhub_is_still_being_asked_cancels_its_task(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    fake_agent: FakeFeeder,
+    coralhub_never_answers: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CoralHub task reads the store, which `async_unload_entry` closes -- so unloading
+    cancels the task first rather than leaving it to Home Assistant's own cleanup afterwards."""
+    entry = await _setup_with_budget(hass, monkeypatch, SETUP_BUDGET_SECONDS, _CORALHUB_OPTIONS)
+    coordinator = entry.runtime_data
+    coral = coordinator.coral_task
+    assert coral is not None and not coral.done()
+    await hass.async_block_till_done()  # the first poll's ingest pass: finish before the store closes
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    assert coral.cancelled()
+    assert coordinator.coral_task is None
+
+
+async def test_the_cat_recognition_model_is_built_before_the_first_poll(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first poll schedules the first ingest, and a verdict is silently skipped while there
+    is no model -- so the model has to exist by then. Setup used to guarantee that by building
+    it first; now the start-up task does, in that same order."""
+    polls_when_the_build_finished: list[int] = []
+    build = IdentityEngine.async_rebuild_histogram
+
+    async def build_and_note_the_polls(self: IdentityEngine) -> None:
+        await build(self)
+        polls_when_the_build_finished.append(feeder_door.state_polls)
+
+    monkeypatch.setattr(IdentityEngine, "async_rebuild_histogram", build_and_note_the_polls)
+    feeder_door.open.set()
+
+    entry = await _setup_with_budget(hass, monkeypatch, SETUP_BUDGET_SECONDS)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert polls_when_the_build_finished == [0]
+    assert entry.runtime_data.engine._model is not None
+    assert entry.runtime_data.data is not None
+
+
+async def test_a_slow_model_build_never_holds_setup_and_the_feeders_entities_follow_it(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The histogram model's leave-one-out accuracy grows with the square of the training set
+    (close to a minute at 1000 samples, measured with synthetic features), and setup used to
+    await it. A build that has not finished costs setup nothing; the feeder's poll -- and so its
+    entities -- follow the build, as they always did."""
+    finish = asyncio.Event()
+
+    async def slow_build(self: IdentityEngine) -> None:
+        await finish.wait()
+
+    monkeypatch.setattr(IdentityEngine, "async_rebuild_histogram", slow_build)
+    feeder_door.open.set()  # the feeder itself answers at once
+
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    coordinator = entry.runtime_data
+    assert coordinator.data is None
+    assert feeder_door.state_polls == 0  # the poll waits for the model: ingest needs it
+
+    finish.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert coordinator.data is not None
+    assert er.async_get(hass).async_get_entity_id("button", DOMAIN, f"{SERIAL}_feed") is not None
+
+
+async def test_a_failing_model_build_is_logged_and_the_feeder_still_comes_up(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The feeder, its schedule and its feed buttons matter more than cat recognition: a model
+    build that raises must not leave the entry loaded with no entities and no explanation."""
+
+    async def broken_build(self: IdentityEngine) -> None:
+        raise RuntimeError("corrupt training row")
+
+    monkeypatch.setattr(IdentityEngine, "async_rebuild_histogram", broken_build)
+    feeder_door.open.set()
+
+    entry = await _setup_with_budget(hass, monkeypatch, SETUP_BUDGET_SECONDS)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.runtime_data.data is not None
+    assert er.async_get(hass).async_get_entity_id("button", DOMAIN, f"{SERIAL}_feed") is not None
+    assert "Building Kibble's cat-recognition model failed" in caplog.text
+    assert "corrupt training row" in caplog.text
+
+
+# --- a feeder that never answers: the repair issue -----------------------------------------------
+
+
+async def test_a_feeder_that_never_answers_raises_the_repair_and_answering_clears_it(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Home Assistant started with the feeder switched off or unreachable: the entry loads (it
+    no longer sits in a setup-retry state) and keeps trying, so the repair is how a user is
+    told. Raised after the same three failed attempts as for a feeder that stopped answering;
+    it survives every further failed attempt and goes only when the feeder really answers."""
+    monkeypatch.setattr(coordinator_mod, "FIRST_POLL_RETRY_MIN", 0.02)
+    monkeypatch.setattr(coordinator_mod, "FIRST_POLL_RETRY_MAX", 0.02)
+    threshold = coordinator_mod.CONSECUTIVE_FAILURES_FOR_UNAVAILABLE
+    feeder_door.open.set()
+    feeder_door.refuse_state_polls = 10**9  # switched off
+
+    entry = await _setup_with_budget(hass, monkeypatch, 0.05)
+    coordinator = entry.runtime_data
+    issues = ir.async_get(hass)
+    issue_id = f"{ISSUE_FEEDER_UNRESPONSIVE}_{entry.entry_id}"
+
+    async with asyncio.timeout(10):
+        while coordinator.consecutive_failures < threshold:
+            assert issues.async_get_issue(DOMAIN, issue_id) is None  # below the threshold: not yet
+            await asyncio.sleep(0.005)
+
+    issue = issues.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_key == ISSUE_FEEDER_UNRESPONSIVE_SINCE_START
+    assert issue.severity is ir.IssueSeverity.WARNING and issue.is_fixable is False
+    assert issue.translation_placeholders["name"] == entry.title
+    assert "connection refused" in issue.translation_placeholders["error"]
+
+    # Home Assistant can actually find that wording (a missing key renders as a bare id).
+    wording = await async_get_translations(hass, "en", "issues", [DOMAIN])
+    for part in ("title", "description"):
+        assert f"component.{DOMAIN}.issues.{ISSUE_FEEDER_UNRESPONSIVE_SINCE_START}.{part}" in wording
+
+    # Still failing: the issue stays.
+    failures_so_far = coordinator.consecutive_failures
+    async with asyncio.timeout(10):
+        while coordinator.consecutive_failures < failures_so_far + 2:
+            await asyncio.sleep(0.005)
+    assert issues.async_get_issue(DOMAIN, issue_id) is not None
+
+    feeder_door.refuse_state_polls = 0  # the feeder is back
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert coordinator.data is not None
+    assert issues.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_the_first_answer_clears_a_repair_an_earlier_load_of_the_entry_left_behind(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    feeder_door: _FeederDoor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reloading the entry while the feeder is unreachable leaves the repair standing, and the
+    replacement coordinator never failed itself -- its failure counter is zero when the feeder
+    answers -- so only landing its first data can clear the issue."""
+    issue_id = f"{ISSUE_FEEDER_UNRESPONSIVE}_{ENTRY_ID}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_FEEDER_UNRESPONSIVE_SINCE_START,
+        translation_placeholders={"name": "Cat Feeder", "failures": "5", "error": "timed out"},
+    )
+    feeder_door.open.set()
+
+    entry = await _setup_with_budget(hass, monkeypatch, SETUP_BUDGET_SECONDS)
+
+    assert entry.runtime_data.data is not None
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    await hass.async_block_till_done()  # the first poll's ingest pass, which uses the store

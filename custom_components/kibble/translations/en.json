@@ -780,6 +780,10 @@
     "feeder_unresponsive": {
       "title": "{name} is not responding",
       "description": "The feeder has not answered {failures} polls in a row (most recent error: {error}). Entities keep showing their last known values, not live ones, until it recovers.\n\nCheck that the feeder is powered on and connected to Wi-Fi, and that its `kibbled` agent is running. This resolves itself — and this issue clears — as soon as a poll succeeds again."
+    },
+    "feeder_unresponsive_since_start": {
+      "title": "{name} is not responding",
+      "description": "The feeder has not answered any of the {failures} attempts Kibble has made since Home Assistant started (most recent error: {error}), so its entities show as unavailable and Kibble's actions are refused for now.\n\nCheck that the feeder is powered on and connected to Wi-Fi, that its address has not changed, and that its `kibbled` agent is running. Kibble keeps trying by itself: this resolves — and this issue clears — as soon as the feeder answers."
     }
   }
 }

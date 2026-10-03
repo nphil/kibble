@@ -193,17 +193,51 @@ def test_staying_below_threshold_never_creates_a_repair_issue(
     issue_registry.created.assert_not_called()
 
 
-def test_first_ever_failure_with_no_data_does_not_create_a_repair_issue(
+# --- a feeder that has never answered: the same repair, at the same threshold -------------------
+
+
+def test_first_contact_failures_below_the_threshold_raise_but_create_no_repair(
     issue_registry: SimpleNamespace,
 ) -> None:
-    """Nothing was ever working -- that is `ConfigEntryNotReady` territory, not a repair issue
-    about something that broke."""
+    """One or two failed attempts are this device's noise floor whether or not a snapshot
+    exists, so there is no repair yet. With no snapshot every failure still raises -- there is
+    nothing to serve instead -- which is what `async_poll_until_first_data` retries on."""
     coord = _bare_coordinator(data=None, consecutive_failures=0)
 
-    with pytest.raises(UpdateFailed):
-        coord._handle_poll_failure(KibbleConnectionError("timed out"))
+    for _ in range(CONSECUTIVE_FAILURES_FOR_UNAVAILABLE - 1):
+        with pytest.raises(UpdateFailed):
+            coord._handle_poll_failure(KibbleConnectionError("timed out"))
 
     issue_registry.created.assert_not_called()
+
+
+def test_a_feeder_that_never_answered_raises_the_same_repair_at_the_same_threshold(
+    issue_registry: SimpleNamespace,
+) -> None:
+    """The entry no longer fails setup into Home Assistant's retry state for an unreachable
+    feeder, so this issue is where a user sees that the feeder has not answered since Home
+    Assistant started. Same issue id, severity and threshold as the outage of a feeder that had
+    been answering -- but not that outage's text, which promises last known values there are
+    none of."""
+    coord = _bare_coordinator(
+        data=None, consecutive_failures=CONSECUTIVE_FAILURES_FOR_UNAVAILABLE - 1
+    )
+
+    with pytest.raises(UpdateFailed):
+        coord._handle_poll_failure(KibbleConnectionError("no route to host"))
+
+    issue_registry.created.assert_called_once()
+    args, kwargs = issue_registry.created.call_args
+    assert args[2] == f"{coordinator_module.ISSUE_FEEDER_UNRESPONSIVE}_entry1"
+    assert kwargs["translation_key"] == coordinator_module.ISSUE_FEEDER_UNRESPONSIVE_SINCE_START
+    assert kwargs["severity"] is coordinator_module.ir.IssueSeverity.WARNING
+    assert kwargs["is_fixable"] is False
+    assert kwargs["translation_placeholders"] == {
+        "name": "Cat Feeder",
+        "failures": str(CONSECUTIVE_FAILURES_FOR_UNAVAILABLE),
+        "error": "no route to host",
+    }
+    issue_registry.deleted.assert_not_called()  # failing again never clears it
 
 
 # --- _async_update_data / _fetch_all: the whole-cycle behaviour -------------------------------

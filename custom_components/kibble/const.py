@@ -176,8 +176,11 @@ MAX_CLIP_SECONDS = 30
 
 # `coordinator.py`'s repair issue, raised once the feeder has missed
 # CONSECUTIVE_FAILURES_FOR_UNAVAILABLE polls in a row -- see its module docstring for the
-# full availability policy this backs.
+# full availability policy this backs. One issue per entry (one issue id) with two wordings:
+# the second is for a feeder that has not answered at all since Home Assistant started (so
+# there is no snapshot, and no "last known values" for the first one's text to promise).
 ISSUE_FEEDER_UNRESPONSIVE = "feeder_unresponsive"
+ISSUE_FEEDER_UNRESPONSIVE_SINCE_START = "feeder_unresponsive_since_start"
 
 SERVICE_BEEP = "beep"
 

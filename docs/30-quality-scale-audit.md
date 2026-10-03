@@ -73,7 +73,7 @@ Regression test: `tests/test_coordinator_availability.py` (17 tests) exercises t
 no-prior-data-raises-immediately, backoff growth, repair-issue create/clear timing, and the
 aggregate `POLL_TIMEOUT` actually bounding a hung fetch.
 
-## Startup: the first poll runs in the background (0.29.2)
+## Startup: the first poll runs in the background (0.29.2, completed in 0.29.3)
 
 Home Assistant reports "started" only after every integration's `async_setup_entry` has
 returned. This feeder's first poll is a dozen serial calls to a slow device (8–18 s; **17.7 s**
@@ -84,9 +84,26 @@ the whole restart up. Now:
   Measured against the previous release in the same harness: a feeder that never answers held
   setup for 25.7 s and then failed into a setup retry; one taking 1.4 s per call held it 19.3 s.
   Both now return in 5.0 s with the entry loaded.
-- Setup itself only does local work (open the store, forward every platform). The first poll
-  runs in a task the entry owns (`_async_finish_setup`), and setup waits for it only for what is
-  left of the budget — a feeder that answers in time leaves setup looking exactly as before.
+- Setup itself only does local, bounded work: open the SQLite store, forward every platform.
+  Everything that waits on something else runs in a task the entry owns
+  (`_async_finish_setup`), and setup waits for it only for what is left of the budget — a feeder
+  that answers in time leaves setup looking exactly as before. (0.29.2 moved only the feeder's
+  first poll there; the next bullet is what 0.29.3 found still sitting in setup.)
+- **The identity engine's rebuild is not setup work either (0.29.3).** `async_setup_store` used
+  to end with `IdentityEngine.async_rebuild()`: the local histogram model, then CoralHub's. The
+  start-up task now does them separately, in this order. (1) `async_rebuild_histogram`, before
+  the first poll, because that poll schedules the first ingest and a verdict is silently skipped
+  while there is no model; its leave-one-out accuracy builds one model per training row, so it
+  grows with the square of the training set — measured with synthetic features: 0.3 s at 160
+  samples, 3.4 s at 500, 57 s at 1000, 129 s at 2000 — which a "purely local" step can still
+  blow a 5 s budget with. (2) `async_rebuild_coral` and then the embedding backfill, as a task of
+  its own (`coral_task`, started right after (1), running beside the poll): CoralHub's health
+  check alone is up to two 10 s attempts, plus a bounded batch of embedding requests. Until it
+  finishes — or for as long as CoralHub is down — the histogram recognizer answers, exactly as
+  for any CoralHub outage, so the first ingest after a restart can use it if CoralHub is slow.
+  A failed model build is logged and start-up carries on (the feeder matters more than cat
+  recognition; any later training change rebuilds). Every other caller of `async_rebuild` (each
+  training change) still rebuilds both, in the same order.
 - Every platform's `async_setup_entry` hands its entity creation to
   `entity.async_when_data_ready`: at once if the first poll has landed, otherwise the moment it
   does. Entities are built from the poll's data (serial, firmware, running stack), so none is
@@ -97,6 +114,14 @@ the whole restart up. Now:
   (`FIRST_POLL_RETRY_MIN`..`MAX`, 5 s growing to 30 s), which recovers faster than HA's own
   retry delay (up to 80 s). Setup still fails with `ConfigEntryNotReady` only when no platform
   could be set up at all.
+- **A feeder that has not answered raises the repair too (0.29.3).** With the entry loading
+  instead of sitting in HA's "retrying setup" state, nothing else says the feeder is unreachable
+  beyond one log line. `_handle_poll_failure` now raises the same `feeder_unresponsive_<entry>`
+  issue after the same three failed polls whether or not a snapshot exists, with its own wording
+  (`feeder_unresponsive_since_start`) because "entities keep showing their last known values"
+  is untrue when there are none. Only a poll that returns data clears it — including the first
+  data of a reloaded entry, whose own failure counter never moved, which is why
+  `async_poll_until_first_data` clears it unconditionally on landing.
 - While there is no data, services answer `feeder_not_ready` and websocket commands answer
   `not_found` ("Entry not loaded yet…") — the code an entry that is still setting up has always
   got — so nothing reads a missing snapshot and nothing reaches the feeder. Diagnostics works
@@ -110,10 +135,14 @@ the whole restart up. Now:
   feeder that accepts the connection and never answers used to hold the push task for as long
   as the shared HTTP session allowed.
 
-Tests: `tests_ha/test_setup.py` (setup within budget with a never-answering feeder, entities
-when the poll lands later, nothing written to the feeder meanwhile, background retry of refused
-polls, unload while the poll is pending, services/websocket refusing, stack-change reload) and
-`tests/test_first_poll.py` (retry back-off, queued creation, cancellation).
+Tests: `tests_ha/test_setup.py` (setup within budget with a never-answering feeder or CoralHub,
+entities when the poll lands later, nothing written to the feeder meanwhile, background retry of
+refused polls, unload while the poll or CoralHub is pending, the model built before the first
+poll and a slow or failing build, the repair raised / kept / cleared against the real issue
+registry, services/websocket refusing, stack-change reload), `tests/test_first_poll.py` (retry
+back-off, queued creation, repair cleared only on first data, cancelling both tasks in order),
+`tests/test_ingest.py` (the two rebuild halves) and `tests/test_coordinator_availability.py`
+(the repair's threshold and wording with and without a snapshot).
 
 ## Platform-isolation reality check (defect #2)
 

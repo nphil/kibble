@@ -90,8 +90,9 @@ MIN_LOO_SAMPLES = identity.MIN_LOO_SAMPLES
 # Bounded catch-up run inline by every `CoralRecognizer.async_rebuild` (cheap, keeps
 # training-mutation latency snappy: a rebuild follows one label/upload/auto-learn action, so at
 # most a handful of rows are ever newly missing an embedding at that moment). The dedicated
-# background backfill task (`async_backfill`, started once at entry setup) does the bulk of the
-# catching-up over time instead, uncapped.
+# background backfill task (`async_backfill`, started once per entry load by `__init__.py`'s
+# `_async_coral_startup`, right after the first rebuild) does the bulk of the catching-up over
+# time instead, uncapped.
 REBUILD_EMBED_LIMIT = 64
 BACKFILL_BATCH_LIMIT = 32
 BACKFILL_PACE_S = 1.0
@@ -395,8 +396,9 @@ class CoralRecognizer:
     # --- background backfill (docs/41-coral-recognition.md) ----------------------------------
 
     async def async_backfill(self) -> None:
-        """Started once, as an unawaited background task, at entry setup (`__init__.py`) --
-        never blocks setup. Catches up every training row's and every still-reclassifiable
+        """Started once per entry load, as the second step of the entry's CoralHub background
+        task (`__init__.py`'s `_async_coral_startup`, after the first rebuild) -- never blocks
+        setup or the first poll. Catches up every training row's and every still-reclassifiable
         sample's (an unreviewed event's own -- `store.samples_needing_coral`'s own docstring)
         cached embedding, newest first, in `BACKFILL_BATCH_LIMIT`-sized batches, pacing itself
         (`BACKFILL_PACE_S` while healthy, `BACKFILL_UNREACHABLE_RETRY_S` after any failed batch)

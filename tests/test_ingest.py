@@ -14,6 +14,7 @@ real `_SyncStore` (sqlite3, no mock of the guard itself) so the assertion is tha
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -339,6 +340,66 @@ def test_backend_property_reflects_coral_availability() -> None:
 
     engine_on = IdentityEngine(_FakeHass(), object(), coral=_Recognizer())
     assert engine_on.backend == "coral"
+
+
+# --- the two halves of a rebuild: the local one must never wait for CoralHub --------------------
+
+
+class _RebuildStore:
+    async def async_all_training_features(self):
+        return []
+
+
+class _HangingCoral:
+    """A CoralHub that accepts the request and never answers."""
+
+    def __init__(self) -> None:
+        self.rebuilds = 0
+
+    async def async_rebuild(self) -> bool:
+        self.rebuilds += 1
+        await asyncio.Event().wait()
+        return True
+
+
+async def test_rebuilding_the_local_model_never_waits_for_coralhub() -> None:
+    """Start-up builds the histogram model (it must exist before the first poll can ingest) and
+    CoralHub's (a network round trip that can take tens of seconds) separately, so a CoralHub
+    that never answers cannot hold the first one up."""
+    coral = _HangingCoral()
+    engine = IdentityEngine(_FakeHass(), _RebuildStore(), coral=coral)
+
+    async with asyncio.timeout(2):  # a regression fails this test instead of hanging the suite
+        await engine.async_rebuild_histogram()
+
+    assert engine._model is not None
+    assert coral.rebuilds == 0
+
+
+async def test_a_full_rebuild_builds_the_local_model_before_asking_coralhub() -> None:
+    """What every training change still runs: both recognizers, the local one first, so the
+    fallback is ready before CoralHub is even asked."""
+    seen: list[bool] = []
+
+    class _Coral:
+        async def async_rebuild(self) -> bool:
+            seen.append(engine._model is not None)
+            return True
+
+    engine = IdentityEngine(_FakeHass(), _RebuildStore(), coral=_Coral())
+
+    await engine.async_rebuild()
+
+    assert seen == [True]
+
+
+async def test_rebuilding_without_coralhub_configured_builds_just_the_local_model() -> None:
+    engine = IdentityEngine(_FakeHass(), _RebuildStore())
+
+    await engine.async_rebuild()
+    await engine.async_rebuild_coral()  # nothing configured: harmless, never raises
+
+    assert engine._model is not None
 
 
 

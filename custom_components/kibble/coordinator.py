@@ -67,11 +67,13 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   raise past the threshold sets `UpdateFailed.retry_after` to a capped exponential backoff -- a
   feeder that has been down for minutes does not need polling every `DEFAULT_SCAN_INTERVAL`, and
   backing off reduces load on whatever eventually restarts it (the device or its network).
-  The first poll is deliberately exempt from all of the above: with no prior snapshot to fall
-  back on, a failure is raised on every attempt (`_handle_poll_failure`) -- and
-  `async_poll_until_first_data` simply tries again in the background (next section) instead of
-  Home Assistant turning it into `ConfigEntryNotReady` -- correct, since there is nothing to
-  show either way.
+  The first poll is exempt from the *tolerance* above -- with no prior snapshot to fall back on,
+  every failed attempt raises (`_handle_poll_failure`) -- and `async_poll_until_first_data`
+  simply tries again in the background (next section) instead of Home Assistant turning it
+  into `ConfigEntryNotReady`. It is NOT exempt from the repair: a feeder that has not answered
+  `CONSECUTIVE_FAILURES_FOR_UNAVAILABLE` attempts in a row raises the same issue (same id, same
+  threshold) with its own wording (`feeder_unresponsive_since_start`, since there are no "last
+  known values" to promise), and it clears the moment a poll lands.
 - Every HTTP call in this module funnels through one `KibbleClient`, which serialises them with
   its own `asyncio.Lock` (see `api.py`'s module docstring) -- there is only ever one Kibble
   request in flight against the feeder at a time, whether it originates from this coordinator's
@@ -93,6 +95,18 @@ Home Assistant's retry back-off (5s growing to 80s) would only postpone the reco
 retries on its own (`FIRST_POLL_RETRY_MIN`..`FIRST_POLL_RETRY_MAX`), and the moment a poll
 lands it runs the entity creation the platforms queued, starts the push channel and does the
 rest of the start-up work that needs a snapshot.
+
+Setup itself now only opens the local SQLite store (`async_setup_store`) and forwards the
+platforms. Everything else that used to be awaited there is in that same entry-owned start-up
+task, in this order: (1) the cat-recognition model (`IdentityEngine.async_rebuild_histogram`),
+because it must exist before the first poll can schedule the first ingest -- a verdict is
+silently skipped while there is no model -- and because its leave-one-out accuracy grows with
+the square of the training set (0.3 s at 160 samples, 3 s at 500, close to a minute at 1000, on
+synthetic features), so it has no business on the setup path; (2) CoralHub's half, as a task of
+its own (`coral_task`) started right after (1) and running beside the poll rather than in front
+of it -- a health check of up to two 10 s attempts, then a bounded batch of embedding requests,
+then the embedding backfill; until it finishes (or for as long as CoralHub is down) the histogram
+recognizer answers, exactly as it does for any CoralHub outage; (3) the first poll.
 
 Until then `data` is `None` and nothing may read through it. Every entity is built from `data`
 (serial, firmware, which stack is running), so the platforms are still forwarded during setup,
@@ -175,6 +189,7 @@ from .const import (
     HOPPER_1,
     HOPPER_BOTH,
     ISSUE_FEEDER_UNRESPONSIVE,
+    ISSUE_FEEDER_UNRESPONSIVE_SINCE_START,
     MAX_AMOUNT,
 )
 from .ingest import IdentityEngine, Ingestor
@@ -416,10 +431,12 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # per-platform forwarding loop. Populated once, after `async_setup_entry` forwards
         # every platform; `async_unload_entry` only unloads what is in here.
         self.loaded_platforms: list[Platform] = []
-        # The background first-poll task (`__init__.py` starts it) and the platforms' entity
+        # The background first-poll task (`__init__.py` starts it), the CoralHub start-up task it
+        # starts (`coral_task`, `None` when Coral is not configured) and the platforms' entity
         # creation still waiting for that poll's data -- see the module docstring's "The first
-        # poll runs in the background". `async_cancel_startup` stops the one, forgets the other.
+        # poll runs in the background". `async_cancel_startup` stops both tasks, forgets the other.
         self.startup_task: asyncio.Task[None] | None = None
+        self.coral_task: asyncio.Task[None] | None = None
         self._first_data_callbacks: list[Callable[[], None]] = []
         # See the module docstring's availability policy.
         self.consecutive_failures = 0
@@ -454,14 +471,15 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         self._bowl_fill_clear_after: float | None = None
 
     async def async_setup_store(self) -> None:
-        """Opens the SQLite store and loads any existing training into the identity engine.
-        Called once, before the first refresh, so ingest can classify from it immediately."""
+        """Opens the SQLite store and loads the learned bowl-fill rates -- the local, bounded
+        part of start-up, and the only part that stays inside `async_setup_entry` (a failure
+        here surfaces as a failed setup, as it always did). Building the identity engine's
+        models is NOT here: see the module docstring's "The first poll runs in the background"."""
         await self.store.async_setup()
         for bucket in ("hopper1", "hopper2"):
             learned = await self.store.async_get_bowl_fill_learning(bucket)
             if learned is not None:
                 self._bowl_fill_learned[bucket] = learned
-        await self.engine.async_rebuild()
 
     async def async_poll_until_first_data(self) -> None:
         """Polls until one poll succeeds -- so `data` exists -- retrying a failed attempt after a
@@ -473,15 +491,19 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         entry is still mid-setup, and `__init__.py` deliberately lets setup return before this
         finishes. `async_refresh` does the rest -- it logs the first failure once and the
         recovery -- and `_async_update_data`'s own accounting still applies (no snapshot to
-        fall back on, so every failed attempt raises and counts)."""
+        fall back on, so every failed attempt raises and counts, and from the third the repair
+        issue is raised -- `_handle_poll_failure`). Landing the first data also clears that issue
+        unconditionally: this coordinator may be a reload's replacement for one that raised it
+        and never failed itself, so `_handle_poll_success`'s failure counter would not."""
         backoff = FIRST_POLL_RETRY_MIN
         while self.data is None:
             await self.async_refresh()
             if self.data is not None:
-                return
+                break
             _LOGGER.debug("First poll failed (%s); trying again in about %.0f s", self.last_error, backoff)
             await asyncio.sleep(backoff + random.uniform(0, backoff / 2))
             backoff = min(backoff * 2, FIRST_POLL_RETRY_MAX)
+        self._async_clear_unresponsive_issue()
 
     @callback
     def async_on_first_data(self, setup: Callable[[], None]) -> None:
@@ -505,15 +527,22 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 )
 
     async def async_cancel_startup(self) -> None:
-        """Stops the background first-poll task and forgets any entity creation still waiting for
-        data. First thing on unload: left running, that task could land its poll between the
-        platforms being unloaded and Home Assistant cancelling it, and add entities to a
-        platform that no longer exists."""
+        """Stops the background first-poll task, then the CoralHub task it starts, and forgets any
+        entity creation still waiting for data. First thing on unload: left running, the poll
+        task could land its poll between the platforms being unloaded and Home Assistant
+        cancelling it, and add entities to a platform that no longer exists; and CoralHub's
+        task would still be using the store when `async_unload_entry` closes it. Order matters:
+        the poll task is awaited to its end first, so it can no longer start a CoralHub task
+        after we have looked for one."""
         task, self.startup_task = self.startup_task, None
         self._first_data_callbacks.clear()
         if task is not None and not task.done():
             task.cancel()
             await asyncio.wait({task})
+        coral, self.coral_task = self.coral_task, None
+        if coral is not None and not coral.done():
+            coral.cancel()
+            await asyncio.wait({coral})
 
     def async_start_retention(self) -> Callable[[], None]:
         """Runs one retention purge now (background task) and schedules an hourly one for the
@@ -785,7 +814,13 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         re-serve it so `last_update_success`/entity availability don't flip for what is, per the
         module docstring, this device's ordinary noise floor. At or past the threshold, or with
         no prior snapshot (the very first poll -- `async_poll_until_first_data` keeps retrying
-        it), raise so HA's own coordinator marks entities unavailable for real."""
+        it), raise so HA's own coordinator marks entities unavailable for real.
+
+        From the threshold on the repair issue is raised too, snapshot or not: a feeder that has
+        not answered once since Home Assistant started is exactly as much "not responding" as one
+        that stopped, and with the entry now loading instead of retrying setup, nothing else but
+        one log line would say so. Below the threshold there is no issue yet, same as for a
+        feeder that has been answering."""
         self.consecutive_failures += 1
         self.last_error = str(err) or repr(err)
         if self.data is not None and self.consecutive_failures < CONSECUTIVE_FAILURES_FOR_UNAVAILABLE:
@@ -796,7 +831,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 self.last_error,
             )
             return self.data
-        if self.data is not None:
+        if self.consecutive_failures >= CONSECUTIVE_FAILURES_FOR_UNAVAILABLE:
             self._async_create_unresponsive_issue()
         raise UpdateFailed(self.last_error, retry_after=self._retry_after_seconds()) from err
 
@@ -809,13 +844,21 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         return min(MAX_RETRY_AFTER, DEFAULT_SCAN_INTERVAL * (2 ** max(overage, 0)))
 
     def _async_create_unresponsive_issue(self) -> None:
+        """One issue per entry whichever way the outage began; only the wording differs. With a
+        snapshot the entities keep their last known values (`feeder_unresponsive`'s promise);
+        without one -- nothing answered since Home Assistant started -- there are none to keep
+        (`feeder_unresponsive_since_start`)."""
         ir.async_create_issue(
             self.hass,
             DOMAIN,
             f"{ISSUE_FEEDER_UNRESPONSIVE}_{self.entry.entry_id}",
             is_fixable=False,
             severity=ir.IssueSeverity.WARNING,
-            translation_key=ISSUE_FEEDER_UNRESPONSIVE,
+            translation_key=(
+                ISSUE_FEEDER_UNRESPONSIVE
+                if self.data is not None
+                else ISSUE_FEEDER_UNRESPONSIVE_SINCE_START
+            ),
             translation_placeholders={
                 "name": self.entry.title,
                 "failures": str(self.consecutive_failures),
