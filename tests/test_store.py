@@ -2047,6 +2047,50 @@ def test_legacy_sidless_session_keeps_the_chronological_split_fallback(tmp_path:
     assert {sample["uid"] for sample in detail["samples"]} == {f"e1-s{i}" for i in range(4)}
 
 
+def test_a_split_that_shrinks_mid_session_never_leaves_a_cat_present_after_it_closes(
+    tmp_path: Path,
+) -> None:
+    """Session e3438 (2026-10-03): one confident photo grew the open session's plan to Kitty,
+    Pancake, Kitty, the next (a low-confidence Kitty photo that disqualified that last run)
+    shrank it back to Kitty, Pancake. The third, open Kitty segment was left behind, so "Kitty
+    present" stayed on for 2 h 20 min after she had walked away."""
+    store = _SyncStore(tmp_path, "entry1")
+    store.add_cat("Kitty")
+    store.add_cat("Pancake")
+    start = int(time.time()) - 600
+    _insert_event(store, "e1", start, kind="eat", end=None, open_=True)
+
+    def add(index: int, t: int, cat: str, confidence: float) -> None:
+        uid = f"e1-s{index}"
+        _insert_sample(store, uid, "e1", start + t)
+        store.conn.execute(
+            "UPDATE samples SET guess=?, guess_confidence=? WHERE uid=?", (cat, confidence, uid)
+        )
+        store.conn.commit()
+
+    for index, (t, cat) in enumerate(((0, "Kitty"), (4, "Kitty"), (30, "Pancake"), (34, "Pancake"))):
+        add(index, t, cat, 0.95)
+    add(4, 60, "Kitty", 0.95)
+    add(5, 64, "Kitty", 0.95)
+    store.replan_session("e1", _subject_scores())
+    assert store.identity_summary().cats["Kitty"].present is True  # the third segment, open
+
+    add(6, 66, "Kitty", 0.55)
+    store.replan_session("e1", _subject_scores())
+    store.conn.execute("UPDATE events SET open=0, end=? WHERE uid='e1'", (start + 70,))
+    store.conn.commit()
+    store.replan_session("e1", _subject_scores())
+
+    summary = store.identity_summary()
+    assert summary.cats["Kitty"].present is False
+    assert summary.cats["Pancake"].present is False
+    children = store.conn.execute("SELECT uid, cat FROM events WHERE parent_uid='e1' ORDER BY uid").fetchall()
+    assert [(row["uid"], row["cat"]) for row in children] == [("e1-seg0", "Kitty"), ("e1-seg1", "Pancake")]
+    detail = store.event_detail("e1")
+    assert detail is not None and len(detail["samples"]) == 7
+
+
+
 def test_identity_summary_counts_cat_parts_not_the_hidden_session_parent(tmp_path: Path) -> None:
     store = _SyncStore(tmp_path, "entry1")
     start = int(time.time()) - 3600

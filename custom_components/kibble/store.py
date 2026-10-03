@@ -2440,7 +2440,11 @@ class _SyncStore:
         (relabel, reclassification drift) is never silently overwritten, and nothing past that
         point is touched either. Only once EVERY existing child matched cleanly, and the plan
         has segments beyond them, are the extra trailing one(s) created -- exactly like the
-        first-ever split. Returns whether anything changed."""
+        first-ever split. The reverse, a plan that SHRANK so that every segment it still has
+        matched but children remain past its end, deletes those surplus children (an unreviewed
+        one) or closes them (a reviewed one): the plan has already moved the photos it still
+        wants, and an orphan left open kept its cat "present" -- and counted as an extra meal --
+        long after the session ended (e3438, 2026-10-03). Returns whether anything changed."""
         changed = False
         now = _now()
         last_plan_index = len(plan) - 1
@@ -2468,6 +2472,16 @@ class _SyncStore:
                         (seg.end, new_open, new_after, now, child["uid"]),
                     )
                     changed = True
+        if matched == len(plan):
+            for child in children[matched:]:
+                if child["reviewed"]:
+                    if child["open"]:
+                        self.conn.execute("UPDATE events SET open=0, updated=? WHERE uid=?", (now, child["uid"]))
+                        changed = True
+                    continue
+                self.conn.execute("UPDATE samples SET event_uid=? WHERE event_uid=?", (row["uid"], child["uid"]))
+                self.conn.execute("DELETE FROM events WHERE uid=?", (child["uid"],))
+                changed = True
         if matched == len(children) and len(plan) > matched:
             self._append_split_segments(row, plan[matched:], start_index=matched)
             changed = True
