@@ -158,7 +158,8 @@ mixins and matches on /onnx|openvino/i, so it also works with an OpenVINO-based 
 Settings → Second-pass detection.
 
 The re-check only ever sees the feeder's own pet crop, so two kinds of answer are thrown away
-before they are reported, and neither is advertised by `getObjectTypes`:
+before they are reported (`getObjectTypes` still lists `animal`, which the on-device path uses;
+it no longer lists `person`/`vehicle`):
 
 - **Animal classes** (`animal`, `cat`, `dog`, `dog_cat`): so this re-check can never trigger an
   Events Recorder clip on its own; only the dedicated eating path does.
@@ -168,8 +169,8 @@ before they are reported, and neither is advertised by `getObjectTypes`:
 
 Real people are detected by the camera's own **Scrypted NVR Object Detection** mixin, which looks
 at the full frame. On the feeder camera (Scrypted device 240) its Detections list is
-`package, person` with Person Threshold **0.88** (set 2026-11-04; it was `package` only before,
-so the camera reported no real people). The threshold sits above the 0.80 the worst cat crop
+`person` only, Person Threshold **0.88** (set 2026-11-04; before that it was `package` only, so
+the camera reported no real people; `package` was dropped at Nitin's request). The threshold sits above the 0.80 the worst cat crop
 scored; lower it only after checking that cats close to the lens stay below it.
 
 ## Eating clips: Events Recorder trigger, verified live end to end
