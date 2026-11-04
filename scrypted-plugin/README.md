@@ -86,9 +86,9 @@ Nitin's other cameras in this exact instance show that same pattern already).
 **2. `ObjectDetector.getObjectTypes()` on the mixed-in camera returns real, live data requiring
 both halves of the feature to actually work:**
 ```
-{"classes":["face","visit","eat","cat","animal"]}
+{"classes":["cat_face","visit","eat","cat","animal"]}
 ```
-`face`/`visit`/`eat`/`cat` are the agent's own on-device classes (`agent/src/ai.rs`'s `WATCHED`
+`cat_face`/`visit`/`eat`/`cat` are the agent's own on-device classes (`agent/src/ai.rs`'s `WATCHED`
 array). `animal` comes from live-querying this Scrypted instance's own "ONNX Object Detection"
 plugin (`@scrypted/onnx`, a YOLOv9c model) via `systemManager`/`ObjectDetection.
 getDetectionModel()`; its `person`/`vehicle` are left out (see "Second pass" below). Re-read live

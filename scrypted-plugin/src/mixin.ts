@@ -128,7 +128,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
     }
 
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
-        const classes = new Set(['face', 'visit', 'eat', 'cat']);
+        const classes = new Set(['cat_face', 'visit', 'eat', 'cat']);
         if (this.getConfig().secondPassEnabled) {
             this.secondPassDetector ??= findSecondPassDetector();
             if (this.secondPassDetector) {
@@ -165,7 +165,9 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         const detectionId = `kibble-${raw.seq}`;
         const config = this.getConfig();
 
-        const onDevice: HonestDetectionResult = { className: raw.class };
+        // The feeder's `face` is a cat's face; downstream consumers (the LumaShow TV bridge, HA)
+        // read a bare "face" class as a person, so it is reported as `cat_face` instead.
+        const onDevice: HonestDetectionResult = { className: raw.class === 'face' ? 'cat_face' : raw.class };
         const crop = raw.image ? await this.tryFetchCrop(config.host, config.httpPort, raw.image) : undefined;
         if (crop)
             this.cacheCrop(detectionId, crop);
