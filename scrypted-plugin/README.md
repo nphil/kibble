@@ -86,13 +86,14 @@ Nitin's other cameras in this exact instance show that same pattern already).
 **2. `ObjectDetector.getObjectTypes()` on the mixed-in camera returns real, live data requiring
 both halves of the feature to actually work:**
 ```
-{"classes":["face","visit","eat","person","vehicle","animal"]}
+{"classes":["face","visit","eat","cat","animal"]}
 ```
-`face`/`visit`/`eat` are the agent's own on-device classes (`agent/src/ai.rs`'s `WATCHED` array).
-`person`/`vehicle`/`animal` came from live-querying this Scrypted instance's own "ONNX Object
-Detection" plugin (`@scrypted/onnx`, a YOLOv9c model) via `systemManager`/`ObjectDetection.
-getDetectionModel()` — proving the second-pass detector auto-discovery and the `sdk.systemManager`
-access it depends on both work end-to-end against the live system, not just in isolation.
+`face`/`visit`/`eat`/`cat` are the agent's own on-device classes (`agent/src/ai.rs`'s `WATCHED`
+array). `animal` comes from live-querying this Scrypted instance's own "ONNX Object Detection"
+plugin (`@scrypted/onnx`, a YOLOv9c model) via `systemManager`/`ObjectDetection.
+getDetectionModel()`; its `person`/`vehicle` are left out (see "Second pass" below). Re-read live
+2026-11-04, proving the second-pass detector auto-discovery and the `sdk.systemManager` access it
+depends on both work end-to-end against the live system, not just in isolation.
 
 **3. Intercom RTSP/ONVIF backchannel negotiation — full transcript, captured live via the plugin's
 own "Test intercom negotiation" button** (Settings → Kibble Feeder), which drives the *exact* same
@@ -155,6 +156,21 @@ with ObjectDetection.detectObjects on ONNX Object Detection, about 35 ms). It ru
 only when an event crop is available. Auto-discovery skips the NVR's own per-camera detection
 mixins and matches on /onnx|openvino/i, so it also works with an OpenVINO-based instance. Toggle:
 Settings → Second-pass detection.
+
+The re-check only ever sees the feeder's own pet crop, so two kinds of answer are thrown away
+before they are reported, and neither is advertised by `getObjectTypes`:
+
+- **Animal classes** (`animal`, `cat`, `dog`, `dog_cat`): so this re-check can never trigger an
+  Events Recorder clip on its own; only the dedicated eating path does.
+- **Scene classes** (`person`, `vehicle`), since 2026-11-04: the scene detector called a cat's face
+  in the bowl a person (110 of 110 person tags on 2026-11-03/04 were cats, scores up to 0.80),
+  which raised "Detected a person" notifications.
+
+Real people are detected by the camera's own **Scrypted NVR Object Detection** mixin, which looks
+at the full frame. On the feeder camera (Scrypted device 240) its Detections list is
+`package, person` with Person Threshold **0.88** (set 2026-11-04; it was `package` only before,
+so the camera reported no real people). The threshold sits above the 0.80 the worst cat crop
+scored; lower it only after checking that cats close to the lens stay below it.
 
 ## Eating clips: Events Recorder trigger, verified live end to end
 
