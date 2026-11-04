@@ -62,6 +62,9 @@ const EATING_INPUT_DIMENSIONS: [number, number] = [1920, 1080];
  * confirmed live in the day-partitioned events.json files under /NVR/clips/240/events/ before this filter existed. */
 const SECOND_PASS_ANIMAL_CLASSES: Record<string, true> = { animal: true, cat: true, dog: true, dog_cat: true };
 
+/** Scene classes the second pass must never report from a pet crop -- see `trySecondPass`. */
+const SECOND_PASS_SCENE_CLASSES: Record<string, true> = { person: true, vehicle: true };
+
 /** Exported so `main.ts` can quote the same number in the "Record test clip" button's own
  * description (that button lives on the plugin's Settings -- see this file's header). */
 export const TEST_CLIP_DURATION_MS = 30_000;
@@ -291,7 +294,10 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
 
     /** Runs the crop through an installed general-purpose ONNX/OpenVINO detector for a real,
      * off-device class + confidence score. Strips Animal-mapped results so only the dedicated
-     * eating path can trigger the recorder. */
+     * eating path can trigger the recorder, and strips person/vehicle: the crop is always the
+     * feeder's own pet box, and the scene detector calls a cat's face in the bowl a "person"
+     * (110 of 110 person tags on 2026-11-03/04 were cats, scores up to 0.80), which raised
+     * "Detected a person" notifications. Real people are Scrypted's own full-frame job. */
     private async trySecondPass(crop: Buffer): Promise<ObjectDetectionResult[]> {
         this.secondPassDetector ??= findSecondPassDetector();
         if (!this.secondPassDetector) {
@@ -301,7 +307,7 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
         try {
             const result = await runSecondPass(this.secondPassDetector, crop, SECOND_PASS_MIN_SCORE);
             const detections = result?.detections ?? [];
-            return detections.filter(d => !SECOND_PASS_ANIMAL_CLASSES[d.className]);
+            return detections.filter(d => !SECOND_PASS_ANIMAL_CLASSES[d.className] && !SECOND_PASS_SCENE_CLASSES[d.className]);
         } catch (e) {
             this.console.warn(`kibble: second-pass detection failed: ${(e as Error).message}`);
             return [];
