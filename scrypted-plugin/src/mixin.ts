@@ -134,7 +134,8 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
             if (this.secondPassDetector) {
                 const model = await this.secondPassDetector.getDetectionModel().catch(() => undefined);
                 for (const c of model?.classes ?? [])
-                    classes.add(c);
+                    if (!SECOND_PASS_SCENE_CLASSES[c])
+                        classes.add(c);
             }
         }
         return { classes: [...classes] };
@@ -297,7 +298,9 @@ export class KibbleFeederMixin extends MixinDeviceBase<VideoCamera & Camera> imp
      * eating path can trigger the recorder, and strips person/vehicle: the crop is always the
      * feeder's own pet box, and the scene detector calls a cat's face in the bowl a "person"
      * (110 of 110 person tags on 2026-11-03/04 were cats, scores up to 0.80), which raised
-     * "Detected a person" notifications. Real people are Scrypted's own full-frame job. */
+     * "Detected a person" notifications. Real people come only from the camera's own Scrypted NVR
+     * Object Detection (full frame), which reports person only if "person" is in its Detections
+     * list -- on camera 240 it was not until 2026-11-04 (now person, threshold 0.88). */
     private async trySecondPass(crop: Buffer): Promise<ObjectDetectionResult[]> {
         this.secondPassDetector ??= findSecondPassDetector();
         if (!this.secondPassDetector) {
