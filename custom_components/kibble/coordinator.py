@@ -45,7 +45,7 @@ This coordinator now tells "the last poll failed" apart from "the feeder is down
   *and* as long as a prior good snapshot (`self.data`) exists, `_async_update_data` returns that
   stale snapshot instead of raising: `last_update_success` stays `True`, every entity keeps
   showing its last real value, and only `.consecutive_failures`/`.last_error` (read by the
-  disabled-by-default "Feeder reachable" diagnostic binary sensor and by `diagnostics.py`) record
+  disabled-by-default "Reachable" diagnostic binary sensor and by `diagnostics.py`) record
   that something is off. Three is deliberate, not arbitrary: the starved-server incident this
   policy exists for saw `GET /state` fail 3 of 5 attempts at a 10s timeout -- failures in ones
   and twos are this device's ordinary noise floor at a 10s poll interval, not an outage; three in
@@ -574,7 +574,7 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         """True iff the *most recent* contact (poll or push frame) succeeded outright --
         stricter than `.available` (`CoordinatorEntity.available`/`last_update_success`), which
         stays `True` through the tolerance window described in the module docstring. Backs the
-        disabled-by-default "Feeder reachable" diagnostic binary sensor."""
+        disabled-by-default "Reachable" diagnostic binary sensor."""
         return self.consecutive_failures == 0
 
     # --- push ------------------------------------------------------------------------------

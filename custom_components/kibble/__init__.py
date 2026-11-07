@@ -437,7 +437,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     if not loaded:
         raise ConfigEntryNotReady("No Kibble platform could be set up; see the log above")
 
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _async_register_services(hass)
     # Everything `_async_finish_setup` starts is torn down here on unload (and the push socket
     # also on HA stop -- wled's pattern); each of these is safe to run if it never got that far.
@@ -841,8 +840,3 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_CLEAR_TRAINING, handle_clear_training, CLEAR_TRAINING_SCHEMA
     )
-
-
-async def _async_options_updated(hass: HomeAssistant, entry: KibbleConfigEntry) -> None:
-    """The stream source lives in options; re-create the camera entity with the new one."""
-    await hass.config_entries.async_reload(entry.entry_id)

@@ -7,3 +7,4 @@ __pycache__/
 tools/aacenc/.build/
 tools/aacenc/build-arm/
 tools/aacenc/build-native/
+manifest-requirements.txt

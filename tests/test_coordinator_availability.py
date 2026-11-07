@@ -150,7 +150,7 @@ def test_recovery_after_failures_clears_the_repair_issue(issue_registry: SimpleN
 
 
 def test_feeder_reachable_is_false_after_a_single_failure_even_though_available_stays_true() -> None:
-    """This is the whole point of `feeder_reachable`/the "Feeder reachable" binary sensor: it
+    """This is the whole point of `feeder_reachable`/the "Reachable" binary sensor: it
     diverges from `last_update_success` exactly during the tolerance window."""
     coord = _bare_coordinator(data=object(), consecutive_failures=0)
     assert coord.feeder_reachable is True

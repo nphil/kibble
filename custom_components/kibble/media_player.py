@@ -164,3 +164,11 @@ class KibbleSpeaker(KibbleEntity, MediaPlayerEntity):
             self._unsub_idle()
             self._unsub_idle = None
         await super().async_will_remove_from_hass()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The pending revert-to-idle timer writes state through `self.entity_id`
+        whatever it is at the time, so there is nothing to re-key; without this method a
+        rename would remove and re-add the entity."""
+        super().async_entity_id_changed(old_entity_id)

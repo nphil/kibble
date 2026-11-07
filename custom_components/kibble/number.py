@@ -41,7 +41,7 @@ from homeassistant.components.number import (
     NumberMode,
 )
 from homeassistant.const import PERCENTAGE, EntityCategory, Platform, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -204,6 +204,13 @@ class KibbleFeedAmount(KibbleEntity, NumberEntity, RestoreEntity):
                 self._value = float(last.state)
             except ValueError:
                 pass
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The restored amount is not keyed on the entity id, so there is nothing to
+        re-key; without this method an entity rename would remove and re-add the entity."""
+        super().async_entity_id_changed(old_entity_id)
 
     @property
     def native_value(self) -> float:

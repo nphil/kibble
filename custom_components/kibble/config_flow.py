@@ -11,7 +11,7 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlow,
+    OptionsFlowWithReload,
 )
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -79,7 +79,7 @@ class KibbleConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="user", data_schema=SCHEMA, errors=errors)
 
 
-class KibbleOptionsFlow(OptionsFlow):
+class KibbleOptionsFlow(OptionsFlowWithReload):
     """Video source, BLE fallback address, the schedule-card write gate, HA-side evidence
     retention, the Scrypted eating-clips server and the vision judge -- all filled in after
     initial setup.
@@ -112,8 +112,9 @@ class KibbleOptionsFlow(OptionsFlow):
     (`docs/39-eating-clips.md`). Empty (the default) turns the whole eating-clips feature off:
     no lookups, no retries, no clip ever offered on the timeline. Stored with any trailing
     slash removed, so `eating_clips.py`'s URL builders never have to guard against a doubled
-    slash. Changing it reloads the entry (`_async_options_updated`), same as every other
-    option here -- a stale `ClipLinker` pointed at the old value never lingers.
+    slash. Saving changed options reloads the entry (`OptionsFlowWithReload`, so there is no
+    update listener), same as every other option here -- a stale `ClipLinker` pointed at the
+    old value never lingers.
 
     `vision_judge_url`: the judge model's own OpenAI-compatible base URL, e.g.
     `http://192.168.1.69:9292/v1` (`docs/40-vision-judge.md`). Empty (the default) turns the
@@ -211,10 +212,12 @@ class KibbleOptionsFlow(OptionsFlow):
                 # Entity first: it is the source that survives a video hub restarting, and the
                 # one most installs should use. `stream_url` stays for a genuinely fixed URL,
                 # and leaving BOTH empty is a first-class configuration -- the feeder's own
-                # stream, no hub required.
-                vol.Optional(CONF_STREAM_ENTITY, default=stream_entity): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="camera")
-                ),
+                # stream, no hub required. A suggested value, not a `default`: a default is
+                # validated by the camera picker too, and "" is not a camera, so the form
+                # could never be saved without one chosen.
+                vol.Optional(
+                    CONF_STREAM_ENTITY, description={"suggested_value": stream_entity}
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain="camera")),
                 vol.Optional(CONF_STREAM_URL, default=stream_url): str,
                 vol.Optional(CONF_BLE_ADDRESS, default=ble_address): str,
                 vol.Optional(

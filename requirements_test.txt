@@ -1,0 +1,11 @@
+# What the tests need besides `pytest-homeassistant[bluetooth]` (the Home Assistant test harness,
+# which brings Home Assistant itself) and the manifest's own `requirements`. The `ha-compat`
+# workflow and the README's Development section install all three together.
+#
+# numpy and pillow: the identity engine and the tests' synthetic photos.
+# ha-ffmpeg and PyTurboJPEG: requirements of the `ffmpeg` and `camera` integrations, which
+# Kibble depends on -- the test harness does not install an integration's own requirements.
+numpy
+pillow
+ha-ffmpeg
+PyTurboJPEG

@@ -28,7 +28,7 @@ from typing import Any
 
 from homeassistant.components.text import TextEntity, TextEntityDescription, TextMode
 from homeassistant.const import EntityCategory, Platform, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -286,6 +286,14 @@ class KibbleHopperFoodText(KibbleEntity, TextEntity, RestoreEntity):
         if last is not None and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             self._value = last.state[: self.entity_description.native_max]
         self.coordinator.async_set_hopper_food(self.entity_description.hopper, self._value)
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The food name is pushed onto the coordinator keyed by hopper, not by entity
+        id, so there is nothing to re-key; without this method a rename would remove and
+        re-add the entity."""
+        super().async_entity_id_changed(old_entity_id)
 
     @property
     def native_value(self) -> str:

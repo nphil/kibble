@@ -1,7 +1,7 @@
 """Shared fixtures for the tests_ha real-Home-Assistant integration suite.
 
-This suite runs under /data/home/tmp/hatest/bin/python (real homeassistant +
-pytest-homeassistant-custom-component), never the repo's own minimal uv venv -- see
+This suite needs a real Home Assistant core plus its test harness (`pytest-homeassistant`; the
+README's Development section has the install line), never the repo's own minimal uv venv -- see
 kibble/tests/ for the HA-independent unit-style suite.
 """
 

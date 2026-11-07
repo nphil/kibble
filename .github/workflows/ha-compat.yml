@@ -1,0 +1,31 @@
+name: HA compatibility
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly. The beta leg fails here about a week before a breaking Home
+    # Assistant release reaches the house.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: pytest (HA ${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Home Assistant and its test harness
+        run: |
+          uv venv -p 3.14
+          python3 -c "import json,glob; [print(r) for f in glob.glob('custom_components/*/manifest.json') for r in json.load(open(f)).get('requirements', [])]" > manifest-requirements.txt
+          prerelease=""
+          if [ "${{ matrix.channel }}" = "beta" ]; then prerelease="--prerelease=allow"; fi
+          uv pip install $prerelease "pytest-homeassistant[bluetooth]" -r manifest-requirements.txt -r requirements_test.txt
+      # Both test tiers: the unit tests in tests/ and the real-Home-Assistant tests in tests_ha/.
+      - run: uv run --no-project pytest tests tests_ha

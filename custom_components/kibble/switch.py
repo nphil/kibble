@@ -34,7 +34,7 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.const import EntityCategory, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -238,6 +238,14 @@ class KibbleHopperDividerSwitch(KibbleEntity, SwitchEntity, RestoreEntity):
             self._attr_is_on = last.state == "on"
         self.coordinator.single_hopper = not self._attr_is_on
 
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The remembered choice lives on the coordinator, not under the entity id,
+        so there is nothing to re-key; without this method a rename would remove and re-add
+        the entity."""
+        super().async_entity_id_changed(old_entity_id)
+
     @property
     def is_on(self) -> bool:
         return not self.coordinator.single_hopper
@@ -282,6 +290,13 @@ class KibbleAutoLearnSwitch(KibbleEntity, SwitchEntity, RestoreEntity):
         if last is not None and last.state in ("on", "off"):
             self._attr_is_on = last.state == "on"
         self.coordinator.auto_learn_enabled = self._attr_is_on
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The choice lives on the coordinator, not under the entity id, so there is
+        nothing to re-key; without this method a rename would remove and re-add the entity."""
+        super().async_entity_id_changed(old_entity_id)
 
     @property
     def is_on(self) -> bool:

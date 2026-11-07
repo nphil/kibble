@@ -1,7 +1,7 @@
 """Real-Home-Assistant integration smoke test for the pipeline-v2 rebuild.
 
 Runs `custom_components/kibble` against a real `homeassistant` core via
-pytest-homeassistant-custom-component (`/data/home/tmp/hatest/bin/python -m pytest tests_ha`)
+pytest-homeassistant (`python -m pytest tests_ha`; setup is in the README's Development section)
 -- the only place `__init__.py`, `config_flow.py`, `coordinator.py`, `websocket.py` and every
 entity platform file actually execute against real Home Assistant before a live deploy.
 
@@ -25,16 +25,19 @@ from typing import Any
 
 import numpy as np
 import pytest
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import async_get_platforms
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from PIL import Image
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 import custom_components.kibble as kibble_mod
 import custom_components.kibble.coordinator as coordinator_mod
@@ -43,8 +46,11 @@ from custom_components.kibble import PLATFORMS
 from custom_components.kibble.api import KibbleClient, KibbleConnectionError, KibbleNotFoundError
 from custom_components.kibble.const import (
     CONF_CORALHUB_URL,
+    CONF_ENABLE_SCHEDULE_WRITES,
     CONF_HOST,
     CONF_PORT,
+    CONF_RETENTION_DAYS,
+    CONF_STREAM_ENTITY,
     DOMAIN,
     HOPPER_BOTH,
     ISSUE_FEEDER_UNRESPONSIVE,
@@ -1256,3 +1262,161 @@ async def test_the_first_answer_clears_a_repair_an_earlier_load_of_the_entry_lef
     assert entry.runtime_data.data is not None
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
     await hass.async_block_till_done()  # the first poll's ingest pass, which uses the store
+
+
+# --- Home Assistant 2026.11: entity ids change in place; reloads come from the flows ---------------
+
+# Home Assistant 2026.11 renames an entity in place; before that every rename removed the entity
+# and added it again. The hook is what tells the two apart.
+IN_PLACE_ENTITY_ID_CHANGE = hasattr(Entity, "async_entity_id_changed")
+
+
+def _live_entity(hass: HomeAssistant, entity_id: str) -> Entity:
+    """The entity object currently serving `entity_id` (there is no public lookup for it)."""
+    [entity] = [
+        platform.entities[entity_id]
+        for platform in async_get_platforms(hass, DOMAIN)
+        if entity_id in platform.entities
+    ]
+    return entity
+
+
+@pytest.mark.parametrize(
+    ("domain", "key"),
+    [
+        ("number", "feed_amount"),
+        ("switch", "hopper_divider"),
+        ("switch", "auto_learn"),
+        ("text", "hopper_1_food"),
+        ("media_player", "speaker"),
+    ],
+)
+async def test_renaming_an_entity_id_is_done_in_place_where_home_assistant_supports_it(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    domain: str,
+    key: str,
+) -> None:
+    """These five classes define `async_added_to_hass`/`async_will_remove_from_hass`, so from
+    Home Assistant 2026.11 they only get the in-place rename once they implement
+    `async_entity_id_changed` -- without it a rename keeps removing and re-adding them (and
+    from 2027.11 would stop them working properly). Either way the entity must come out under
+    the new id with its state intact and still follow the feeder's polls."""
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(domain, DOMAIN, f"{SERIAL}_{key}")
+    assert entity_id is not None
+    entity = _live_entity(hass, entity_id)
+    state_before = hass.states.get(entity_id)
+    assert state_before is not None
+
+    torn_down: list[str] = []
+    real_will_remove = entity.async_will_remove_from_hass
+
+    async def counting_will_remove() -> None:
+        torn_down.append(entity.entity_id)
+        await real_will_remove()
+
+    # On the instance, not the class: Home Assistant decides from the class whether a rename
+    # has to rebuild the entity, and this test must not change that decision. Taken off again
+    # in the `finally` rather than by `monkeypatch`, whose undo would leave a method bound to
+    # the entity in the entity's own `__dict__`: a reference cycle that outlives the test.
+    entity.async_will_remove_from_hass = counting_will_remove
+    new_entity_id = f"{domain}.renamed_{key}"
+    try:
+        registry.async_update_entity(entity_id, new_entity_id=new_entity_id)
+        await hass.async_block_till_done()
+    finally:
+        del entity.async_will_remove_from_hass
+
+    assert hass.states.get(entity_id) is None
+    state_after = hass.states.get(new_entity_id)
+    assert state_after is not None
+    assert state_after.state == state_before.state
+    assert entity.entity_id == new_entity_id
+    assert _live_entity(hass, new_entity_id) is entity
+    assert torn_down == ([] if IN_PLACE_ENTITY_ID_CHANGE else [entity_id])
+
+    # Still wired to the coordinator: the next poll writes the state under the new id.
+    await configured_entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(new_entity_id) is not None
+    assert hass.states.get(entity_id) is None
+
+
+class _SetupCounter:
+    """Counts how often the entry is set up -- one per reload."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.entry_ids: list[str] = []
+        real_setup = kibble_mod.async_setup_entry
+
+        async def counting_setup(hass: HomeAssistant, entry: MockConfigEntry) -> bool:
+            self.entry_ids.append(entry.entry_id)
+            return await real_setup(hass, entry)
+
+        monkeypatch.setattr(kibble_mod, "async_setup_entry", counting_setup)
+
+
+async def test_saving_options_reloads_the_entry_once_and_no_update_listener_is_registered(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The options flow reloads the entry itself (`OptionsFlowWithReload`); a config entry
+    update listener beside it is an error from Home Assistant 2026.12. So the entry carries no
+    listener, and saving changed options still replaces the running coordinator exactly once.
+    No camera is chosen here: the form must save with the camera picker left blank (it used to
+    reject that, because the picker validated its own empty default)."""
+    assert configured_entry.update_listeners == []
+    coordinator_before = configured_entry.runtime_data
+    setups = _SetupCounter(monkeypatch)
+
+    result = await hass.config_entries.options.async_init(configured_entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_ENABLE_SCHEDULE_WRITES: True, CONF_RETENTION_DAYS: 30},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert configured_entry.options[CONF_ENABLE_SCHEDULE_WRITES] is True
+    assert configured_entry.options[CONF_RETENTION_DAYS] == 30
+    assert configured_entry.options[CONF_STREAM_ENTITY] == ""
+    assert configured_entry.state is ConfigEntryState.LOADED
+    assert configured_entry.runtime_data is not coordinator_before
+    assert setups.entry_ids == [configured_entry.entry_id]
+    assert configured_entry.update_listeners == []
+
+
+async def test_adding_the_same_feeder_at_a_new_address_updates_the_entry_and_reloads_it_once(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The feeder's serial identifies it, so adding it again under a new address just moves the
+    existing entry (`_abort_if_unique_id_configured(updates=...)`), which core reloads by itself:
+    the integration used to reload a second time through its own update listener."""
+    coordinator_before = configured_entry.runtime_data
+    setups = _SetupCounter(monkeypatch)
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "192.0.2.99", CONF_PORT: PORT}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert configured_entry.data[CONF_HOST] == "192.0.2.99"
+    assert configured_entry.state is ConfigEntryState.LOADED
+    assert configured_entry.runtime_data is not coordinator_before
+    assert setups.entry_ids == [configured_entry.entry_id]

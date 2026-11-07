@@ -6,7 +6,8 @@
 
 Kibble is a Home Assistant integration. It talks over your home network to a small program that
 runs *on the feeder itself*, so feeding, the camera, cat recognition and the feeder's settings all
-work locally. You install the integration with HACS; the program on the feeder is separate
+work locally. You install the integration from this repository through Home Assistant's
+Marketplace (HACS on older versions); the program on the feeder is separate
 (see [The feeder side](#the-feeder-side)).
 
 ## What you get
@@ -44,9 +45,16 @@ work locally. You install the integration with HACS; the program on the feeder i
 
 ## Install
 
-1. In Home Assistant open **HACS**, choose the three-dot menu, then **Custom repositories**. Add
-   `https://github.com/nphil/kibble` as type **Integration**.
-2. Find **Kibble** in HACS, press **Download**, then restart Home Assistant.
+1. Add the repository:
+   - **Home Assistant 2026.11 or newer**: HACS is built into Home Assistant there as the
+     **Marketplace**. Go to **Settings, Marketplace**, choose **Add from link** (top right) and
+     enter `nphil/kibble`. The Marketplace asks you to connect a GitHub account the first time
+     it adds a repository from a link. The repository is public and carries the `hacs.json`
+     file it needs.
+   - **Home Assistant 2026.10 or older**: in **HACS**, choose the three-dot menu, then **Custom
+     repositories**, and add `https://github.com/nphil/kibble` as type **Integration**.
+2. Open **Kibble** in the list, press **Install** (**Download** in HACS), then restart Home
+   Assistant.
 3. Go to **Settings, Devices & services, Add integration, Kibble** and enter the feeder's address
    (port 8765 unless you changed it). Kibble does not discover feeders by itself, so type the
    address in.
@@ -184,7 +192,7 @@ they were recovered from, are in [docs/](docs/README.md).
 
 | Path | What it is |
 |---|---|
-| `custom_components/kibble/` | The Home Assistant integration (what HACS installs) |
+| `custom_components/kibble/` | The Home Assistant integration (what the Marketplace or HACS installs) |
 | `agent/` | `kibbled`, the Rust agent that runs on the feeder next to the stock firmware |
 | `scrypted-plugin/` | The Scrypted plugin for detections and meal clips |
 | `dashboard/` | A sample Lovelace dashboard |
@@ -192,7 +200,8 @@ they were recovered from, are in [docs/](docs/README.md).
 | `tests/`, `tests_ha/` | The integration's test suites (see [Development](#development)) |
 | `scripts/`, `tools/` | Helpers: the feeder boot hook, the one-off history migration, C message tools, the cat-recognition calibration scripts, and `render_brand.py` for the icons |
 
-Only `custom_components/kibble/` is copied to Home Assistant; nothing else here is installed by HACS.
+Only `custom_components/kibble/` is copied to Home Assistant; nothing else here is installed by the
+Marketplace or HACS.
 
 ## Development
 
@@ -206,18 +215,21 @@ The integration has two test tiers, both run from the repository root.
   ```
 
 - **The full suite** (every WebSocket command, entity platform and config flow test) needs a real
-  Home Assistant, so it runs from its own virtual environment. Home Assistant 2026.9 needs
-  Python 3.14:
+  Home Assistant, so it runs from its own virtual environment. Home Assistant 2026.11 needs
+  Python 3.14, and its test harness is the `pytest-homeassistant` package (versioned exactly like
+  Home Assistant itself; it replaces the old `pytest-homeassistant-custom-component`):
 
   ```sh
   uv venv --python 3.14 .venv-ha
-  uv pip install --python .venv-ha/bin/python "pytest-homeassistant-custom-component==0.13.366" \
-    numpy pillow ha-ffmpeg PyTurboJPEG serialx bleak bleak-retry-connector pyserial habluetooth \
-    bluetooth-adapters bluetooth-auto-recovery bluetooth-data-tools dbus-fast aiousbwatcher
+  python3 -c "import json; print(*json.load(open('custom_components/kibble/manifest.json'))['requirements'], sep='\n')" > manifest-requirements.txt
+  uv pip install --python .venv-ha/bin/python "pytest-homeassistant[bluetooth]" \
+    -r manifest-requirements.txt -r requirements_test.txt
   .venv-ha/bin/python -m pytest tests tests_ha -q
   ```
 
-  `pytest-homeassistant-custom-component` 0.13.366 brings Home Assistant 2026.9.3 with it.
+  The `ha-compat` GitHub workflow runs exactly this on every push and once a week, against both
+  the latest Home Assistant release and the latest beta, so a release that would break Kibble
+  fails there first.
 
 To redraw the icons after changing `tools/render_brand.py`: `python3 tools/render_brand.py`
 (Pillow only; `icon.svg` is the hand-drawn vector twin of the mark).

@@ -30,7 +30,7 @@
         "name": "Eating"
       },
       "reachable": {
-        "name": "Feeder reachable"
+        "name": "Reachable"
       },
       "hopper_1_empty": {
         "name": "Hopper 1 empty"
