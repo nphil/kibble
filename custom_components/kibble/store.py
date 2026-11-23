@@ -33,7 +33,7 @@ import re
 import shutil
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -831,6 +831,28 @@ class _SyncStore:
             (uid, device_event_id, kind, start, end, int(open_), eat_start, scene, scene_k, subjects_json, before, after, now),
         )
         self.conn.commit()
+
+    def close_orphaned_open(self, live_open_uids: Collection[str]) -> int:
+        """Closes every row still marked open whose session the feeder no longer reports as
+        open. `live_open_uids` are the top-level uids of the tracks open in the feeder's
+        CURRENT event list; anything else open here can never be closed by `upsert_event`,
+        because its track is no longer in that list at all: the feeder restarted mid-track
+        (an open track is not carried across a restart), or it aged out of the feeder's
+        bounded log before a poll saw it closed. Left alone, such a row kept its cat "present"
+        indefinitely (Kitty, 2026-11-22 to 11-23, 24 h). Ends at its last photo, else its start.
+        Returns how many rows were closed."""
+        rows = self.conn.execute("SELECT uid, parent_uid FROM events WHERE open=1").fetchall()
+        orphans = [r["uid"] for r in rows if (r["parent_uid"] or r["uid"]) not in live_open_uids]
+        now = _now()
+        for uid in orphans:
+            self.conn.execute(
+                "UPDATE events SET open=0, updated=?, end=COALESCE("
+                "(SELECT MAX(t) FROM samples WHERE event_uid=events.uid), end, start) WHERE uid=?",
+                (now, uid),
+            )
+        if orphans:
+            self.conn.commit()
+        return len(orphans)
 
     def event_asset_fields(self, uid: str) -> dict[str, str | None] | None:
         row = self.conn.execute(
@@ -3278,6 +3300,9 @@ class KibbleStore:
 
     async def async_upsert_event(self, **kwargs: Any) -> None:
         await self._run(lambda: self._sync.upsert_event(**kwargs))
+
+    async def async_close_orphaned_open(self, live_open_uids: Collection[str]) -> int:
+        return await self._run(self._sync.close_orphaned_open, live_open_uids)
 
     async def async_event_asset_fields(self, uid: str) -> dict[str, str | None] | None:
         return await self._run(self._sync.event_asset_fields, uid)

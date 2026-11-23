@@ -2047,6 +2047,29 @@ def test_legacy_sidless_session_keeps_the_chronological_split_fallback(tmp_path:
     assert {sample["uid"] for sample in detail["samples"]} == {f"e1-s{i}" for i in range(4)}
 
 
+def test_an_open_visit_the_feeder_no_longer_lists_is_closed_and_its_cat_stops_being_present(
+    tmp_path: Path,
+) -> None:
+    """2026-11-22: a visit named Kitty was still open when its track vanished from the feeder's
+    list, so nothing ever closed it and "Kitty present" stayed on for 24 h."""
+    store = _SyncStore(tmp_path, "entry1")
+    store.add_cat("Kitty")
+    start = int(time.time()) - 3600
+    _insert_event(store, "gone", start, end=None, open_=True)
+    _insert_sample(store, "gone-s1", "gone", start + 7)
+    _insert_event(store, "live", start + 100, end=None, open_=True)
+    store.conn.execute("UPDATE events SET cat='Kitty', identity_status='auto' WHERE uid IN ('gone','live')")
+    store.conn.commit()
+
+    assert store.close_orphaned_open({"live"}) == 1
+    gone = store.conn.execute("SELECT open, end FROM events WHERE uid='gone'").fetchone()
+    assert (gone["open"], gone["end"]) == (0, start + 7)
+    assert store.identity_summary().cats["Kitty"].present is True  # the live one
+
+    assert store.close_orphaned_open(set()) == 1
+    assert store.identity_summary().cats["Kitty"].present is False
+
+
 def test_a_split_that_shrinks_mid_session_never_leaves_a_cat_present_after_it_closes(
     tmp_path: Path,
 ) -> None:

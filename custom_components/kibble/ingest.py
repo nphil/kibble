@@ -332,6 +332,16 @@ class Ingestor:
                     auto_learn_changed = True
             except Exception:  # noqa: BLE001 -- one bad row must never abort the whole batch
                 _LOGGER.exception("Failed to ingest event %s", event.event_id)
+        # `events` is the feeder's whole current list, so a row still open in the store that it
+        # does not list as open has lost its track for good -- see `close_orphaned_open`.
+        try:
+            closed = await self._store.async_close_orphaned_open(
+                {event_uid(self._entry_id, event) for event in events if event.open}
+            )
+            if closed:
+                _LOGGER.warning("Closed %d visit(s) the feeder no longer reports as open", closed)
+        except Exception:  # noqa: BLE001 -- must never abort the ingest pass
+            _LOGGER.exception("Failed to close orphaned open events")
         for feed in feeds:
             try:
                 await self._ingest_feed(feed)
