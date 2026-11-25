@@ -180,7 +180,7 @@ EXPECTED_VENDOR: dict[Platform, set[str]] = {
         "bowl_fill", "hopper_1_level", "hopper_2_level", "desiccant_days", "firmware",
         "ble_firmware", "factor1", "factor2", "schedule", "schedule_card_state", "next_feed",
         "cloud_connection", "control_path", "wifi", "wifi_signal", "last_seen_pet",
-        "clips", "last_detection", "detections_today", "recognition",
+        "clips", "last_detection", "detections_today", "recognition", "learning",
     },
     Platform.CAMERA: {"camera"},
     Platform.LIGHT: {"status_light"},

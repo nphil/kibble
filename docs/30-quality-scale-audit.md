@@ -102,8 +102,12 @@ the whole restart up. Now:
   finishes — or for as long as CoralHub is down — the histogram recognizer answers, exactly as
   for any CoralHub outage, so the first ingest after a restart can use it if CoralHub is slow.
   A failed model build is logged and start-up carries on (the feeder matters more than cat
-  recognition; any later training change rebuilds). Every other caller of `async_rebuild` (each
-  training change) still rebuilds both, in the same order.
+  recognition; any later training change rebuilds). Since 0.29.7 training changes no longer
+  rebuild inline: the persisted generation counter wakes the debounced learning job
+  (`docs/36-ai-pipeline.md`, "Learning"), which calls `async_rebuild` (both halves, same order) off
+  the label path, and which resumes after a restart if a change was still unlearned. That adds
+  exactly ONE entity, the diagnostic `sensor.…_learning` (state = learning state, attributes =
+  progress, last result and error), so the entity count goes up by one and nothing else.
 - Every platform's `async_setup_entry` hands its entity creation to
   `entity.async_when_data_ready`: at once if the first poll has landed, otherwise the moment it
   does. Entities are built from the poll's data (serial, firmware, running stack), so none is

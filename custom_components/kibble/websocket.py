@@ -1,22 +1,26 @@
 """Local-push companion for the dashboard cards: WebSocket commands over HA's own
 `websocket_api`, distinct from `push.py`'s channel to the agent.
 
-`kibble/timeline`, `kibble/event`, `kibble/review`, `kibble/cats` and `kibble/training` all read
-straight off `coordinator.store` (SQLite, `store.py`) -- the HA-side event journal and identity
-engine that is now the system of record, per docs/36-ai-pipeline.md. None of them touch the
-feeder. `kibble/cats` is the one exception that also makes a live, on-demand call
-(`client.spool_stats()`) for `Storage.device_spool`, the same "not worth carrying in every poll
-cycle" reasoning `kibble/vision/last` below already uses.
+`kibble/timeline`, `kibble/event`, `kibble/review/photos`, `kibble/cats`, `kibble/training` and
+`kibble/learning` all read straight off `coordinator.store` (SQLite, `store.py`) or memory -- the
+HA-side event journal and identity engine that is now the system of record, per
+docs/36-ai-pipeline.md. None of them wait for the feeder. `kibble/cats` is the one exception that
+also makes a live, on-demand call (`coordinator.async_device_spool()`, bounded to well under a
+second) for `Storage.device_spool`, the same "not worth carrying in every poll cycle" reasoning
+`kibble/vision/last` below already uses.
 
-`kibble/label` and `kibble/sample/label` are the fast/slow-split commands: each updates its
-row(s) and responds immediately, then runs training reconciliation, model rebuild and
-reclassification -- all file/CPU work -- in the background, notifying subscribers via
-`kibble/timeline/subscribe` only once that settles. `kibble/label` reviews a whole event;
-`kibble/sample/label` overrides (or clears the override on) one photo within it, independent
-of the event's own label. `kibble/cats/add`, `kibble/cats/delete` and `kibble/training/
-remove` are the other mutations here; each ends by pushing a fresh identity snapshot through
-the coordinator (`KibbleCoordinator.async_refresh_identity_snapshot`) so entities and
-subscribers see the result the same way an ingest pass would.
+Every labelling command -- `kibble/label`, `kibble/session/label`, `kibble/session/subject`,
+`kibble/sample/label`, `kibble/session/ate` and `kibble/training/remove` -- writes what it was told
+durably and answers at once; none of them relearns anything on the request. The store notices
+that the training gallery changed and `learning.py`'s job (debounced, single flight) rebuilds the
+models and rechecks the unreviewed visits in the background; `kibble/learning` and
+`kibble/learning/subscribe` report where that stands. `kibble/review/photos` serves the
+one-photo review queue and `kibble/sample/label` saves one photo's answer (the visit's identity
+is derived from the photos' answers); `kibble/label` and `kibble/session/label` are the older
+whole-visit commands, kept as idempotent writes. Each ends by asking the coordinator for a fresh
+identity snapshot (`KibbleCoordinator.async_schedule_identity_refresh`) so entities and
+subscribers see the result the same way an ingest pass would. `kibble/cats/add` and
+`kibble/cats/delete` do the same, awaited.
 
 `kibble/vision/last`, `kibble/vision/areas(/set)`, `kibble/calibration(/action)` are unrelated
 to the AI pipeline and unchanged: every command takes `entry_id`; `_resolve_coordinator` is the
@@ -255,31 +259,19 @@ async def ws_event(
 async def ws_label(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """Apply a timeline quick-pick to each whole session, then reconcile training in background."""
+    """Applies a timeline quick-pick to each whole visit: saved and answered at once, learned
+    from later by the learning job (`learning.py`), which the store wakes by itself. Idempotent --
+    a retry after a lost response changes nothing."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
     try:
-        events, training_changed = await coordinator.store.async_label_events(msg["uids"], msg["label"])
+        events = await coordinator.store.async_label_events(msg["uids"], msg["label"])
     except ValueError as err:
         connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
         return
     connection.send_result(msg["id"], {"events": events})
-    if training_changed:
-        session_uids = [event["uid"] for event in events]
-        hass.async_create_task(_async_label_followup(coordinator, session_uids, msg["label"]))
-    else:
-        hass.async_create_task(coordinator.async_refresh_identity_snapshot())
-
-
-async def _async_label_followup(coordinator: KibbleCoordinator, uids: list[str], label: str) -> None:
-    try:
-        await coordinator.store.async_reconcile_event_training(uids, label)
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
-        _LOGGER.exception("kibble/label background training update failed")
-    await coordinator.async_refresh_identity_snapshot()
+    coordinator.async_schedule_identity_refresh()
 
 
 @websocket_api.websocket_command(
@@ -305,9 +297,7 @@ async def ws_session_label(
         return
     if "verdict" in msg:
         try:
-            events, training_changed = await coordinator.store.async_label_events(
-                [msg["uid"]], msg["verdict"]
-            )
+            events = await coordinator.store.async_label_events([msg["uid"]], msg["verdict"])
         except ValueError as err:
             connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
             return
@@ -319,12 +309,7 @@ async def ws_session_label(
             connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
             return
         connection.send_result(msg["id"], detail)
-        if training_changed:
-            hass.async_create_task(
-                _async_label_followup(coordinator, [events[0]["uid"]], msg["verdict"])
-            )
-        else:
-            hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+        coordinator.async_schedule_identity_refresh()
         return
     cats = [(item["cat"], item["ate"]) for item in msg["cats"]]
     try:
@@ -336,7 +321,7 @@ async def ws_session_label(
         connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
         return
     connection.send_result(msg["id"], detail)
-    hass.async_create_task(_async_session_followup(coordinator, detail["event"]["uid"]))
+    coordinator.async_schedule_identity_refresh()
 
 
 @websocket_api.websocket_command(
@@ -367,17 +352,38 @@ async def ws_session_subject(
         connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
         return
     connection.send_result(msg["id"], detail)
-    hass.async_create_task(_async_session_followup(coordinator, detail["event"]["uid"]))
+    coordinator.async_schedule_identity_refresh()
 
 
-async def _async_session_followup(coordinator: KibbleCoordinator, uid: str) -> None:
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "kibble/session/ate",
+        vol.Required("entry_id"): str,
+        vol.Required("uid"): str,
+        vol.Required("ate"): [str],
+    }
+)
+@websocket_api.async_response
+async def ws_session_ate(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Who ate, for a visit that names two cats and a meal the feeder could not split
+    (`event.needs_ate`). Result `{"visit": {uid, kind, cats: [{cat, ate}], needs_ate}}`.
+    `agent_rejected` for an empty list or a cat the visit does not name, `not_found` for an
+    unknown visit. Idempotent, and never trains anything."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
     try:
-        await coordinator.store.async_reconcile_session_training(uid)
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
-        _LOGGER.exception("kibble/session background training update failed")
-    await coordinator.async_refresh_identity_snapshot()
+        result = await coordinator.store.async_session_ate(msg["uid"], msg["ate"])
+    except ValueError as err:
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
+        return
+    if result is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown session")
+        return
+    connection.send_result(msg["id"], result)
+    coordinator.async_schedule_identity_refresh()
 
 
 # --- kibble/sample/label -------------------------------------------------------------------------
@@ -395,6 +401,11 @@ async def _async_session_followup(coordinator: KibbleCoordinator, uid: str) -> N
 async def ws_sample_label(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
+    """Saves one photo's answer -- a cat's name, `both` (two cats in this one crop; only with
+    exactly two enrolled), `not_a_cat`, `skip` ("Don't use") or `follow` (undo) -- and answers
+    `{"sample", "visit": {uid, kind, cats: [{cat, ate}], needs_ate}}`: the photo as it now stands
+    and what the visit's identity became because of it. Idempotent: the same answer twice is a
+    success that changes nothing. The model relearns later, in the learning job."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
@@ -404,33 +415,23 @@ async def ws_sample_label(
         return
     try:
         scores = await coordinator.engine.async_subject_scores(session_uid)
-        sample = await coordinator.store.async_label_sample(msg["sample_uid"], msg["label"], scores)
+        result = await coordinator.store.async_label_sample(msg["sample_uid"], msg["label"], scores)
     except ValueError as err:
         connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
         return
-    if sample is None:
+    if result is None:
         connection.send_error(msg["id"], ERR_NOT_FOUND, "Unknown sample")
         return
-    connection.send_result(msg["id"], {"sample": sample})
-    hass.async_create_task(_async_sample_label_followup(coordinator, session_uid))
+    connection.send_result(msg["id"], result)
+    coordinator.async_schedule_identity_refresh()
 
 
-async def _async_sample_label_followup(coordinator: KibbleCoordinator, uid: str) -> None:
-    try:
-        await coordinator.store.async_reconcile_session_training(uid)
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-    except Exception:  # noqa: BLE001 -- always refresh the public identity snapshot
-        _LOGGER.exception("kibble/sample/label background training update failed")
-    await coordinator.async_refresh_identity_snapshot()
-
-
-# --- kibble/review --------------------------------------------------------------------------
+# --- kibble/review/photos, kibble/learning, kibble/learning/subscribe ---------------------------
 
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "kibble/review",
+        vol.Required("type"): "kibble/review/photos",
         vol.Required("entry_id"): str,
         vol.Optional("cursor"): str,
         vol.Optional("limit", default=24): vol.All(
@@ -439,20 +440,69 @@ async def _async_sample_label_followup(coordinator: KibbleCoordinator, uid: str)
     }
 )
 @websocket_api.async_response
-async def ws_review(
+async def ws_review_photos(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
+    """One page of the one-photo review queue: `{items: [{sample, visit}], remaining, visits,
+    cursor, has_more}` -- photos nobody has answered yet, a few per visit, the least certain
+    first. Answered photos leave the queue, so the cursor stays valid while the card labels.
+    Reads the store only, never a relearn: it answers at the same speed whatever the learning
+    job is doing. A cursor this command did not issue is `agent_rejected`."""
     coordinator = _resolve_coordinator(hass, connection, msg)
     if coordinator is None:
         return
     try:
-        page = await coordinator.store.async_review_page(
+        page = await coordinator.store.async_review_photos_page(
             limit=msg["limit"], cursor=msg.get("cursor"), retention_cutoff=coordinator.retention_cutoff()
         )
     except ValueError as err:
-        connection.send_error(msg["id"], "invalid_cursor", str(err))
+        connection.send_error(msg["id"], ERR_AGENT_REJECTED, str(err))
         return
     connection.send_result(msg["id"], page)
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/learning", vol.Required("entry_id"): str}
+)
+@callback
+def ws_learning(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Where the learning job stands (`learning.LearningManager.status`), read from memory."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    if coordinator.learning is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Learning is not running")
+        return
+    connection.send_result(msg["id"], coordinator.learning.status())
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "kibble/learning/subscribe", vol.Required("entry_id"): str}
+)
+@callback
+def ws_learning_subscribe(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Pushes `{"learning": status}` on every change of the learning job's status: once right
+    after the result (so a subscriber never has to also ask first), then whenever it changes --
+    progress ticks are throttled to about two a second."""
+    coordinator = _resolve_coordinator(hass, connection, msg)
+    if coordinator is None:
+        return
+    learning = coordinator.learning
+    if learning is None:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Learning is not running")
+        return
+
+    @callback
+    def _send(status: dict[str, Any]) -> None:
+        connection.send_message(websocket_api.event_message(msg["id"], {"learning": status}))
+
+    connection.subscriptions[msg["id"]] = learning.subscribe(_send)
+    connection.send_result(msg["id"])
+    _send(learning.status())
 
 
 # --- kibble/cats / kibble/cats/add / kibble/cats/delete ----------------------------------------
@@ -469,34 +519,22 @@ async def ws_cats(
     if coordinator is None:
         return
     identity = coordinator.data.identity
+    overview = await coordinator.store.async_cats_overview(coordinator.retention_days())
     cats: list[dict[str, Any]] = []
-    for row in await coordinator.store.async_cats():
-        name = row["name"]
-        counts = await coordinator.store.async_training_counts(name)
-        avatar_info = await coordinator.store.async_avatar_info(name)
-        learning_paused = await coordinator.store.async_auto_learn_paused(name)
-        stats = identity.cats.get(name)
+    for row in overview["cats"]:
+        stats = identity.cats.get(row["name"])
         cats.append(
             {
-                "name": name,
-                "color": row["color"],
-                "avatar": avatar_info["avatar"],
-                "avatar_custom": avatar_info["custom"],
-                "learning_paused": learning_paused,
-                "training": counts,
-                "accuracy": coordinator.engine.loo_accuracy(name),
+                **row,
+                "accuracy": coordinator.engine.loo_accuracy(row["name"]),
                 "last_seen": stats.last_seen if stats else None,
                 "last_meal": stats.last_meal if stats else None,
                 "meals_today": _meals_today(stats),
                 "present": stats.present if stats else False,
             }
         )
-    storage = await coordinator.store.async_storage_summary(coordinator.retention_days())
-    try:
-        spool = await coordinator.client.spool_stats()
-        storage["device_spool"] = {"used_bytes": spool.used_bytes, "cap_bytes": spool.cap_bytes}
-    except KibbleError:
-        storage["device_spool"] = None
+    storage = overview["storage"]
+    storage["device_spool"] = await coordinator.async_device_spool()
     connection.send_result(msg["id"], {"cats": cats, "storage": storage})
 
 
@@ -646,16 +684,7 @@ async def ws_training_remove(
     removed = await coordinator.store.async_training_remove(msg["uids"])
     connection.send_result(msg["id"], {"removed": removed})
     if removed:
-        hass.async_create_task(_async_training_remove_followup(coordinator))
-
-
-async def _async_training_remove_followup(coordinator: KibbleCoordinator) -> None:
-    try:
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-    except Exception:  # noqa: BLE001
-        _LOGGER.exception("kibble/training/remove background rebuild failed")
-    await coordinator.async_refresh_identity_snapshot()
+        coordinator.async_schedule_identity_refresh()
 
 
 # --- kibble/vision/last, kibble/vision/areas(/set), kibble/vision/bowl(/set),
@@ -878,8 +907,11 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_label)
     websocket_api.async_register_command(hass, ws_session_label)
     websocket_api.async_register_command(hass, ws_session_subject)
+    websocket_api.async_register_command(hass, ws_session_ate)
     websocket_api.async_register_command(hass, ws_sample_label)
-    websocket_api.async_register_command(hass, ws_review)
+    websocket_api.async_register_command(hass, ws_review_photos)
+    websocket_api.async_register_command(hass, ws_learning)
+    websocket_api.async_register_command(hass, ws_learning_subscribe)
     websocket_api.async_register_command(hass, ws_cats)
     websocket_api.async_register_command(hass, ws_cats_add)
     websocket_api.async_register_command(hass, ws_cats_delete)

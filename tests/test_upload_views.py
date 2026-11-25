@@ -9,11 +9,14 @@ others intact (proven here at the HTTP layer, where the one-request-per-file des
 true by construction -- there is no shared transaction for a bad file to poison). EXIF-rotation
 and quality/downscale behaviour are `media_processing.py`'s own unit tests
 (`test_media_processing.py`); this file is about the view's routing, status codes and gates.
+
+An accepted upload (training or avatar) asks the coordinator for one identity-snapshot refresh;
+relearning is the learning job's business (`learning.py`), never the view's, so the fake engine
+here only classifies.
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -95,12 +98,6 @@ class _FakeEngine:
     async def async_classify_one(self, features: identity.Features) -> identity.Verdict | None:
         return self._verdict
 
-    async def async_rebuild(self) -> None:
-        pass
-
-    async def async_reclassify_unreviewed(self, cutoff: int) -> None:
-        pass
-
 
 @web.middleware
 async def _authenticated(request: web.Request, handler):
@@ -109,20 +106,21 @@ async def _authenticated(request: web.Request, handler):
 
 
 @asynccontextmanager
-async def _running_upload_views(sync_store: _SyncStore, *, engine: _FakeEngine | None = None):
+async def _running_upload_views(
+    sync_store: _SyncStore, *, engine: _FakeEngine | None = None, schedule_refresh: Mock | None = None
+):
     """Wires both real upload views onto a real aiohttp router; `coordinator.store` is a thin
-    async wrapper over a real, on-disk `_SyncStore` (`_RealAsyncStore` above)."""
+    async wrapper over a real, on-disk `_SyncStore` (`_RealAsyncStore` above). `schedule_refresh`
+    stands in for `coordinator.async_schedule_identity_refresh` so a test can count the calls."""
     coordinator = SimpleNamespace(
         store=_RealAsyncStore(sync_store),
         engine=engine or _FakeEngine(),
-        retention_cutoff=lambda: 0,
-        async_refresh_identity_snapshot=AsyncMock(),
+        async_schedule_identity_refresh=schedule_refresh or Mock(),
     )
     entry = SimpleNamespace(domain=DOMAIN, state=ConfigEntryState.LOADED, runtime_data=coordinator)
     hass = SimpleNamespace(
         is_stopping=False,
         async_add_executor_job=AsyncMock(side_effect=lambda fn, *a: fn(*a)),
-        async_create_task=lambda coro: asyncio.ensure_future(coro),
         config_entries=SimpleNamespace(
             async_get_entry=Mock(side_effect=lambda entry_id: entry if entry_id == ENTRY_ID else None)
         ),
@@ -157,7 +155,8 @@ def _form(data: bytes, filename: str = "photo.jpg") -> FormData:
 
 async def test_a_real_photo_is_added_as_an_upload_sourced_training_row(tmp_path: Path, socket_enabled: None) -> None:
     store = _store(tmp_path, "Kitty")
-    async with _running_upload_views(store) as client:
+    schedule_refresh = Mock()
+    async with _running_upload_views(store, schedule_refresh=schedule_refresh) as client:
         resp = await client.post("/api/kibble/e1/upload/training/Kitty", data=_form(_jpeg_bytes((180, 90, 40))))
         assert resp.status == HTTPStatus.OK
         body = await resp.json()
@@ -165,6 +164,10 @@ async def test_a_real_photo_is_added_as_an_upload_sourced_training_row(tmp_path:
         assert body["sample"]["cat"] == "Kitty"
     rows = store.conn.execute("SELECT source FROM training WHERE cat='Kitty'").fetchall()
     assert [r["source"] for r in rows] == ["upload"]
+    schedule_refresh.assert_called_once_with()
+    # The upload is a training change, so it bumps the training generation the learning job watches
+    # -- the view itself never starts a relearn.
+    assert store.learning_state()["gen"] >= 1
 
 
 async def test_a_blank_photo_is_rejected_as_no_cat(tmp_path: Path, socket_enabled: None) -> None:
@@ -183,22 +186,26 @@ async def test_a_not_a_cat_verdict_from_the_trained_model_is_also_rejected_as_no
     verdict rejects an upload even though the baseline blank-image heuristic alone would not."""
     store = _store(tmp_path, "Kitty")
     engine = _FakeEngine(verdict=identity.Verdict(label=identity.NOT_A_CAT, confidence=0.9))
-    async with _running_upload_views(store, engine=engine) as client:
+    schedule_refresh = Mock()
+    async with _running_upload_views(store, engine=engine, schedule_refresh=schedule_refresh) as client:
         resp = await client.post("/api/kibble/e1/upload/training/Kitty", data=_form(_jpeg_bytes((90, 140, 60))))
         assert (await resp.json())["status"] == "no_cat"
     assert store.conn.execute("SELECT 1 FROM training").fetchone() is None
+    schedule_refresh.assert_not_called()
 
 
 async def test_a_near_duplicate_of_an_already_trained_photo_is_rejected(tmp_path: Path, socket_enabled: None) -> None:
     store = _store(tmp_path, "Kitty")
     photo = _jpeg_bytes((180, 90, 40), seed=7)
-    async with _running_upload_views(store) as client:
+    schedule_refresh = Mock()
+    async with _running_upload_views(store, schedule_refresh=schedule_refresh) as client:
         first = await client.post("/api/kibble/e1/upload/training/Kitty", data=_form(photo))
         assert (await first.json())["status"] == "added"
         second = await client.post("/api/kibble/e1/upload/training/Kitty", data=_form(photo))
         assert (await second.json())["status"] == "duplicate"
     rows = store.conn.execute("SELECT COUNT(*) AS n FROM training WHERE cat='Kitty'").fetchone()
     assert rows["n"] == 1
+    schedule_refresh.assert_called_once_with()  # only the accepted upload, not the duplicate
 
 
 async def test_uploading_to_an_unknown_cat_404s(tmp_path: Path, socket_enabled: None) -> None:
@@ -283,17 +290,21 @@ def _crafted_oversized_png(w: int, h: int) -> bytes:
 
 async def test_avatar_upload_sets_a_custom_avatar_end_to_end(tmp_path: Path, socket_enabled: None) -> None:
     store = _store(tmp_path, "Kitty")
-    async with _running_upload_views(store) as client:
+    schedule_refresh = Mock()
+    async with _running_upload_views(store, schedule_refresh=schedule_refresh) as client:
         resp = await client.post("/api/kibble/e1/upload/avatar/Kitty", data=_form(_jpeg_bytes((10, 20, 30))))
         assert resp.status == HTTPStatus.OK
         body = await resp.json()
         assert body["avatar"]["id"] == "avatars/kitty.jpg"
     assert (tmp_path / "avatars" / "kitty.jpg").exists()
     assert store.avatar_info("Kitty")["custom"] is True
+    schedule_refresh.assert_called_once_with()
 
 
 async def test_avatar_upload_to_an_unknown_cat_404s(tmp_path: Path, socket_enabled: None) -> None:
     store = _store(tmp_path)
-    async with _running_upload_views(store) as client:
+    schedule_refresh = Mock()
+    async with _running_upload_views(store, schedule_refresh=schedule_refresh) as client:
         resp = await client.post("/api/kibble/e1/upload/avatar/Nope", data=_form(_jpeg_bytes((1, 2, 3))))
         assert resp.status == HTTPStatus.NOT_FOUND
+    schedule_refresh.assert_not_called()

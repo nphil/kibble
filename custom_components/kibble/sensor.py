@@ -32,6 +32,7 @@ from .api import ClipInfo, CloudState, DetectionEvent, FeederState, ScheduleEntr
 from .ble_fallback import CONTROL_PATHS
 from .coordinator import KibbleConfigEntry, KibbleCoordinator
 from .entity import KibbleEntity, async_when_data_ready
+from .learning import STATES as LEARNING_STATES
 from .stacks import applies_to
 
 _LOGGER = logging.getLogger(__name__)
@@ -244,6 +245,7 @@ def _add_entities(
         ("detections_today", KibbleDetectionsTodaySensor(coordinator)),
         ("agent_starts", KibbleAgentStartsSensor(coordinator)),
         ("recognition", KibbleOverallRecognitionSensor(coordinator)),
+        ("learning", KibbleLearningSensor(coordinator)),
     ]
     entities.extend(entity for key, entity in one_offs if applies_to(Platform.SENSOR, key, stack))
     async_add_entities(entities)
@@ -775,6 +777,73 @@ class KibbleOverallRecognitionSensor(KibbleEntity, SensorEntity):
     def native_value(self) -> int | None:
         scores = [stats.recognition_score for stats in self.coordinator.data.identity.cats.values()]
         return autolearn.overall_recognition_score(scores)
+
+
+class KibbleLearningSensor(KibbleEntity, SensorEntity):
+    """Where the learning job stands (`learning.py`): `idle`; `waiting` (answers are saved and
+    learning starts after a quiet moment); `learning` (rebuilding the recognition models);
+    `rechecking` (re-checking every unreviewed visit against them); `retrying` (a pass failed or
+    CoralHub is not answering -- it tries again by itself). The rest of the status -- how many
+    answers are waiting, progress, when it starts or retries, the last result, the error --
+    rides along as attributes, none of them recorded in history.
+
+    Diagnostic, so disabled by default (house rule 4). It shows what the card's learning line
+    shows, from the same job, and never waits on the feeder: it stays available while the
+    feeder is down. Progress ticks do not rewrite the entity -- a change of state, of the number
+    of waiting answers, of the error, or a finished pass does; the other attributes catch up on
+    the coordinator's next refresh."""
+
+    _attr_translation_key = "learning"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(LEARNING_STATES)
+    _unrecorded_attributes = frozenset(
+        {"pending", "done", "total", "starts_at", "retry_at", "started", "last", "error"}
+    )
+
+    def __init__(self, coordinator: KibbleCoordinator) -> None:
+        super().__init__(coordinator, "learning")
+        self._seen: tuple[Any, ...] | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.learning is not None
+
+    @property
+    def native_value(self) -> str | None:
+        learning = self.coordinator.learning
+        return learning.status()["state"] if learning is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        learning = self.coordinator.learning
+        if learning is None:
+            return None
+        return {key: value for key, value in learning.status().items() if key != "state"}
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        learning = self.coordinator.learning
+        if learning is not None:
+            self.async_on_remove(learning.subscribe(self._on_status))
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to Home Assistant 2026.11's in-place `entity_id` change (older cores never
+        call this). The subscription to the learning job is not keyed on the entity id, so there
+        is nothing to re-key; without this method an entity rename would remove and re-add the
+        entity."""
+        super().async_entity_id_changed(old_entity_id)
+
+    @callback
+    def _on_status(self, status: dict[str, Any]) -> None:
+        marker = (
+            status["state"], status["pending"], status["error"], (status["last"] or {}).get("finished")
+        )
+        if marker != self._seen:
+            self._seen = marker
+            self.async_write_ha_state()
 
 
 class KibbleClipsSensor(KibbleEntity, SensorEntity):

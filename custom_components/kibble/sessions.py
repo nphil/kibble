@@ -159,7 +159,7 @@ def _modal_subject_label(samples: Sequence[PlanningSample]) -> str | None:
 def _sample_photo_cat(sample: PlanningSample) -> str | None:
     if sample.review_src not in (None, "photo"):
         return None
-    if sample.review in (None, "", "skip", "unknown", "follow", _NOT_A_CAT):
+    if sample.review in (None, "", "skip", "unknown", "follow", "both", _NOT_A_CAT):
         return None
     return sample.review
 

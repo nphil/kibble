@@ -24,8 +24,10 @@ docstring for that background arc.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import autolearn, coral_identity, crop_geometry, identity, sessions
@@ -40,6 +42,10 @@ if TYPE_CHECKING:
     from .judge import VisionJudge
 
 _LOGGER = logging.getLogger(__name__)
+
+# `IdentityEngine.async_reclassify_unreviewed` skips an event that fails, but gives up when this
+# many fail one after another: that is the store or the models being broken, not one bad row.
+RECLASSIFY_MAX_CONSECUTIVE_FAILURES = 3
 
 
 def event_uid(entry_id: str, event: DetectionEvent) -> str:
@@ -83,6 +89,14 @@ class IdentityEngine:
         self._coral = coral
         self._model: identity.Model | None = None
         self._loo: dict[str, float | None] = {}
+        # One build at a time: the learning job, start-up and the Coral backfill can all ask for
+        # one, and two interleaved builds would each read the gallery at a different moment.
+        self._build_lock = asyncio.Lock()
+        # The training generation (`store.py`'s `learning.gen`) the models were last fully
+        # rebuilt from. `learning.py` skips the rebuild of a pass whose generation matches.
+        self.built_gen: int | None = None
+        # Milliseconds the last full rebuild spent in each stage, for `learning.py`'s log line.
+        self.timings: dict[str, int] = {}
 
     @property
     def backend(self) -> str:
@@ -102,43 +116,73 @@ class IdentityEngine:
         `CoralRecognizer.status` -- read by `diagnostics.py`."""
         return None if self._coral is None else self._coral.status
 
-    async def async_rebuild(self) -> None:
-        """Both recognizers, histogram first, then (if configured) CoralHub's -- what every
-        training change runs. Start-up calls the two halves separately instead
-        (`__init__.py`'s `_async_finish_setup`), because they cost very different things."""
-        await self.async_rebuild_histogram()
-        await self.async_rebuild_coral()
+    @property
+    def embed_stats(self) -> coral_identity.EmbedStats | None:
+        """CoralHub request totals so far; `None` when Coral is not configured."""
+        return None if self._coral is None else self._coral.stats
+
+    async def async_rebuild(self, gen: int | None = None) -> str | None:
+        """Both recognizers, histogram first, then (if configured) CoralHub's -- what a pass of
+        the learning job runs. `gen` is the training generation being built from, remembered as
+        `built_gen` once everything succeeded. Returns why CoralHub could not be reached (the
+        learning job reports it and tries again), or `None`: built, or not configured.
+        Start-up calls the two halves separately instead (`__init__.py`'s
+        `_async_finish_setup`), because they cost very different things."""
+        async with self._build_lock:
+            started = time.perf_counter()
+            await self._build_histogram()
+            timings = {"histogram_ms": round((time.perf_counter() - started) * 1000)}
+            error = await self._build_coral()
+            if self._coral is not None:
+                timings.update({f"coral_{stage}": ms for stage, ms in self._coral.timings.items()})
+            self.timings = timings
+            if error is None:
+                self.built_gen = gen
+            return error
 
     async def async_rebuild_histogram(self) -> None:
-        """The local recognizer only: reads the training set and builds `identity.Model` plus
-        its leave-one-out accuracy in the executor. No network, but not cheap either --
-        `loo_accuracy` builds one fresh model per training row, so it grows with the SQUARE of
-        the training set (measured here with synthetic features: 0.3 s at 160 samples, 3 s at
-        500, close to a minute at 1000) -- which is why start-up runs it in the entry's
-        background task rather than inside `async_setup_entry`."""
+        """The local recognizer only: reads the training set and builds `identity.Model` in the
+        executor, no network. Its leave-one-out accuracy -- one fresh model per training row,
+        so it grows with the SQUARE of the training set (0.3 s at 160 samples, 3 s at 500,
+        close to a minute at 1000) -- is only worked out when CoralHub is not configured: it is
+        read only when this recognizer is the one answering, and with Coral configured the
+        histogram model is merely the fallback while CoralHub is down."""
+        async with self._build_lock:
+            await self._build_histogram()
+
+    async def async_rebuild_coral(self) -> str | None:
+        """CoralHub's recognizer only (`CoralRecognizer.async_rebuild`), `None` and nothing done
+        when Coral is not configured; otherwise why CoralHub could not be reached, or `None`. A
+        network round trip: a health check of up to two 10 s attempts, then a bounded batch of
+        embedding requests, then its own leave-one-out build -- so it can take tens of seconds
+        when CoralHub is slow or off, and must never sit on the setup path."""
+        async with self._build_lock:
+            return await self._build_coral()
+
+    async def _build_histogram(self) -> None:
         training = await self._store.async_all_training_features()
+        with_loo = self._coral is None
 
         def _build() -> tuple[identity.Model, dict[str, float | None]]:
             model = identity.Model(training)
-            return model, model.loo_accuracy()
+            return model, (model.loo_accuracy() if with_loo else {})
 
         self._model, self._loo = await self._hass.async_add_executor_job(_build)
 
-    async def async_rebuild_coral(self) -> None:
-        """CoralHub's recognizer only (`CoralRecognizer.async_rebuild`), a no-op when Coral is
-        not configured. A network round trip: a health check of up to two 10 s attempts, then
-        a bounded batch of embedding requests, then its own leave-one-out build -- so it can
-        take tens of seconds when CoralHub is slow or off, and must never sit on the setup path.
-        """
-        if self._coral is not None:
-            await self._coral.async_rebuild()
+    async def _build_coral(self) -> str | None:
+        if self._coral is None:
+            return None
+        await self._coral.async_rebuild()
+        return self._coral.rebuild_error
 
     def loo_accuracy(self, cat: str) -> float | None:
         """`None` both when neither model has ever been built and when `cat` has fewer than
         five training samples -- see `identity.Model.loo_accuracy`'s own "not enough data yet"
         note, shared verbatim by `coral_identity.CoralModel.loo_accuracy`. Reads whichever
         backend `self.backend` currently prefers, so the UI's own per-cat accuracy figure
-        always reflects the recognizer actually answering classification calls."""
+        always reflects the recognizer actually answering classification calls. While CoralHub
+        is configured but not answering, the histogram model is only a fallback and its accuracy
+        is not worked out (see `async_rebuild_histogram`), so this is `None` for that stretch."""
         if self.backend == "coral":
             assert self._coral is not None
             return self._coral.loo_accuracy(cat)
@@ -150,7 +194,7 @@ class IdentityEngine:
             return None
         return await self._hass.async_add_executor_job(model.classify, samples)
 
-    async def async_classify_event(self, uid: str) -> None:
+    async def async_classify_event(self, uid: str) -> bool:
         """Classifies one event's current samples and persists the verdict. Tries Coral first
         (when configured) via `CoralRecognizer.async_classify_event`: a bare `None` there means
         Coral could not answer this event AT ALL right now (not configured, no model yet, or
@@ -159,17 +203,17 @@ class IdentityEngine:
         used as-is, never re-checked against the histogram model. A safe no-op when NEITHER
         model can produce a verdict (no samples yet), or when the event is already reviewed
         (`store.py`'s own `WHERE reviewed=0` guard) -- a human's word always wins and this never
-        overwrites it."""
+        overwrites it. `True` when the stored verdict actually changed."""
         verdict: identity.Verdict | None = None
         if self._coral is not None:
             verdict = await self._coral.async_classify_event(uid)
         if verdict is None:
             features = await self._store.async_features_for_event(uid)
             if not features:
-                return
+                return False
             verdict = await self._classify(features)
             if verdict is None:
-                return
+                return False
         sample_uids = await self._store.async_sample_uids_ordered(uid)
         if verdict.label is None:
             cat, status = None, "unknown"
@@ -177,13 +221,15 @@ class IdentityEngine:
             cat, status = None, identity.NOT_A_CAT
         else:
             cat, status = verdict.label, "auto"
-        await self._store.async_set_event_classification(
-            uid,
-            cat=cat,
-            identity_status=status,
-            confidence=verdict.confidence,
-            per_sample_uids=sample_uids,
-            per_sample=verdict.per_sample,
+        return bool(
+            await self._store.async_set_event_classification(
+                uid,
+                cat=cat,
+                identity_status=status,
+                confidence=verdict.confidence,
+                per_sample_uids=sample_uids,
+                per_sample=verdict.per_sample,
+            )
         )
 
     async def async_replan_session(self, uid: str) -> bool:
@@ -233,8 +279,8 @@ class IdentityEngine:
         """Auto-learn's entry point: called for every event during ingest, idempotent by
         construction (this module's own docstring) so a repeat call for an already-processed
         event is always safe -- a few cheap reads that find nothing left to do. `True` only
-        when it actually added at least one training sample, the signal `Ingestor.async_ingest`
-        uses to decide whether a model rebuild is worth running. See `autolearn.py`'s module
+        when it actually added at least one training sample (the store itself tells the learning
+        job, `learning.py`, so the models are rebuilt a little later). See `autolearn.py`'s module
         docstring for the full five-gate design (confidence+consistency, never contradicted by
         a human, diversity, rolling-accuracy pause/resume, never a judge verdict either)."""
         ctx = await self._store.async_event_training_context(uid)
@@ -275,14 +321,44 @@ class IdentityEngine:
             added = added or ok
         return added
 
-    async def async_reclassify_unreviewed(self, retention_cutoff: int) -> None:
-        """Re-runs classification for every unreviewed event inside retention -- called after
-        every training change (a label, or `kibble/training/remove`), so a name that only
-        became learnable with the new data shows up without waiting for that cat's next
-        visit."""
-        for uid in await self._store.async_events_for_reclassify(retention_cutoff):
-            await self.async_classify_event(uid)
-            await self.async_replan_session(uid)
+    async def async_reclassify_unreviewed(
+        self, retention_cutoff: int, progress: Callable[[int, int], None] | None = None
+    ) -> dict[str, int]:
+        """Re-runs classification for every unreviewed event inside retention -- the last step
+        of a pass of the learning job (`learning.py`), so a name that only became learnable with
+        the new data shows up without waiting for that cat's next visit. One event at a time,
+        yielding to the event loop in between, and `progress(done, total)` after each so the
+        pass can show how far along it is.
+
+        One event that fails is logged and skipped -- it must not cost every other event its
+        recheck -- but `RECLASSIFY_MAX_CONSECUTIVE_FAILURES` in a row mean something underneath
+        is broken (the store is closing, say), and the last error is raised so the pass is
+        retried later instead of grinding through every remaining event.
+
+        Returns how many events were rechecked, how many of those changed (a new name or a new
+        session plan), and how many failed."""
+        uids = await self._store.async_events_for_reclassify(retention_cutoff)
+        total = len(uids)
+        if progress is not None:
+            progress(0, total)
+        changed = failed = streak = 0
+        for done, uid in enumerate(uids, start=1):
+            try:
+                moved = await self.async_classify_event(uid)
+                moved = await self.async_replan_session(uid) or moved
+            except Exception:  # noqa: BLE001 -- see the docstring: one bad event is skipped
+                failed += 1
+                streak += 1
+                _LOGGER.warning("Could not recheck event %s", uid, exc_info=True)
+                if streak >= RECLASSIFY_MAX_CONSECUTIVE_FAILURES:
+                    raise
+            else:
+                streak = 0
+                changed += moved
+            if progress is not None:
+                progress(done, total)
+            await asyncio.sleep(0)
+        return {"rechecked": total - failed, "renamed": changed, "failed": failed}
 
 
 class Ingestor:
@@ -325,11 +401,9 @@ class Ingestor:
     ) -> None:
         assert self.coordinator is not None  # wired by `__init__.py` before any ingest can run
         self.coordinator.bowl_fill_settle_pending()
-        auto_learn_changed = False
         for event in events:
             try:
-                if await self._ingest_event(event):
-                    auto_learn_changed = True
+                await self._ingest_event(event)
             except Exception:  # noqa: BLE001 -- one bad row must never abort the whole batch
                 _LOGGER.exception("Failed to ingest event %s", event.event_id)
         # `events` is the feeder's whole current list, so a row still open in the store that it
@@ -347,20 +421,13 @@ class Ingestor:
                 await self._ingest_feed(feed)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to ingest feed %s", feed.id)
-        if auto_learn_changed:
-            # Model rebuild + reclassify only, off the event-loop path this whole module
-            # already runs on -- the identity-snapshot push both of those want happens for
-            # free right after, unconditionally, in `coordinator._async_run_ingest`.
-            try:
-                await self._engine.async_rebuild()
-                if self.coordinator is not None:
-                    await self._engine.async_reclassify_unreviewed(self.coordinator.retention_cutoff())
-            except Exception:  # noqa: BLE001 -- a rebuild failure must not crash the ingest pass
-                _LOGGER.exception("Auto-learn triggered model rebuild failed")
+        # Auto-learn may have added training photos while ingesting: the store itself tells the
+        # learning job (`learning.py`), which rebuilds the models and rechecks unreviewed events
+        # once things have been quiet for a while, off this ingest path.
 
     # --- events ------------------------------------------------------------------------------
 
-    async def _ingest_event(self, event: DetectionEvent) -> bool:
+    async def _ingest_event(self, event: DetectionEvent) -> None:
         uid = event_uid(self._entry_id, event)
         date = _utc_date(event.ts)
 
@@ -446,8 +513,8 @@ class Ingestor:
             # replacement that just landed above is included in whichever run actually fires.
             self.vision_judge.schedule_judge(uid)
         if self.coordinator is not None and not self.coordinator.auto_learn_enabled:
-            return False
-        return await self._engine.async_maybe_auto_learn(uid)
+            return
+        await self._engine.async_maybe_auto_learn(uid)
 
     async def _ingest_sample(
         self,

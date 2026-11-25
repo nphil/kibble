@@ -37,8 +37,8 @@ camera -> media (NPU): bodies[+224px body crop], faces[+224px crop, 512-D embedd
   -> HA ingest: fetch assets -> write /config/kibble/<entry_id>/media/... -> SQLite row
        -> DELETE /events/<asset> (ack) on the feeder
        -> identity engine classifies the track -> entities + WS subscribers update
-  -> card: kibble/timeline, kibble/cats, kibble/review, labelling via kibble/label
-  -> labelling copies the sample into the training set -> engine retrains -> unreviewed
+  -> card: kibble/timeline, kibble/cats, kibble/review/photos, labelling via kibble/sample/label
+  -> a label is saved and acknowledged at once; the debounced learning job then retrains and
      events inside retention are re-classified
 ```
 
@@ -199,6 +199,77 @@ CoralHub server is configured, falling back to the histogram engine above automa
 is not configured or unreachable -- see `docs/41-coral-recognition.md` for the full design and
 the live-data comparison that justified turning it on.
 
+## Learning (0.29.7)
+
+Every label used to start a full relearn on the one store thread: model rebuild, an O(n^2)
+leave-one-out, a re-check of about 1,400 events and a snapshot. Labelling five visits quickly meant
+92-129 s of work, `kibble/cats` waited 10-38 s behind it and saves failed. Measured on one relearn
+(about 13 s): Coral leave-one-out 42%, histogram leave-one-out 20%, verdict writes 13%, Coral
+network about 2%. Now a label is saved and acknowledged at once and learning runs as a separate job
+(`learning.py`, `LearningManager`, `coordinator.learning`):
+
+- **Generation counter.** The store bumps a persisted `learning.gen` in the same transaction as any
+  training-gallery change, then tells the manager (`notify(gen, answers)`) on the event loop. No
+  caller has to tell the manager anything, so no path can forget.
+- **Debounce.** A pass starts 20 s (`QUIET_S`) after the last change, but never later than 120 s
+  (`MAX_WAIT_S`) after the first one. Both are constructor arguments so tests can shrink them.
+- **Single-flight, follow-up pass.** Only one pass runs at a time; changes that arrive during a pass
+  schedule one more pass with a fresh quiet window.
+- **A pass:** reconcile queued sessions, enforce the training caps (label writes no longer do),
+  read the target generation, `engine.async_rebuild(gen=target)` (skipped when `built_gen` already
+  equals it), `engine.async_reclassify_unreviewed(cutoff, progress)`,
+  `store.async_learning_complete(gen, answers, result, counts)`, identity snapshot refresh.
+  `events_for_reclassify` returns top-level events only: child parts of a split session are rebuilt
+  from the parent (re-checking a child un-split the session and every pass re-split it).
+- **Failure and retry.** An exception, or an unreachable CoralHub (`async_rebuild` returns an error
+  string), sets state `retrying`, backs off 30 s doubling to 900 s and stores the text in
+  `learning.last_error`; success clears it. A new answer while retrying does not wait out the whole
+  back-off: a pass runs after the usual quiet window, but never later than the retry already due.
+- **Restart.** At start, a pass is scheduled when `gen > done_gen` or the learning queue is not
+  empty. `async_stop()` runs first on unload, cancels the worker and leaves the durable state dirty,
+  so the next start resumes. Nothing is lost.
+- **Reads never wait.** `kibble/learning` is answered from memory and `kibble/cats` is a single store
+  call (`async_cats_overview`; its live `spool_stats()` is bounded to 0.75 s, falling back to the
+  last known value). The `clear_training` service no longer rebuilds inline either.
+
+Status payload (WebSocket result, subscription event, and the one diagnostic
+`sensor.<device>_learning`, whose state is `state` and whose attributes are the other fields):
+
+```ts
+type Learning = {
+  state: "idle" | "waiting" | "learning" | "rechecking" | "retrying";
+  pending: number;           // answers saved but not yet learned
+  done: number | null; total: number | null;   // re-check progress; null until the first tick
+  starts_at: number | null;  // unix seconds, while waiting
+  retry_at: number | null;   // unix seconds, while retrying
+  started: number | null;    // unix seconds the running pass began
+  last: null | { finished: number; duration: number; answers: number;
+                 learned: Record<string, number>;   // cat -> +/- photos
+                 renamed: number; rechecked: number;
+                 stages: Stages };
+  error: string | null;
+};
+
+type Stages = {                // milliseconds spent in each stage of the last pass
+  reconcile_ms: number; caps_ms: number; state_ms: number;
+  rebuild_ms: number;          // all of the model rebuild: histogram_ms plus the coral_* stages
+  histogram_ms?: number;       // present once a rebuild ran
+  coral_health_ms?: number; coral_embed_ms?: number; coral_load_ms?: number;
+  coral_build_ms?: number; coral_loo_ms?: number;   // only with CoralHub configured
+  rebuild_skipped?: true;      // the models already matched the generation, nothing rebuilt
+  coral_requests?: { calls: number; crops: number; ms: number; reused: number };
+  recheck_ms: number; snapshot_ms: number;
+};
+```
+
+The sensor is diagnostic and disabled by default. History keeps only its state (every attribute is
+unrecorded), and it rewrites itself only when the state, the number of waiting answers, the error
+or a finished pass changes: progress ticks do not, the other attributes catch up on the
+coordinator's next refresh. It stays available while the feeder is down.
+
+`set_event_classification` no longer bumps `updated` for an unchanged verdict and returns True only
+when the name changed.
+
 ## HA entities
 
 Per enrolled cat (created and removed with the roster):
@@ -226,7 +297,7 @@ fetched with `hass.fetchWithAuth`. Media responses are immutable (`Cache-Control
   frame area or clipped at the frame edge (skip the box gate when the device sent no box at
   all), then prefer a sample with a face, then the highest detector score. Computed fresh on
   every read, never cached, so a later reclassification is reflected immediately. A `visit`
-  with no sample surviving that is not shown at all (it still exists for `kibble/review` and
+  with no sample surviving that is not shown at all (it still exists for `kibble/review/photos` and
   ages out under retention normally); an `eat` always shows something -- its best surviving
   crop, or the scene frame if none survives.
 - `kibble/timeline/subscribe` `{}` -> subscription; each message `{changed: true}`; client refetches.
@@ -236,17 +307,36 @@ fetched with `hass.fetchWithAuth`. Media responses are immutable (`Cache-Control
   `{events: TimelineEvent[]}` immediately -- no file I/O on this path. For a cat or not_a_cat
   label (never `unknown`), reconciling every one of those events' samples afterward -- a
   sample with no override of its own (`review IS NULL`) adopts the new label, a `"skip"`
-  override stays untrained, any other override is left exactly alone -- rebuilding the model
-  if training changed, and re-classifying unreviewed events inside retention all happen off
-  the response, followed by a `kibble/timeline/subscribe` push once that settles.
-- `kibble/sample/label` `{sample_uid, label}` where `label` is a cat name, `"not_a_cat"`,
-  `"skip"` or `"follow"` (clears a previous override). Sets that one sample's own `review`
-  override, independent of its event's label, and responds immediately with `{sample: Sample}`
-  reflecting the saved state; the same model rebuild/reclassify/snapshot-refresh as
-  `kibble/label` runs afterward, unconditionally.
-- `kibble/review` `{limit?: 1..60 = 24, cursor?}` -> events needing review
-  (`identity_status = "unknown"` and not reviewed, inside retention), newest first:
-  `{items: TimelineEvent[], total: n, cursor, has_more}`.
+  override stays untrained, any other override is left exactly alone. The label is saved and
+  acknowledged at once; the model rebuild and re-classification happen later in the learning job,
+  followed by a `kibble/timeline/subscribe` push once that settles.
+- `kibble/review/photos` `{entry_id, cursor?, limit?: 1..60 = 24}` replaces the old `kibble/review`
+  (events needing review). Result `{items: [{sample, visit: {uid, start, kind, scene, in_scene}}],
+  remaining, visits, cursor, has_more}`: one photo per card. Keyset-paged, so the cursor stays
+  valid while photos are answered (an answered photo just disappears), and it never depends on a
+  relearn. At most 3 photos per visit: different from each other and from the training gallery,
+  unsure ones first, good crops only, newest first.
+- `kibble/sample/label` `{entry_id, sample_uid, label}` where `label` is a cat name, `"not_a_cat"`,
+  `"both"` ("Both in this photo", only with exactly two enrolled cats, never trained), `"skip"`
+  ("Don't use") or `"follow"` (undo: back to no answer). Replies
+  `{sample, visit: {uid, kind, cats: [{cat, ate}], needs_ate}}` at once;
+  training changes are learned later by the debounced learning job (see "Learning"). Repeating the
+  same answer is a successful no-op. Only the photos the person answers train in a photo-driven
+  visit; a per-photo `not_a_cat` trains the `not_a_cat` class (still vetoable).
+- `kibble/session/ate` `{entry_id, uid, ate: string[]}` -> `{visit}`: who ate, asked only when a
+  meal's photos name two cats and the feeder's per-subject data cannot tell. `agent_rejected` for an
+  empty list or a cat not in the visit, `not_found` for an unknown visit. `kibble/event` adds
+  `event.needs_ate`.
+- Legacy, kept and idempotent: `kibble/label` and `kibble/session/label` (visit-level answers; they
+  keep the old follow-photo training). The visit's result (who visited, who ate, title) is derived
+  server-side from the photo answers; nobody answers for a bundle.
+- `kibble/learning` `{entry_id}` -> learning status (see "Learning"), served from memory.
+  `kibble/learning/subscribe` `{entry_id}`: result first, then at once one event `{learning: status}`,
+  then one per change (progress pushes throttled to about 2 a second).
+- Error codes: `not_found` and `agent_rejected` are terminal; everything else is transient.
+- "Can't tell" (`unknown`) at visit level and a per-photo `skip` both guarantee that none of that
+  visit's / photo's photos stay in the training gallery (the `<sample_uid>-train` rows and their
+  cached Coral embeddings are removed) and auto-learn never re-adds them (it skips reviewed events).
 - `kibble/cats` `{}` -> `{cats: CatSummary[], storage: Storage}`.
 - `kibble/cats/add` `{name}`, `kibble/cats/delete` `{name}`.
 - `kibble/training` `{cat, limit?: 1..60 = 24, cursor?}` -> `{items: TrainingSample[], total, cursor, has_more}`.
@@ -296,7 +386,7 @@ from `kibble/timeline` but kept until retention removes them.
 2. Import the device gallery into HA training: `Kitty`, `Pancake` as cats, `not_a_cat` as the
    reject class. `other` (the old skip bucket) is not imported. Face crops plus `.emb` sidecars.
 3. Import the 199 pending crops as events of kind `import` with one face-only sample each.
-   `import` events never appear in `kibble/timeline`; they appear in `kibble/review` and age
+   `import` events never appear in `kibble/timeline`; they appear in `kibble/review/photos` and age
    out under retention like any other event.
 4. Move the existing `.storage/kibble/evidence` archive files into `media/<date>/<name>`
    (date from the leading unix timestamp in the name), then delete `.storage/kibble/`.

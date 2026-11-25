@@ -359,6 +359,25 @@ def nearest_distance(query: np.ndarray, pool: Sequence[np.ndarray]) -> float | N
     return float(_hellinger_batch(query, matrix).min())
 
 
+def nearest_other_distances(vectors: Sequence[np.ndarray], rows: Sequence[int]) -> list[float]:
+    """For each index in `rows`, the smallest Hellinger distance from `vectors[row]` to every
+    OTHER vector in `vectors` (all of one shape) -- `nearest_distance` for a whole pool at
+    once. The pool is stacked and square-rooted a single time instead of once per query, which
+    is what made ranking a few hundred training rows by redundancy cost seconds; the arithmetic
+    per query is `_hellinger_batch`'s own, so the values (and therefore every tie-break built
+    on them) are identical. A single-vector pool has nothing to compare against: `inf`."""
+    if len(vectors) < 2:
+        return [float("inf")] * len(rows)
+    roots = np.sqrt(np.clip(np.stack(vectors).astype(np.float32), 0, None))
+    out: list[float] = []
+    for row in rows:
+        diff = roots - roots[row][None, :]
+        distance = np.sqrt(np.sum(diff * diff, axis=1)) * _INV_SQRT2
+        distance[row] = np.inf
+        out.append(float(distance.min()))
+    return out
+
+
 # --- k-NN + fusion -----------------------------------------------------------------------------
 
 

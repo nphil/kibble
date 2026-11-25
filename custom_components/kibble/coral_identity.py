@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -192,6 +193,19 @@ class CoralModel:
                     out.append(identity.to_log_probs(scores, self.classes, LOG_PROB_FLOOR))
         return out
 
+    def _decide(self, all_log_probs: list[np.ndarray]) -> tuple[str, float] | None:
+        """The gate `classify` and `loo_accuracy` both end in: fuse every modality's
+        log-probabilities, then accept the top class only when it clears
+        `DECISION_TOP_THRESHOLD` and beats the runner-up by `DECISION_MARGIN`."""
+        fused = identity.fuse_log_probs(all_log_probs)
+        order = np.argsort(fused)[::-1]
+        top_idx = int(order[0])
+        top_p = float(fused[top_idx])
+        second_p = float(fused[order[1]]) if len(order) > 1 else 0.0
+        if top_p >= DECISION_TOP_THRESHOLD and (top_p - second_p) >= DECISION_MARGIN:
+            return self.classes[top_idx], top_p
+        return None
+
     def classify(self, samples: Sequence[CoralFeatures]) -> identity.Verdict:
         """Same per-sample-then-fused shape as `identity.Model.classify` (fuse each sample's
         own available modalities, then fuse across samples, gate the fused top class on
@@ -213,15 +227,10 @@ class CoralModel:
 
         if not self.classes or not all_log_probs:
             return identity.Verdict(label=None, confidence=None, per_sample=per_sample)
-
-        fused = identity.fuse_log_probs(all_log_probs)
-        order = np.argsort(fused)[::-1]
-        top_idx = int(order[0])
-        top_p = float(fused[top_idx])
-        second_p = float(fused[order[1]]) if len(order) > 1 else 0.0
-        if top_p >= DECISION_TOP_THRESHOLD and (top_p - second_p) >= DECISION_MARGIN:
-            return identity.Verdict(label=self.classes[top_idx], confidence=top_p, per_sample=per_sample)
-        return identity.Verdict(label=None, confidence=None, per_sample=per_sample)
+        decided = self._decide(all_log_probs)
+        if decided is None:
+            return identity.Verdict(label=None, confidence=None, per_sample=per_sample)
+        return identity.Verdict(label=decided[0], confidence=decided[1], per_sample=per_sample)
 
     def class_distribution(self, samples: Sequence[CoralFeatures]) -> list[tuple[str, float]] | None:
         """Same per-sample-then-fused shape as `classify` but returns the full fused class
@@ -238,25 +247,67 @@ class CoralModel:
     def loo_accuracy(self) -> dict[str, float | None]:
         """Same shape/semantics as `identity.Model.loo_accuracy` -- `ingest.py`'s
         `IdentityEngine.loo_accuracy(cat)` (surfaced by `websocket.py`'s `kibble/cats`) reads
-        whichever backend built the current model through this one interface, unchanged."""
-        result: dict[str, float | None] = {}
+        whichever backend built the current model through this one interface, unchanged.
+
+        Exact leave-one-out, not an approximation, and linear in the number of rows: a centroid
+        model built without row `i` differs from this one in a single centroid -- row `i`'s own
+        class, in the one pool (modality x lighting mode) the row belongs to -- and that centroid
+        is `(sum - vector) / (count - 1)` from running sums. The previous version rebuilt a whole
+        model per row (quadratic: tens of seconds at the live gallery's size, on every relearn)
+        and now takes milliseconds; `tests/test_coral_identity.py` keeps that version as the
+        reference this one is checked against."""
+        # (modality, mode, class) -> [sum of the class's vectors, how many]
+        sums: dict[tuple[str, str, str], list[Any]] = {}
         by_class: dict[str, list[int]] = {}
-        for i, (label, _) in enumerate(self._training):
+        for i, (label, feat) in enumerate(self._training):
             by_class.setdefault(label, []).append(i)
+            if feat.mode is None:
+                continue
+            for modality, vec in (("body", feat.body_emb), ("face", feat.face_emb)):
+                if vec is None:
+                    continue
+                entry = sums.get((modality, feat.mode, label))
+                if entry is None:
+                    sums[(modality, feat.mode, label)] = [vec.astype(np.float64), 1]
+                else:
+                    entry[0] += vec
+                    entry[1] += 1
+        result: dict[str, float | None] = {}
         for cls in self.classes:
             rows = by_class.get(cls, [])
             if len(rows) < MIN_LOO_SAMPLES:
                 result[cls] = None
                 continue
-            correct = 0
-            for i in rows:
-                reduced = self._training[:i] + self._training[i + 1 :]
-                fold = CoralModel(reduced)
-                verdict = fold.classify([self._training[i][1]])
-                if verdict.label == cls:
-                    correct += 1
+            correct = sum(1 for i in rows if self._held_out_label(i, sums) == cls)
             result[cls] = correct / len(rows)
         return result
+
+    def _held_out_label(self, index: int, sums: dict[tuple[str, str, str], list[Any]]) -> str | None:
+        """What a model built from every training row EXCEPT row `index` decides for that row
+        (`classify`'s verdict label, `None` when it abstains) -- see `loo_accuracy`."""
+        label, feat = self._training[index]
+        if feat.mode is None:
+            return None
+        logs: list[np.ndarray] = []
+        for modality, vec, pools in (
+            ("body", feat.body_emb, self._body_pools),
+            ("face", feat.face_emb, self._face_pools),
+        ):
+            if vec is None:
+                continue
+            pool = dict(pools[feat.mode])  # the row itself is in this pool
+            total, count = sums[(modality, feat.mode, label)]
+            if count == 1:
+                del pool[label]  # the row was its class's only vector here: no centroid without it
+            else:
+                pool[label] = _l2_normalize(((total - vec) / (count - 1)).astype(np.float32))
+            scores = _centroid_scores(vec, pool, self.classes)
+            if scores is not None:
+                logs.append(identity.to_log_probs(scores, self.classes, LOG_PROB_FLOOR))
+        if not logs:
+            return None
+        decided = self._decide(logs)
+        return None if decided is None else decided[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +319,30 @@ class CoralStatus:
     last_error: str | None
 
 
+@dataclass(slots=True)
+class EmbedStats:
+    """Running totals of the CoralHub work this recognizer has done. The learning job reads
+    them before and after a pass (`since`) to report what the Coral box cost it: requests sent,
+    images embedded for the first time, the time spent waiting for the box, and rows that
+    reused an embedding which was already cached instead."""
+
+    calls: int = 0
+    crops: int = 0
+    ms: float = 0.0
+    reused: int = 0
+
+    def snapshot(self) -> EmbedStats:
+        return EmbedStats(self.calls, self.crops, self.ms, self.reused)
+
+    def since(self, earlier: EmbedStats) -> dict[str, int]:
+        return {
+            "calls": self.calls - earlier.calls,
+            "crops": self.crops - earlier.crops,
+            "ms": round(self.ms - earlier.ms),
+            "reused": self.reused - earlier.reused,
+        }
+
+
 class CoralRecognizer:
     """Owns the CoralHub-backed half of `ingest.py`'s `IdentityEngine`: the embedding cache
     (embed each image at most once -- `store.py` schema v8), the current `CoralModel`, and the
@@ -277,17 +352,24 @@ class CoralRecognizer:
     itself gave -- see `async_classify_event`'s own docstring); this class never raises past its
     own boundary, every CoralHub failure just means "not available/answerable right now".
 
-    `on_progress` is set (not constructor-injected) by `__init__.py` right after the sibling
-    `IdentityEngine` exists -- same chicken-and-egg reason `Ingestor.coordinator`/`VisionJudge.
-    coordinator` are wired post-construction: it is `IdentityEngine.async_rebuild` itself, called
-    once a backfill batch actually adds new training-row centroids, so freshly caught-up data
-    reaches production without waiting for an unrelated training mutation."""
+    `on_progress` is set (not constructor-injected) by `__init__.py` once the learning job
+    exists -- same chicken-and-egg reason `Ingestor.coordinator`/`VisionJudge.coordinator` are
+    wired post-construction. It is called once a backfill batch actually adds new training-row
+    embeddings, and tells the learning job the gallery's centroids are out of date, so freshly
+    caught-up data reaches production without waiting for an unrelated training mutation.
+
+    `stats` and `timings` are what the learning job reports about one pass: CoralHub request
+    totals, and the milliseconds the last rebuild spent in each of its stages. `rebuild_error`
+    is why the last rebuild could not reach CoralHub (`None` when it did)."""
 
     def __init__(self, hass: "HomeAssistant", store: "KibbleStore", client: CoralHubClient) -> None:
         self._hass = hass
         self._store = store
         self._client = client
         self.on_progress: Callable[[], Awaitable[None]] | None = None
+        self.stats = EmbedStats()
+        self.timings: dict[str, int] = {}
+        self.rebuild_error: str | None = None
         self._model: CoralModel | None = None
         self._loo: dict[str, float | None] = {}
 
@@ -318,26 +400,56 @@ class CoralRecognizer:
         AND at least one class ended up with a usable embedding; `False` leaves `self._model` at
         its PREVIOUS value -- a transient health-check failure during an otherwise-routine
         training-mutation rebuild degrades to "still using the last known-good Coral model",
-        never a spurious drop back to the histogram recognizer over one bad poll. At startup
-        (no previous model yet), a `False` here really does mean "not available yet" --
-        `IdentityEngine` reads `self.available`, not this return value, to decide."""
+        never a spurious drop back to the histogram recognizer over one bad poll (and
+        `rebuild_error` says so). At startup (no previous model yet), a `False` here really does
+        mean "not available yet" -- `IdentityEngine` reads `self.available`, not this return
+        value, to decide.
+
+        A healthy CoralHub with NO embedded training row left (every photo was removed) also
+        returns `False`, and drops the model: the removed photos' centroids must not keep
+        answering for a gallery that no longer has them."""
+        timings: dict[str, int] = {}
+        mark = time.perf_counter()
+
+        def lap(stage: str) -> None:
+            nonlocal mark
+            now = time.perf_counter()
+            timings[stage] = round((now - mark) * 1000)
+            mark = now
+
         health = await self._client.health()
+        lap("health_ms")
         if not health.ok:
+            self.rebuild_error = health.error or "CoralHub did not answer its health check"
+            self.timings = timings
             return False
+        self.rebuild_error = None
         rows = await self._store.async_training_rows_needing_coral(
             CORAL_BODY_MODEL_ID, CORAL_FACE_MODEL_ID, REBUILD_EMBED_LIMIT
         )
         if rows:
             await self._embed_rows("training", rows)
+        lap("embed_ms")
         pairs = await self._store.async_all_training_coral_features(CORAL_BODY_MODEL_ID, CORAL_FACE_MODEL_ID)
+        lap("load_ms")
+        self.stats.reused += max(0, len(pairs) - len(rows))
         if not pairs:
+            self._model, self._loo = None, {}
+            self.timings = timings
             return False
 
-        def _build() -> tuple[CoralModel, dict[str, float | None]]:
+        def _build() -> tuple[CoralModel, dict[str, float | None], int, int]:
+            started = time.perf_counter()
             model = CoralModel(pairs)
-            return model, model.loo_accuracy()
+            built = time.perf_counter()
+            loo = model.loo_accuracy()
+            done = time.perf_counter()
+            return model, loo, round((built - started) * 1000), round((done - built) * 1000)
 
-        self._model, self._loo = await self._hass.async_add_executor_job(_build)
+        model, loo, build_ms, loo_ms = await self._hass.async_add_executor_job(_build)
+        self._model, self._loo = model, loo
+        timings["build_ms"], timings["loo_ms"] = build_ms, loo_ms
+        self.timings = timings
         return True
 
     async def async_classify_event(self, uid: str) -> identity.Verdict | None:
@@ -354,6 +466,7 @@ class CoralRecognizer:
         down (same `last_error` guard) -- keeps the cache warm through a temporary fallback
         window so classification switches back the moment CoralHub (and the next rebuild) come
         back, instead of discovering a large embedding backlog only then."""
+        rows: list[dict[str, Any]] = []
         if self._client.last_error is None:
             rows = await self._store.async_samples_needing_coral_for_event(
                 uid, CORAL_BODY_MODEL_ID, CORAL_FACE_MODEL_ID
@@ -365,6 +478,7 @@ class CoralRecognizer:
         feats = await self._store.async_coral_features_for_event(uid, CORAL_BODY_MODEL_ID, CORAL_FACE_MODEL_ID)
         if not feats:
             return None
+        self.stats.reused += max(0, len(feats) - len(rows))
         model = self._model
         assert model is not None  # guarded by `self.available` above
         return await self._hass.async_add_executor_job(model.classify, feats)
@@ -379,18 +493,24 @@ class CoralRecognizer:
         model's batch call fails, so a caller can back off instead of busy-looping against an
         unreachable CoralHub."""
         ok = True
+        embedded: list[tuple[str, str, str, bytes]] = []
         for crop_kind, model_id in (("body", CORAL_BODY_MODEL_ID), ("face", CORAL_FACE_MODEL_ID)):
             key = f"{crop_kind}_bytes"
             batch = [(r["uid"], r[key]) for r in rows if r.get(key) is not None]
             if not batch:
                 continue
+            started = time.perf_counter()
             vectors = await self._client.embed(model_id, [data for _, data in batch])
+            self.stats.calls += 1
+            self.stats.ms += (time.perf_counter() - started) * 1000
             if vectors is None:
                 ok = False
                 continue
+            self.stats.crops += len(batch)
             for (uid, _), vector in zip(batch, vectors, strict=True):
-                blob = identity.pack(np.asarray(vector, dtype=np.float32))
-                await self._store.async_set_coral_embedding(row_kind, uid, crop_kind, model_id, blob)
+                embedded.append((uid, crop_kind, model_id, identity.pack(np.asarray(vector, dtype=np.float32))))
+        if embedded:
+            await self._store.async_set_coral_embeddings(row_kind, embedded)
         return ok
 
     # --- background backfill (docs/41-coral-recognition.md) ----------------------------------
@@ -408,9 +528,9 @@ class CoralRecognizer:
         background task is cancelled automatically then, same as `vision_judge.
         ensure_descriptions`'s own one-shot background task).
 
-        Calls `on_progress` (`IdentityEngine.async_rebuild`) after each training batch that
-        actually embeds something, so newly-caught-up centroids reach production without waiting
-        for an unrelated training mutation."""
+        Calls `on_progress` (the learning job's "the centroids changed" hook, `learning.py`)
+        after each training batch that actually embeds something, so newly-caught-up centroids
+        reach production without waiting for an unrelated training mutation."""
         while True:
             training_rows = await self._store.async_training_rows_needing_coral(
                 CORAL_BODY_MODEL_ID, CORAL_FACE_MODEL_ID, BACKFILL_BATCH_LIMIT

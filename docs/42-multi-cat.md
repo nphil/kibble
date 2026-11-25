@@ -69,16 +69,19 @@ EventDetail. V1 `companions` and scene subject `sample_uid`/`event_uid` fields a
 
 `kibble/session/label {entry_id, uid, cats}` saves the person's exact cat set, where each row is
 `{cat, ate}`. The alternate form `{entry_id, uid, verdict}` accepts only `not_a_cat` or `unknown`;
-exactly one of `cats` or `verdict` is required. The handler replies with the updated EventDetail,
-then reconciles training and refreshes identity in the background.
+exactly one of `cats` or `verdict` is required. The handler replies with the updated EventDetail at
+once; the training change is learned later by the debounced learning job, and an identity snapshot
+refresh is scheduled in the background.
 
 `kibble/session/subject {entry_id, uid, sid, label}` accepts a cat name, `not_a_cat`, or `follow`.
 The session uid may be `event.uid` from the preceding response. A cat label not already in the
 session is added, with `ate` set when the session is an eating session. It replies with updated
 EventDetail and follows the same training path.
 
-`kibble/sample/label {entry_id, sample_uid, label}` still replies `{sample}` and marks that
-photo review as photo-sourced. A newly named cat is added to the session. `kibble/label` continues
+`kibble/sample/label {entry_id, sample_uid, label}` replies `{sample, visit}` (the photo as it now
+stands and the visit's derived identity) and marks that photo review as photo-sourced. `label` is a
+cat name, `both`, `not_a_cat`, `skip`, or `follow` (undo: back to no answer). A newly named cat is
+added to the session. `kibble/label` continues
 to support timeline quick-pick and bulk review; on a session or part it means the session has
 exactly that one cat, or the supplied `not_a_cat`/`unknown` verdict.
 
@@ -93,16 +96,37 @@ photos only where no photo review already exists. All child photos return to the
 the family is replanned. The e2060 regression must recover one reviewed Kitty eating session,
 all 42 photos, preserve `s1` as `not_a_cat` and `s1-o1` as `Kitty`, and count Kitty's meal.
 
+## One-photo review and derived visit identity (0.29.7)
+
+The review screen shows one photo at a time (`kibble/review/photos`, at most 3 photos per visit:
+different from each other and from the training gallery, unsure first, good crops, newest first).
+Each photo gets one of five answers: **a cat** (by name), **Both in this photo** (only with exactly
+two enrolled cats; never trained), **Not a cat**, or **Don't use** (`skip`). Nobody answers for a
+whole visit: who visited, who ate and the title are derived server-side from the photo answers.
+
+- **Who ate** is asked (`kibble/session/ate`, `event.needs_ate`) only when a meal's photos name two
+  cats and the feeder's per-subject data cannot tell which one ate.
+- **Child parts** of a split session are rebuilt from the parent; the learning job re-checks only
+  top-level events, so a re-check no longer un-splits a session.
+- "Can't tell" at visit level and **Don't use** on a photo mean the same thing now: none of those
+  photos stay in the training gallery and auto-learn never re-adds them.
+- Only the photos the person answers train in a photo-driven visit; legacy visit-level answers
+  (`kibble/label`, `kibble/session/label`) keep the old follow-photo training.
+
+Wire shapes and the learning status are in `docs/36-ai-pipeline.md`.
+
 ## Invariants
 
-1. One review sheet represents one whole session; no per-cat tabs or focus state.
+1. Review is one photo at a time (up to 3 photos per visit); no per-cat tabs or focus state, and no
+   answer is given for a whole visit.
 2. The human cat set is authoritative; detector misses cannot prevent adding a cat.
 3. Automatic splitting needs two different confident, cropped, co-occurring cats.
 4. Same-cat detector fragments merge, and no photo is stranded on a hidden parent.
 5. Every part closes with the session; human photo, subject, and session answers are never overwritten.
 6. Legacy sessions without subject ids retain their chronological split behavior.
 7. Hidden parents do not affect per-cat statistics; food use is counted once.
-8. No new HA entities or entity-id changes.
+8. No new HA entities or entity-id changes from multi-cat planning (0.29.7 adds only the one
+   diagnostic learning sensor, which belongs to the learning job, not to this feature).
 
 ## Verification scope
 

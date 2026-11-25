@@ -101,6 +101,7 @@ from .errors import (
 )
 from .ingest import IdentityEngine, Ingestor
 from .judge import VisionJudge
+from .learning import LearningManager
 from .store import KibbleStore
 from .views import KibbleClipView, KibbleMediaView, KibbleUploadAvatarView, KibbleUploadTrainingView
 from .websocket import async_setup_websocket_api
@@ -416,12 +417,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: KibbleConfigEntry) -> bo
     coordinator = KibbleCoordinator(hass, entry, client, store, engine, ingestor)
     ingestor.coordinator = coordinator
     vision_judge.coordinator = coordinator
+    # The learning job (`learning.py`): the store tells it whenever the training gallery changes,
+    # so a label never waits for -- or has to ask for -- a relearn.
+    learning = LearningManager(
+        hass,
+        entry.entry_id,
+        store,
+        engine,
+        retention_cutoff=coordinator.retention_cutoff,
+        refresh_snapshot=coordinator.async_refresh_identity_snapshot,
+    )
+    coordinator.learning = learning
+    store.set_learning_listener(learning.notify)
     if coral_recognizer is not None:
         # Wired post-construction -- same chicken-and-egg reason `ingestor.coordinator`/
-        # `vision_judge.coordinator` are: a batch of freshly backfilled centroids wants to
-        # reach production right away (`CoralRecognizer.async_backfill`'s own docstring), and
-        # that means calling back into the `IdentityEngine` this recognizer is itself part of.
-        coral_recognizer.on_progress = engine.async_rebuild
+        # `vision_judge.coordinator` are: a batch of freshly backfilled centroids marks the
+        # gallery changed (`CoralRecognizer.async_backfill`'s own docstring), and the learning
+        # job then rebuilds the models.
+        coral_recognizer.on_progress = store.async_touch_training_generation
     entry.runtime_data = coordinator
     await coordinator.async_setup_store()
     # Fills any blank cat coat description (Contract 3), as its own background task -- never
@@ -475,9 +488,10 @@ async def _async_finish_setup(
     coral_recognizer: CoralRecognizer | None,
 ) -> None:
     """Everything setup would otherwise wait for, as a task the entry owns, in this order: the
-    cat-recognition model, CoralHub's own start-up (a task of its own, started here, running
-    beside the poll), the first full poll (retried until the feeder answers), the entities that
-    need its answer, and the start-up work that needs a snapshot. Cancelled by
+    cat-recognition model, the learning job (it resumes any pass a restart interrupted),
+    CoralHub's own start-up (a task of its own, started here, running beside the poll), the
+    first full poll (retried until the feeder answers), the entities that need its answer, and
+    the start-up work that needs a snapshot. Cancelled by
     `async_unload_entry`, and by Home Assistant when it stops.
 
     The model comes first because the first poll schedules the first ingest, and a verdict is
@@ -492,10 +506,18 @@ async def _async_finish_setup(
             "Building Kibble's cat-recognition model failed; cats are not recognised until a "
             "later rebuild (any training change runs one) succeeds"
         )
+    if coordinator.learning is not None:
+        try:
+            await coordinator.learning.async_start()
+        except Exception:  # noqa: BLE001 -- labels are still saved without it
+            _LOGGER.exception(
+                "Starting Kibble's learning job failed; labels are still saved, but nothing "
+                "learns from them until the next restart"
+            )
     if coral_recognizer is not None:
         coordinator.coral_task = entry.async_create_background_task(
             hass,
-            _async_coral_startup(coordinator.engine, coral_recognizer),
+            _async_coral_startup(coordinator.engine, coordinator.store, coral_recognizer),
             name="kibble coral model rebuild and embedding backfill",
         )
     await coordinator.async_poll_until_first_data()
@@ -524,21 +546,27 @@ async def _async_finish_setup(
             _LOGGER.exception("A Kibble start-up sweep failed (%s)", sweep.__qualname__)
 
 
-async def _async_coral_startup(engine: IdentityEngine, recognizer: CoralRecognizer) -> None:
+async def _async_coral_startup(
+    engine: IdentityEngine, store: KibbleStore, recognizer: CoralRecognizer
+) -> None:
     """CoralHub's half of start-up, in a task of its own so that neither setup nor the first poll
     ever waits for it: the recognizer's health check and bounded embedding batch
     (`IdentityEngine.async_rebuild_coral`), then the unbounded embedding backfill
     (docs/41-coral-recognition.md), in the order setup always ran them. Until the rebuild
     succeeds -- or for as long as CoralHub is down -- the histogram recognizer answers, exactly
-    as it does for any CoralHub outage. Cancelled first thing on unload
+    as it does for any CoralHub outage; a rebuild that fails marks the gallery changed so the
+    learning job keeps retrying it with its backoff. Cancelled first thing on unload
     (`KibbleCoordinator.async_cancel_startup`), before the store it reads is closed."""
     try:
-        await engine.async_rebuild_coral()
-    except Exception:  # noqa: BLE001 -- the backfill below keeps its own retry loop going
+        error = await engine.async_rebuild_coral()
+    except Exception as err:  # noqa: BLE001 -- the backfill below keeps its own retry loop going
         _LOGGER.exception(
             "Building Kibble's CoralHub recognition model failed; the histogram recognizer "
             "stays in charge until a later rebuild succeeds"
         )
+        error = str(err) or type(err).__name__
+    if error is not None:
+        await store.async_touch_training_generation()
     await recognizer.async_backfill()
 
 
@@ -785,9 +813,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 translation_placeholders={"cat": target},
             )
         await coordinator.store.async_clear_training(target, keep_uploads=call.data[ATTR_KEEP_UPLOADS])
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-        await coordinator.async_refresh_identity_snapshot()
+        coordinator.async_schedule_identity_refresh()
 
     hass.services.async_register(DOMAIN, SERVICE_FEED, handle_feed, FEED_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_FEED, handle_cancel, CANCEL_SCHEMA)

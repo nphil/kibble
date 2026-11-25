@@ -27,25 +27,28 @@ an event's current samples, computed fresh on every read.
 
 from __future__ import annotations
 import json
+import logging
 import math
 import os
 import re
 import shutil
 import sqlite3
 import time
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import autolearn, coral_identity, crop_geometry, identity, sessions
+from . import autolearn, coral_identity, crop_geometry, identity, photo_queue, sessions
 from .const import DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-SCHEMA_VERSION = 10
+_LOGGER = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 11
 
 MEDIA_CAP_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB guard, docs/36-ai-pipeline.md
 MEDIA_CAP_TARGET_RATIO = 0.9  # purge down to 90% of the cap, not to the line
@@ -78,10 +81,14 @@ AVATAR_DIR = "avatars"
 HIDDEN_TIMELINE_KINDS = ("import",)
 LABEL_UNKNOWN = "unknown"
 # `samples.review` reserved values -- anything else stored there is a cat name. `LABEL_SKIP`
-# means "never trained, regardless of what the event says"; `LABEL_FOLLOW` is never actually
-# stored (a "follow" `kibble/sample/label` call clears the column back to `NULL`) -- it is the
-# WS-facing spelling for "no override" so the card never has to send a literal `null`.
+# ("Don't use this photo") means "never trained, regardless of what the visit says"; `LABEL_BOTH`
+# ("both cats are in this photo") is never trained either -- a crop of two animals teaches the
+# classifier nothing about either -- but does record that both cats were there; `LABEL_FOLLOW`
+# is never actually stored (a "follow" `kibble/sample/label` call clears the column back to
+# `NULL`) -- it is the WS-facing spelling for "no override" so the card never has to send a
+# literal `null`.
 LABEL_SKIP = "skip"
+LABEL_BOTH = "both"
 LABEL_FOLLOW = "follow"
 
 # Reclassification/thumb selection never trusts a sample whose per-sample guess is a
@@ -261,19 +268,28 @@ class TrainingCandidate:
     created: int
 
 
-def _nearest_distance_ranks(entries: Sequence[tuple[str, Any, str | None]]) -> dict[str, float]:
+def _nearest_distance_ranks(
+    entries: Sequence[tuple[str, Any, str | None]], only: Collection[str] | None = None
+) -> dict[str, float]:
     """Per-uid nearest-neighbour distance to every OTHER entry of the same mode in `entries`
     (`(uid, feature_vector_or_None, mode)` triples) -- smaller means more redundant.
     `float("inf")` for an entry with no comparable feature at all (nothing to judge redundancy
-    by, so it is never preferred for eviction on that basis)."""
-    out: dict[str, float] = {}
-    for uid, feat, mode in entries:
-        if feat is None:
-            out[uid] = float("inf")
+    by, so it is never preferred for eviction on that basis). `only` limits the ranking to
+    those uids -- each still measured against the whole pool, so its value is what a full
+    ranking would give -- because eviction only ever ranks its `auto` rows."""
+    wanted = None if only is None else frozenset(only)
+    out = {uid: float("inf") for uid, _, _ in entries if wanted is None or uid in wanted}
+    pools: dict[tuple[str | None, tuple[int, ...]], list[int]] = {}
+    for index, (_, feat, mode) in enumerate(entries):
+        if feat is not None:
+            pools.setdefault((mode, feat.shape), []).append(index)
+    for members in pools.values():
+        rows = [row for row, index in enumerate(members) if wanted is None or entries[index][0] in wanted]
+        if not rows:
             continue
-        pool = [f for u, f, m in entries if u != uid and f is not None and m == mode]
-        dist = identity.nearest_distance(feat, pool)
-        out[uid] = dist if dist is not None else float("inf")
+        distances = identity.nearest_other_distances([entries[index][1] for index in members], rows)
+        for row, distance in zip(rows, distances, strict=True):
+            out[entries[members[row]][0]] = distance
     return out
 
 
@@ -309,6 +325,36 @@ def _select_eviction_candidates(
         hard_excess = remaining - hard_cap
         evict_protected = sorted(protected, key=lambda c: c.created)[:hard_excess]
     return [c.uid for c in (*evict_auto, *evict_protected)]
+
+
+def _sample_training_target(
+    review: str | None, owner: sqlite3.Row, session: sqlite3.Row
+) -> str | None:
+    """What ONE photo should be trained as -- the single rule the training gallery follows
+    (docs/36-ai-pipeline.md, "What trains"): a cat name, `"not_a_cat"`, or `None` for "not in
+    the gallery". `owner` is the visit part the photo belongs to, `session` the top-level visit.
+
+    - "Can't tell" on the visit (`owner` reviewed as unknown) trains nothing, whatever any
+      single photo of it says -- the verdict is about the whole visit, so it wins.
+    - A photo answered "Don't use" or "Both in this photo" is never trained.
+    - A photo answered with a cat teaches that cat; answered "Not a cat" it teaches the
+      "not a cat" class, exactly as the whole-visit label always did.
+    - An unanswered photo follows its visit only when a person labelled the visit as a whole
+      (the legacy visit-level answer). In a photo-driven visit (`from_photos`) it is display
+      only: whoever answered a few photos did not vouch for the rest."""
+    if owner["reviewed"] and owner["identity_status"] == LABEL_UNKNOWN:
+        return None
+    if review in (LABEL_SKIP, LABEL_BOTH, LABEL_UNKNOWN):
+        return None
+    if review is not None:
+        return review
+    if session["from_photos"] or not owner["reviewed"]:
+        return None
+    if owner["identity_status"] == "reviewed" and owner["cat"]:
+        return owner["cat"]
+    if owner["identity_status"] == _NOT_A_CAT:
+        return _NOT_A_CAT
+    return None
 
 
 # --- Cursor encoding for timeline/review/training paging --------------------------------------
@@ -394,6 +440,11 @@ class _SyncStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)
         self.training_root.mkdir(parents=True, exist_ok=True)
+        # Set whenever the training gallery changes (`_bump_training_generation`); `KibbleStore`
+        # reads and clears it after every job so the learning job hears about it at once.
+        self._learning_dirty = False
+        self._media_bytes_cache: tuple[float, int] | None = None
+        self._review_gallery_cache: tuple[int, float, photo_queue.Gallery | None] | None = None
         self.conn = sqlite3.connect(root / "kibble.db", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -550,6 +601,33 @@ class _SyncStore:
                 PRIMARY KEY (row_kind, row_uid, crop_kind, model_id)
             );
             CREATE INDEX IF NOT EXISTS idx_coral_embeddings_row ON coral_embeddings(row_kind, row_uid);
+
+            -- Schema version 11 (docs/36-ai-pipeline.md, "Learning job"): the durable half of the
+            -- coalesced learning job. One row. `gen` rises by one inside the same transaction as
+            -- every change to the training gallery (`_upsert_training_row`, `_delete_training_row`);
+            -- `done_gen` is the `gen` the last finished learning pass covered, so `gen > done_gen`
+            -- survives a restart as "learning still owed". `answers`/`answers_done` count the
+            -- human answers that changed the gallery and the ones a finished pass has used (only
+            -- for the "N answers saved" figure). `last_result` is the last finished pass's summary
+            -- (JSON), `counts_done` the per-cat training counts it ended with (so the next pass can
+            -- say what was learned since), `last_error` the last failure text while it keeps
+            -- retrying.
+            CREATE TABLE IF NOT EXISTS learning(
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                gen INTEGER NOT NULL DEFAULT 0,
+                done_gen INTEGER NOT NULL DEFAULT 0,
+                answers INTEGER NOT NULL DEFAULT 0,
+                answers_done INTEGER NOT NULL DEFAULT 0,
+                last_result TEXT,
+                counts_done TEXT,
+                last_error TEXT
+            );
+            INSERT OR IGNORE INTO learning(id) VALUES (1);
+            -- Write-ahead intent for label writes: the visit whose training rows still have to be
+            -- reconciled with its photo answers. Inserted in the SAME transaction as the answer,
+            -- deleted once `reconcile_session_training` succeeded, so a crash between the two can
+            -- never leave a "Can't tell"/"Don't use" photo in the gallery.
+            CREATE TABLE IF NOT EXISTS learning_queue(session_uid TEXT PRIMARY KEY);
             """
         )
         # `feeds` predates `amount1`/`amount2`/`food1`/`food2`/`single` (schema version 1 --
@@ -642,6 +720,15 @@ class _SyncStore:
                 self.conn.execute(f"ALTER TABLE events ADD COLUMN {column} {decl}")
         if "description" not in cat_columns:
             self.conn.execute("ALTER TABLE cats ADD COLUMN description TEXT")
+        # `events` predates `from_photos`/`ate_confirmed` (schema version 11, one-photo review):
+        # `from_photos` marks a visit whose identity was DERIVED from per-photo answers, so photos
+        # nobody answered are display-only and never trained; `ate_confirmed` records that a human
+        # settled "who ate" for a multi-cat meal (`kibble/session/ate`).
+        for column, decl in (
+            ("from_photos", "INTEGER NOT NULL DEFAULT 0"), ("ate_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in event_columns:
+                self.conn.execute(f"ALTER TABLE events ADD COLUMN {column} {decl}")
         row = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         try:
             old_version = int(row["value"]) if row is not None else 0
@@ -756,13 +843,15 @@ class _SyncStore:
         """Removes one training row's files, cached Coral embeddings and DB row together --
         every full removal (eviction, `training_remove`, a label reverting a row to `skip`)
         goes through this one place so a future addition here never has to be remembered at
-        each call site separately. Never called when a row's files are merely MOVING to a
+        each call site separately -- and advances the learning generation, so the learning job
+        knows the model is out of date. Never called when a row's files are merely MOVING to a
         different cat's directory (`_upsert_training_row`'s own re-label path) -- that keeps
         the row and its cached embeddings, since an embedding is a property of the crop's own
         pixels, not of which cat it is currently labelled as."""
         self.delete_training_files(cat, uid)
         self.conn.execute("DELETE FROM coral_embeddings WHERE row_kind='training' AND row_uid=?", (uid,))
         self.conn.execute("DELETE FROM training WHERE uid=?", (uid,))
+        self._bump_training_generation()
 
     def _media_bytes_by_date(self) -> list[tuple[str, int]]:
         """`[(date, bytes)]` for every day directory under `media/`, oldest first."""
@@ -775,6 +864,17 @@ class _SyncStore:
             total = sum(f.stat().st_size for f in day_dir.glob("**/*") if f.is_file())
             out.append((day_dir.name, total))
         return out
+
+    def _media_used_bytes(self) -> int:
+        """Total bytes under `media/`, at most a minute old: stat-walking every file takes a
+        second or more on a full store, and the only reader (`kibble/cats`, every time the cats
+        screen opens) just shows the figure. Retention's own cap check does NOT use this."""
+        cached = self._media_bytes_cache
+        now = time.monotonic()
+        if cached is None or now - cached[0] > 60:
+            cached = (now, sum(size for _, size in self._media_bytes_by_date()))
+            self._media_bytes_cache = cached
+        return cached[1]
 
     # --- ingest: events/samples upserts ------------------------------------------------------
 
@@ -1103,6 +1203,7 @@ class _SyncStore:
             (sample_uid,),
         ).fetchone()
         return row["session_uid"] if row is not None else None
+
     def insert_sample(
         self,
         *,
@@ -1224,21 +1325,44 @@ class _SyncStore:
         confidence: float | None,
         per_sample_uids: Sequence[str],
         per_sample: Sequence[tuple[str | None, float | None]],
-    ) -> None:
+    ) -> bool:
         """Applies a fresh `Verdict` to an unreviewed event -- never called for a reviewed
-        one; see `store.py`'s callers."""
-        now = _now()
-        self.conn.execute(
-            "UPDATE events SET cat=?, identity_status=?, confidence=?, updated=? "
-            "WHERE uid=? AND reviewed=0",
-            (cat, identity_status, confidence, now, uid),
-        )
-        for sample_uid, (guess, guess_confidence) in zip(per_sample_uids, per_sample, strict=False):
+        one; see `store.py`'s callers. Writes only what actually differs: a relearn re-asks the
+        model about every unreviewed event and most answers do not change, so the unchanged
+        ones cost no write, no commit and no `updated` bump. Returns `True` when the event's
+        NAME changed (a new cat, or none) -- the number the learning summary reports."""
+        row = self.conn.execute(
+            "SELECT cat, identity_status, confidence, reviewed FROM events WHERE uid=?", (uid,)
+        ).fetchone()
+        if row is None:
+            return False
+        changed = renamed = False
+        if not row["reviewed"] and (row["cat"], row["identity_status"], row["confidence"]) != (
+            cat, identity_status, confidence
+        ):
             self.conn.execute(
-                "UPDATE samples SET guess=?, guess_confidence=? WHERE uid=?",
-                (guess, guess_confidence, sample_uid),
+                "UPDATE events SET cat=?, identity_status=?, confidence=?, updated=? "
+                "WHERE uid=? AND reviewed=0",
+                (cat, identity_status, confidence, _now(), uid),
             )
-        self.conn.commit()
+            changed = True
+            renamed = row["cat"] != cat
+        current = {
+            r["uid"]: (r["guess"], r["guess_confidence"])
+            for r in self.conn.execute(
+                "SELECT uid, guess, guess_confidence FROM samples WHERE event_uid=?", (uid,)
+            )
+        }
+        for sample_uid, (guess, guess_confidence) in zip(per_sample_uids, per_sample, strict=False):
+            if current.get(sample_uid) != (guess, guess_confidence):
+                self.conn.execute(
+                    "UPDATE samples SET guess=?, guess_confidence=? WHERE uid=?",
+                    (guess, guess_confidence, sample_uid),
+                )
+                changed = True
+        if changed:
+            self.conn.commit()
+        return renamed
 
     def upsert_feed(
         self,
@@ -1317,8 +1441,12 @@ class _SyncStore:
     # --- reclassification candidates --------------------------------------------------------
 
     def events_for_reclassify(self, cutoff: int) -> list[str]:
+        """The unreviewed TOP-LEVEL events inside retention. A split session's child parts are
+        left out on purpose: they are rebuilt from their parent, and re-planning from a child
+        sees a family of one, which un-splits the session -- the next pass would split it again
+        and every relearn would churn the same parts."""
         rows = self.conn.execute(
-            "SELECT uid FROM events WHERE reviewed=0 AND start>=?", (cutoff,)
+            "SELECT uid FROM events WHERE reviewed=0 AND parent_uid IS NULL AND start>=?", (cutoff,)
         ).fetchall()
         return [r["uid"] for r in rows]
 
@@ -1375,14 +1503,22 @@ class _SyncStore:
     def set_coral_embedding(
         self, row_kind: str, row_uid: str, crop_kind: str, model_id: str, embedding: bytes
     ) -> None:
+        self.set_coral_embeddings(row_kind, [(row_uid, crop_kind, model_id, embedding)])
+
+    def set_coral_embeddings(
+        self, row_kind: str, items: Sequence[tuple[str, str, str, bytes]]
+    ) -> None:
         """Idempotent: "each image is embedded exactly once" (docs/41-coral-recognition.md) --
         an embedding is a pure function of one crop's own bytes and the model that produced
         it, so a second write for the same key is always the identical vector and is silently
-        dropped rather than overwritten."""
-        self.conn.execute(
+        dropped rather than overwritten. `items` are `(row_uid, crop_kind, model_id,
+        embedding)`; a whole batch is ONE transaction, because each commit waits for the disk
+        and a batch used to cost one per vector."""
+        now = _now()
+        self.conn.executemany(
             "INSERT INTO coral_embeddings(row_kind, row_uid, crop_kind, model_id, embedding, created) "
             "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(row_kind, row_uid, crop_kind, model_id) DO NOTHING",
-            (row_kind, row_uid, crop_kind, model_id, embedding, _now()),
+            [(row_kind, uid, crop, model, blob, now) for uid, crop, model, blob in items],
         )
         self.conn.commit()
 
@@ -1599,7 +1735,7 @@ class _SyncStore:
 
     def _event_timeline_dict(self, row: sqlite3.Row) -> dict[str, Any] | None:
         """One `events` row -> a `TimelineEvent` dict, or `None` if a "visit" has no usable
-        thumb (it stays in the store for `kibble/review`, just never on the timeline)."""
+        thumb (it stays in the store for `kibble/review/photos`, just never on the timeline)."""
         candidates = self._thumb_candidates(row["uid"])
         thumb = pick_thumb(candidates)
         if row["kind"] == "visit" and thumb is None:
@@ -1754,6 +1890,7 @@ class _SyncStore:
             event["cat"] = None
             event["identity"] = "reviewed" if all(cat["confirmed"] for cat in cats) else "auto"
             event["confidence"] = None
+        event["needs_ate"] = self._needs_ate(session_row, children, cats)
         return {
             "event": event,
             "samples": samples,
@@ -1813,9 +1950,9 @@ class _SyncStore:
         subject_review: str | None,
         owner: sqlite3.Row | None,
     ) -> tuple[str | None, bool]:
-        if photo_review not in (None, LABEL_SKIP, LABEL_UNKNOWN):
+        if photo_review not in (None, LABEL_SKIP, LABEL_UNKNOWN, LABEL_BOTH):
             return photo_review, True
-        if subject_review not in (None, LABEL_SKIP, LABEL_UNKNOWN):
+        if subject_review not in (None, LABEL_SKIP, LABEL_UNKNOWN, LABEL_BOTH):
             return subject_review, True
         if owner is None:
             return None, False
@@ -1894,15 +2031,15 @@ class _SyncStore:
 
     def _sample_dict(self, uid: str) -> dict[str, Any]:
         """One sample's `kibble/event`/`kibble/sample/label` shape: `review` is the raw
-        column (`None` = follow, or `"skip"`/a cat name/`"not_a_cat"`); `label` is what it
-        actually, currently teaches -- `"skip"` for a skip override (never in `training` to
-        look up), else the `training` row's own cat if one exists, else `None` (nothing saved
-        yet, still just a `guess`)."""
+        column (`None` = follow, or `"skip"`/`"both"`/a cat name/`"not_a_cat"`); `label` is
+        what it actually, currently teaches -- `"skip"`/`"both"` for those answers (never in
+        `training` to look up), else the `training` row's own cat if one exists (`"not_a_cat"`
+        included), else `None` (nothing saved yet, still just a `guess`)."""
         r = self.conn.execute("SELECT * FROM samples WHERE uid=?", (uid,)).fetchone()
         owner = self.conn.execute("SELECT cat FROM events WHERE uid=?", (r["event_uid"],)).fetchone()
         review = r["review"]
-        if review == LABEL_SKIP:
-            label = LABEL_SKIP
+        if review in (LABEL_SKIP, LABEL_BOTH):
+            label = review
         else:
             training_row = self.conn.execute(
                 "SELECT cat FROM training WHERE uid=?", (f"{uid}-train",)
@@ -1966,8 +2103,16 @@ class _SyncStore:
         ).fetchall()
         return session_row, list(children)
 
-    def label_events(self, uids: Sequence[str], label: str) -> tuple[list[dict[str, Any]], bool]:
-        """Apply the existing timeline quick-pick to each whole session, collapsing its parts."""
+    def label_events(self, uids: Sequence[str], label: str) -> list[dict[str, Any]]:
+        """The whole-visit quick-pick (`kibble/label`): applies `label` to each whole visit,
+        collapsing its parts, and returns every visit's fresh `event`.
+
+        Idempotent: a visit that already carries exactly this verdict is left alone -- no
+        write, no learning -- so a retry after a lost response costs nothing. A real change is
+        durable on return (the visit's `learning_queue` row commits with it) and the training
+        gallery is reconciled to it here, or by the learning job if that fails: "Can't tell"
+        therefore empties the gallery of every photo of the visit (rows, files and cached
+        embeddings) instead of leaving them behind. Nothing here waits for a model rebuild."""
         if label not in (LABEL_UNKNOWN, _NOT_A_CAT):
             known = {row["name"] for row in self.conn.execute("SELECT name FROM cats")}
             if label not in known:
@@ -1979,14 +2124,21 @@ class _SyncStore:
             found = self._session_and_parts(uid)
             if found is not None and found[0]["uid"] not in session_uids:
                 session_uids.append(found[0]["uid"])
-        events: list[dict[str, Any]] = []
         touched_cats: set[str] = set()
+        changed: list[str] = []
+        generation = self._training_generation()
         now = _now()
         for session_uid in session_uids:
             found = self._session_and_parts(session_uid)
             if found is None:
                 continue
             parent, children = found
+            if (
+                not children and parent["reviewed"] and not parent["from_photos"]
+                and parent["identity_status"] == identity_status and parent["cat"] == cat
+            ):
+                continue
+            self._queue_reconcile(session_uid)
             for part in [parent, *children]:
                 if part["identity_status"] == "auto" and part["cat"]:
                     self._record_review_outcome(part["uid"], part["cat"], correct=part["cat"] == cat)
@@ -1998,14 +2150,20 @@ class _SyncStore:
                 identity=(cat, identity_status, None, 1),
                 kind="eat" if ate else "visit",
             )
-            self.conn.execute("UPDATE events SET updated=? WHERE uid=?", (now, session_uid))
-            detail = self.event_detail(session_uid)
-            if detail is not None:
-                events.append(detail["event"])
+            self.conn.execute("UPDATE events SET updated=?, from_photos=0 WHERE uid=?", (now, session_uid))
+            changed.append(session_uid)
         for touched in touched_cats:
             self._refresh_auto_learn_state(touched)
         self.conn.commit()
-        return events, label != LABEL_UNKNOWN and bool(events)
+        for session_uid in changed:
+            self._reconcile_now(session_uid)
+        self._count_answers(generation, len(changed))
+        events: list[dict[str, Any]] = []
+        for session_uid in session_uids:
+            detail = self.event_detail(session_uid)
+            if detail is not None:
+                events.append(detail["event"])
+        return events
 
     def set_session_cats(
         self, uid: str, cats: Sequence[tuple[str, bool]]
@@ -2028,6 +2186,17 @@ class _SyncStore:
         if found is None:
             return None
         parent, children = found
+        current = self._session_cats(parent, children)
+        if (
+            not parent["from_photos"]
+            and all(item["confirmed"] for item in current)
+            and sorted((item["cat"], item["ate"]) for item in current) == sorted(normalized)
+        ):
+            return self.event_detail(parent["uid"])
+        generation = self._training_generation()
+        self._queue_reconcile(parent["uid"])
+        self.conn.execute("UPDATE events SET from_photos=0, ate_confirmed=1 WHERE uid=?", (parent["uid"],))
+        self.conn.commit()
         if len(normalized) == 1:
             cat, ate = normalized[0]
             self._unsplit_session(
@@ -2038,6 +2207,8 @@ class _SyncStore:
             )
         else:
             self.replan_session(parent["uid"], {}, human_cats=normalized)
+        self._reconcile_now(parent["uid"])
+        self._count_answers(generation)
         return self.event_detail(parent["uid"])
 
     def set_session_subject(
@@ -2066,6 +2237,23 @@ class _SyncStore:
         if sample is None:
             raise ValueError(f"unknown subject: {sid}")
         if label == LABEL_FOLLOW:
+            pending = self.conn.execute(
+                f"SELECT COUNT(*) FROM samples WHERE event_uid IN ({placeholders}) "
+                "AND sid=? AND review_src='subject'",
+                (*family_uids, sid),
+            ).fetchone()[0]
+        else:
+            pending = self.conn.execute(
+                f"SELECT COUNT(*) FROM samples WHERE event_uid IN ({placeholders}) AND sid=? "
+                "AND (review IS NULL OR review_src='subject') "
+                "AND (review IS NOT ? OR review_src IS NOT 'subject')",
+                (*family_uids, sid, label),
+            ).fetchone()[0]
+        if not pending:
+            return self.event_detail(parent["uid"])
+        generation = self._training_generation()
+        self._queue_reconcile(parent["uid"])
+        if label == LABEL_FOLLOW:
             self.conn.execute(
                 f"UPDATE samples SET review=NULL, review_src=NULL WHERE event_uid IN ({placeholders}) "
                 "AND sid=? AND review_src='subject'",
@@ -2077,99 +2265,293 @@ class _SyncStore:
                 "AND sid=? AND (review IS NULL OR review_src='subject')",
                 (label, *family_uids, sid),
             )
-        human_cats = self._persisted_human_cats(parent, children)
-        if label not in (LABEL_FOLLOW, _NOT_A_CAT):
-            current = self._session_cats(parent, children)
-            if label not in {cat["cat"] for cat in current}:
-                human_cats = [(cat["cat"], cat["ate"]) for cat in current]
-                ate = parent["kind"] == "eat" or any(cat["ate"] for cat in current)
-                human_cats.append((label, ate))
-        self.replan_session(parent["uid"], scores, human_cats=human_cats)
+        self.conn.commit()
+        if self._is_explicit_visit(parent, children):
+            human_cats = self._persisted_human_cats(parent, children)
+            if label not in (LABEL_FOLLOW, _NOT_A_CAT):
+                current = self._session_cats(parent, children)
+                if label not in {cat["cat"] for cat in current}:
+                    human_cats = [(cat["cat"], cat["ate"]) for cat in current]
+                    ate = parent["kind"] == "eat" or any(cat["ate"] for cat in current)
+                    human_cats.append((label, ate))
+            self.replan_session(parent["uid"], scores, human_cats=human_cats)
+        else:
+            self._derive_visit_from_photos(parent, children, scores)
+        self._reconcile_now(parent["uid"])
+        self._count_answers(generation)
         return self.event_detail(parent["uid"])
 
-    def reconcile_session_training(self, uid: str) -> None:
+    # --- photo answers -> visit identity (docs/36-ai-pipeline.md, "One photo per screen") ---------
+
+    def _cat_names(self) -> list[str]:
+        return [row["name"] for row in self.conn.execute("SELECT name FROM cats ORDER BY color")]
+
+    def _is_explicit_visit(self, parent: sqlite3.Row, children: Sequence[sqlite3.Row]) -> bool:
+        """True for a visit a person labelled as a whole (the legacy `kibble/label` and
+        `kibble/session/label` answers): it keeps that label, and a photo answer can only add a
+        cat to it. Everything else -- unreviewed, photo-driven, or "Can't tell" -- gets its
+        identity from its photo answers (`_derive_visit_from_photos`)."""
+        if parent["from_photos"]:
+            return False
+        if self._persisted_human_cats(parent, children):
+            return True
+        return bool(parent["reviewed"]) and parent["identity_status"] == _NOT_A_CAT
+
+    def _apply_photo_answer(
+        self,
+        parent: sqlite3.Row,
+        children: Sequence[sqlite3.Row],
+        label: str,
+        scores: Mapping[int, sessions.IdentityScores] | None,
+    ) -> None:
+        if not self._is_explicit_visit(parent, children):
+            self._derive_visit_from_photos(parent, children, scores)
+            return
+        human_cats = self._persisted_human_cats(parent, children)
+        current = self._session_cats(parent, children)
+        present = {item["cat"] for item in current}
+        known = self._cat_names()
+        added = known if label == LABEL_BOTH else [label] if label in known else []
+        missing = [cat for cat in added if cat not in present]
+        if missing:
+            ate = parent["kind"] == "eat" or any(item["ate"] for item in current)
+            human_cats = [(item["cat"], item["ate"]) for item in current]
+            human_cats.extend((cat, ate) for cat in missing)
+        self.replan_session(parent["uid"], scores, human_cats=human_cats)
+
+    def _answered_samples(self, family_uids: Sequence[str]) -> list[sqlite3.Row]:
+        """The photos of one visit that carry an answer (from any source), in time order --
+        what a photo-driven visit's identity is derived from."""
+        placeholders = ",".join("?" for _ in family_uids)
+        return self.conn.execute(
+            f"SELECT uid, t, sid, review, review_src FROM samples "
+            f"WHERE event_uid IN ({placeholders}) AND review IS NOT NULL ORDER BY t, uid",
+            list(family_uids),
+        ).fetchall()
+
+    def _derive_visit_from_photos(
+        self,
+        parent: sqlite3.Row,
+        children: Sequence[sqlite3.Row],
+        scores: Mapping[int, sessions.IdentityScores] | None,
+    ) -> None:
+        """Sets a visit's identity from ALL its photo answers -- nobody is ever asked about the
+        visit itself. The cats are the ones named by at least one photo (`"both"` names every
+        enrolled cat), the visit is `not_a_cat` when photos were answered but none names a cat
+        and one says so, and "can't tell" when only "Don't use" answers exist. Undoing every
+        answer hands the visit back to the engine (`reviewed=0`)."""
+        family_uids = [parent["uid"], *(child["uid"] for child in children)]
+        answers = self._answered_samples(family_uids)
+        enrolled = self._cat_names()
+        named: list[str] = []
+        not_a_cat = False
+        for answer in answers:
+            review = answer["review"]
+            if review == LABEL_BOTH:
+                named.extend(cat for cat in enrolled if cat not in named)
+            elif review == _NOT_A_CAT:
+                not_a_cat = True
+            elif review in enrolled and review not in named:
+                named.append(review)
+        eat_visit = parent["kind"] == "eat" or any(child["kind"] == "eat" for child in children)
+        kind = "eat" if eat_visit else "visit"
+        if not answers:
+            if parent["from_photos"]:
+                self.conn.execute(
+                    "UPDATE events SET from_photos=0, ate_confirmed=0 WHERE uid=?", (parent["uid"],)
+                )
+                self._unsplit_session(
+                    parent, children, identity=(None, LABEL_UNKNOWN, None, 0), kind=kind
+                )
+            return
+        self.conn.execute("UPDATE events SET from_photos=1 WHERE uid=?", (parent["uid"],))
+        if named:
+            flags = self._derived_ate_flags(parent, children, named, answers, eat_visit)
+            self.replan_session(parent["uid"], scores, human_cats=flags)
+            return
+        status = _NOT_A_CAT if not_a_cat else LABEL_UNKNOWN
+        self._unsplit_session(parent, children, identity=(None, status, None, 1), kind=kind)
+
+    def _derived_ate_flags(
+        self,
+        parent: sqlite3.Row,
+        children: Sequence[sqlite3.Row],
+        named: Sequence[str],
+        answers: Sequence[sqlite3.Row],
+        eat_visit: bool,
+    ) -> list[tuple[str, bool]]:
+        """Who ate, for a photo-driven visit: one cat, or a person's own "who ate" answer, keeps
+        what the visit already says; with two cats the feeder's per-subject data decides when it
+        can (`_feeder_ate`); failing both, what the visit said before, else "everyone ate"."""
+        persisted = {child["cat"]: child["kind"] == "eat" for child in children if child["cat"]}
+        if len(named) > 1 and not parent["ate_confirmed"]:
+            fed = self._feeder_ate(parent, named, answers)
+            if fed is not None:
+                return [(cat, fed[cat]) for cat in named]
+        return [(cat, persisted.get(cat, eat_visit)) for cat in named]
+
+    def _feeder_ate(
+        self, parent: sqlite3.Row, named: Sequence[str], answers: Sequence[sqlite3.Row]
+    ) -> dict[str, bool] | None:
+        """Which of `named` ate according to the feeder's own per-animal data, or `None` when it
+        cannot say. Each cat's animals are the subjects (`sid`) of the photos answered as that
+        cat; an animal ate when the feeder saw it at the bowl. Decided only when every cat has
+        at least one animal with data and at least one of them ate -- a visit where the data
+        says nobody ate is exactly the case worth one question."""
+        spans = self._subject_spans(parent)
+        if not spans:
+            return None
+        subjects: dict[str, set[int]] = {cat: set() for cat in named}
+        for answer in answers:
+            review = answer["review"]
+            if review in subjects and answer["sid"] is not None:
+                subjects[review].add(answer["sid"])
+        verdict: dict[str, bool] = {}
+        for cat, sids in subjects.items():
+            known = [spans[sid] for sid in sids if sid in spans]
+            if not known:
+                return None
+            verdict[cat] = any(span.eat_start is not None for span in known)
+        return verdict if any(verdict.values()) else None
+
+    def _needs_ate(
+        self, parent: sqlite3.Row, children: Sequence[sqlite3.Row], cats: Sequence[dict[str, Any]]
+    ) -> bool:
+        """True when a photo-driven visit names two cats, a meal happened, and neither the
+        feeder's data nor a person has said which of them ate -- the one thing the card may
+        still ask, as a single extra screen (`set_session_ate`)."""
+        if not parent["from_photos"] or parent["ate_confirmed"] or len(cats) < 2:
+            return False
+        if not any(cat["ate"] for cat in cats):
+            return False
+        answers = self._answered_samples(self._family_uids(parent["uid"]))
+        return self._feeder_ate(parent, [cat["cat"] for cat in cats], answers) is None
+
+    def _visit_summary(self, parent: sqlite3.Row, children: Sequence[sqlite3.Row]) -> dict[str, Any]:
+        """The visit's identity as the photo screen shows it after an answer."""
+        cats = self._session_cats(parent, children)
+        kind = "eat" if parent["kind"] == "eat" or any(cat["ate"] for cat in cats) else parent["kind"]
+        return {
+            "uid": parent["uid"],
+            "kind": kind,
+            "cats": [{"cat": cat["cat"], "ate": cat["ate"]} for cat in cats],
+            "needs_ate": self._needs_ate(parent, children, cats),
+        }
+
+    def _label_sample_result(self, sample_uid: str) -> dict[str, Any]:
+        sample = self._sample_dict(sample_uid)
+        owner = self.conn.execute("SELECT event_uid FROM samples WHERE uid=?", (sample_uid,)).fetchone()
+        found = self._session_and_parts(owner["event_uid"])
+        return {"sample": sample, "visit": self._visit_summary(*found) if found is not None else None}
+
+    def set_session_ate(self, uid: str, ate_cats: Sequence[str]) -> dict[str, Any] | None:
+        """Records WHO ATE for a visit that names two cats and a meal -- the one thing the feeder
+        could not tell (`needs_ate`). `None` for an unknown visit; `ValueError` for an empty
+        list, a duplicate, or a cat the visit does not name. Idempotent. Never trains anything:
+        who ate says nothing about what a cat looks like."""
+        if not ate_cats:
+            raise ValueError("at least one cat must have eaten")
+        if len(set(ate_cats)) != len(ate_cats):
+            raise ValueError("duplicate cat")
         found = self._session_and_parts(uid)
         if found is None:
-            return
+            return None
         parent, children = found
-        family_uids = [parent["uid"], *(child["uid"] for child in children)]
-        placeholders = ",".join("?" for _ in family_uids)
+        cats = self._session_cats(parent, children)
+        names = [cat["cat"] for cat in cats]
+        for cat in ate_cats:
+            if cat not in names:
+                raise ValueError(f"not in this visit: {cat}")
+        if parent["ate_confirmed"] and all(cat["ate"] == (cat["cat"] in ate_cats) for cat in cats):
+            return {"visit": self._visit_summary(parent, children)}
+        self._queue_reconcile(parent["uid"])
+        self.conn.execute("UPDATE events SET ate_confirmed=1 WHERE uid=?", (parent["uid"],))
+        self.conn.commit()
+        flags = [(name, name in ate_cats) for name in names]
+        if len(flags) == 1:
+            cat, ate = flags[0]
+            self._unsplit_session(
+                parent, children, identity=(cat, "reviewed", None, 1), kind="eat" if ate else "visit"
+            )
+        else:
+            self.replan_session(parent["uid"], {}, human_cats=flags)
+        self._reconcile_now(parent["uid"])
+        found = self._session_and_parts(uid)
+        assert found is not None
+        return {"visit": self._visit_summary(*found)}
+
+    # --- the write-ahead queue behind every label (docs/36-ai-pipeline.md, "Learning") ------------
+
+    def _queue_reconcile(self, session_uid: str) -> None:
+        """Records that this visit's training photos must be reconciled with its answers. Called
+        BEFORE the answer is committed, so the intent and the answer reach the disk together;
+        `reconcile_session_training` deletes the row once the gallery matches."""
+        self.conn.execute("INSERT OR IGNORE INTO learning_queue(session_uid) VALUES (?)", (session_uid,))
+
+    def _reconcile_now(self, session_uid: str) -> None:
+        """The inline half of a label write: brings the visit's training photos in line right
+        away, so "Can't tell" and "Don't use" take effect at once. Failing is survivable -- the
+        answer is already saved and the visit is still queued, so the learning job reconciles it
+        on its next pass -- and must never fail the label itself."""
+        try:
+            self.reconcile_session_training(session_uid)
+        except Exception:  # noqa: BLE001 -- the answer is saved; the learning job finishes this
+            self.conn.rollback()
+            self._learning_dirty = True  # wakes the learning job, which reconciles the queue
+            _LOGGER.exception(
+                "Reconciling the training photos of visit %s failed; the learning job will retry", session_uid
+            )
+
+    def reconcile_session_training(self, uid: str) -> bool:
+        """Makes the training gallery match one visit's current answers, photo by photo
+        (`_sample_training_target`): rows are added, moved to another cat, or removed together
+        with their files and cached embeddings. Idempotent, and cheap when nothing differs.
+        Returns whether the gallery changed; deletes the visit's `learning_queue` row last."""
+        found = self._session_and_parts(uid)
+        if found is None:
+            self.conn.execute("DELETE FROM learning_queue WHERE session_uid=?", (uid,))
+            self.conn.commit()
+            return False
+        parent, children = found
+        owners = {part["uid"]: part for part in (parent, *children)}
+        placeholders = ",".join("?" for _ in owners)
         rows = self.conn.execute(
             f"SELECT uid, event_uid, review, body, face, face_emb, body_feat, face_feat, mode "
             f"FROM samples WHERE event_uid IN ({placeholders})",
-            family_uids,
+            list(owners),
         ).fetchall()
-        touched_cats: set[str] = set()
+        changed = False
         for sample in rows:
-            review = sample["review"]
-            if review in (LABEL_SKIP, LABEL_UNKNOWN, _NOT_A_CAT):
-                target = None
-            elif review is not None:
-                target = review
-            else:
-                target = self._event_training_target(sample["event_uid"])
-            self._reconcile_sample_training(sample, target)
-            if target is not None:
-                touched_cats.add(target)
-        for cat in touched_cats:
-            self._enforce_training_cap(cat)
+            target = _sample_training_target(sample["review"], owners[sample["event_uid"]], parent)
+            if self._reconcile_sample_training(sample, target):
+                changed = True
+        self.conn.execute("DELETE FROM learning_queue WHERE session_uid IN (?, ?)", (uid, parent["uid"]))
         self.conn.commit()
+        return changed
 
-    def reconcile_event_training(self, uids: Sequence[str], label: str) -> None:
-        """The slow half of a cat/`not_a_cat` `kibble/label` (never called for `unknown`,
-        which never touches training at all): for every sample of every given event,
-        reconciles its training row to that sample's own effective target. `review IS NULL`
-        ("follow") takes `label`; `review == "skip"` removes any existing row; anything else
-        is a per-photo override that already reflects itself in `training` and is left
-        exactly alone -- relabelling the event around it must never move or drop it
-        (`kibble/sample/label` is the only thing that changes an override)."""
-        touched_cats: set[str] = set()
-        for event_uid in uids:
-            rows = self.conn.execute(
-                "SELECT uid, review, body, face, face_emb, body_feat, face_feat, mode "
-                "FROM samples WHERE event_uid=?",
-                (event_uid,),
-            ).fetchall()
-            for r in rows:
-                if r["review"] is None:
-                    self._reconcile_sample_training(r, label)
-                    touched_cats.add(label)
-                elif r["review"] == LABEL_SKIP:
-                    self._reconcile_sample_training(r, None)
-        for cat in touched_cats:
-            self._enforce_training_cap(cat)
-        self.conn.commit()
+    def reconcile_queued_sessions(self) -> int:
+        """Finishes every reconcile a label left undone (a crash, or `_reconcile_now` failing);
+        the first thing each learning pass does. Returns how many visits were queued."""
+        queued = [row["session_uid"] for row in self.conn.execute("SELECT session_uid FROM learning_queue")]
+        for session_uid in queued:
+            self.reconcile_session_training(session_uid)
+        return len(queued)
 
-    def _reconcile_sample_training(self, sample_row: sqlite3.Row, target: str | None) -> None:
+    def _reconcile_sample_training(self, sample_row: sqlite3.Row, target: str | None) -> bool:
         """Makes one sample's training row match `target`: `None` means "not trained"
         (removes an existing row and its files; a no-op if there wasn't one); any other value
         upserts it via `_upsert_training_row`, moving the files if it was previously trained
-        as a different cat."""
+        as a different cat. Returns whether the gallery changed."""
         training_uid = f"{sample_row['uid']}-train"
         if target is None:
             existing = self.conn.execute(
                 "SELECT cat FROM training WHERE uid=?", (training_uid,)
             ).fetchone()
-            if existing is not None:
-                self._delete_training_row(training_uid, existing["cat"])
-            return
-        self._upsert_training_row(target, sample_row)
-
-    def _event_training_target(self, event_uid: str) -> str | None:
-        """What a "follow" sample of `event_uid` should train as: the event's own
-        cat/`not_a_cat`, but only once a human has actually reviewed it (`reviewed=1` -- an
-        auto-classified guess nobody confirmed is not something to train from). `None`
-        otherwise, including a human "Can't tell"."""
-        row = self.conn.execute(
-            "SELECT cat, identity_status, reviewed FROM events WHERE uid=?", (event_uid,)
-        ).fetchone()
-        if row is None or not row["reviewed"]:
-            return None
-        if row["identity_status"] == "reviewed" and row["cat"]:
-            return row["cat"]
-        if row["identity_status"] == _NOT_A_CAT:
-            return _NOT_A_CAT
-        return None
+            if existing is None:
+                return False
+            self._delete_training_row(training_uid, existing["cat"])
+            return True
+        return self._upsert_training_row(target, sample_row)
 
     # --- session splitting (docs/36-ai-pipeline.md): one device track, more than one cat -----
 
@@ -2551,63 +2933,76 @@ class _SyncStore:
         label: str,
         scores: Mapping[int, sessions.IdentityScores] | None = None,
     ) -> dict[str, Any] | None:
-        """Save one photo's review, then re-plan its owning session."""
+        """Saves one photo's answer -- the unit of review (docs/36-ai-pipeline.md, "One photo per
+        screen") -- and returns `{"sample", "visit"}`: the photo as it now stands and what the
+        visit's identity became because of it. `None` for an unknown photo.
+
+        `label` is a cat name, `"both"` (two cats in this one crop: only with exactly two cats
+        enrolled; never trained, both are recorded as present), `"not_a_cat"`, `"skip"` ("Don't
+        use": never trained) or `"follow"` (undo: back to no answer).
+
+        The answer is durable before anything else happens (the visit's `learning_queue` row
+        commits with it); the visit's identity and the training gallery are then brought in line
+        straight away, and the model itself relearns later, in the learning job. Idempotent:
+        saying what the photo already says writes nothing and wakes nothing."""
         row = self.conn.execute(
-            "SELECT uid, event_uid, review, guess, body, face, face_emb, body_feat, face_feat, mode "
-            "FROM samples WHERE uid=?",
-            (sample_uid,),
+            "SELECT uid, event_uid, review, guess FROM samples WHERE uid=?", (sample_uid,)
         ).fetchone()
         if row is None:
             return None
-        if label not in (LABEL_FOLLOW, _NOT_A_CAT, LABEL_SKIP):
-            known = {record["name"] for record in self.conn.execute("SELECT name FROM cats")}
-            if label not in known:
-                raise ValueError(f"unknown cat: {label}")
+        known = self._cat_names()
+        if label == LABEL_BOTH:
+            if len(known) != 2:
+                raise ValueError("'both' needs exactly two cats enrolled")
+        elif label not in (LABEL_FOLLOW, _NOT_A_CAT, LABEL_SKIP) and label not in known:
+            raise ValueError(f"unknown cat: {label}")
         review = None if label == LABEL_FOLLOW else label
-        self.conn.execute(
-            "UPDATE samples SET review=?, review_src='photo' WHERE uid=?", (review, sample_uid)
-        )
+        if row["review"] == review:
+            return self._label_sample_result(sample_uid)
+        generation = self._training_generation()
         found = self._session_and_parts(row["event_uid"])
+        self.conn.execute(
+            "UPDATE samples SET review=?, review_src=? WHERE uid=?",
+            (review, None if review is None else "photo", sample_uid),
+        )
+        if found is not None:
+            self._queue_reconcile(found[0]["uid"])
+        self.conn.commit()
         if found is not None:
             parent, children = found
-            human_cats = self._persisted_human_cats(parent, children)
-            if label not in (LABEL_FOLLOW, _NOT_A_CAT, LABEL_SKIP):
-                current_cats = self._session_cats(parent, children)
-                if label not in {cat["cat"] for cat in current_cats}:
-                    human_cats = [(cat["cat"], cat["ate"]) for cat in current_cats]
-                    ate = parent["kind"] == "eat" or any(cat["ate"] for cat in current_cats)
-                    human_cats.append((label, ate))
-            self.replan_session(parent["uid"], scores, human_cats=human_cats)
-        current = self.conn.execute(
-            "SELECT uid, event_uid, review, guess, body, face, face_emb, body_feat, face_feat, mode "
-            "FROM samples WHERE uid=?",
-            (sample_uid,),
-        ).fetchone()
-        if label in (LABEL_FOLLOW, _NOT_A_CAT, LABEL_SKIP):
-            target = None if label != LABEL_FOLLOW else self._event_training_target(current["event_uid"])
-        else:
-            target = label
-        self._reconcile_sample_training(current, target)
-        if target is not None:
-            self._enforce_training_cap(target)
-        if row["guess"] and row["guess"] != _NOT_A_CAT and label not in (LABEL_FOLLOW, LABEL_SKIP):
+            self._apply_photo_answer(parent, children, label, scores)
+            self._reconcile_now(parent["uid"])
+        if row["guess"] and row["guess"] != _NOT_A_CAT and label not in (LABEL_FOLLOW, LABEL_SKIP, LABEL_BOTH):
             self._record_review_outcome(sample_uid, row["guess"], correct=row["guess"] == label)
             self._refresh_auto_learn_state(row["guess"])
-        self.conn.commit()
-        return self._sample_dict(sample_uid)
+        self._count_answers(generation)
+        return self._label_sample_result(sample_uid)
+
     def _upsert_training_row(
         self, cat: str, sample_row: sqlite3.Row, *, source: str = "label", confidence: float | None = None
-    ) -> None:
-        """Upserts one sample's training row under `training_uid = f"{sample_row['uid']}-train"`.
-        `source`/`confidence` default to the original human-review path (`"label"`, no
-        confidence); `add_upload_training`/`add_auto_training` pass their own. The `ON CONFLICT`
-        branch also updates `source`/`confidence` -- a human re-labelling a sample that was
-        previously `upload`/`auto`-sourced promotes it to `"label"` (protected, per
-        `_select_eviction_candidates`'s design note), never leaves it at its prior source."""
+    ) -> bool:
+        """Upserts one sample's training row under `training_uid = f"{sample_row['uid']}-train"`;
+        `True` when the gallery actually changed (a row appeared, moved to another cat, or had
+        its files rewritten), `False` when it was already there as asked. `source`/`confidence`
+        default to the original human-review path (`"label"`, no confidence);
+        `add_upload_training`/`add_auto_training` pass their own.
+
+        Idempotent: a row that already carries this cat and still has its files is only
+        touched when its source differs -- a human answering a photo that was `auto`-learned
+        promotes it to `"label"` (protected, per `_select_eviction_candidates`'s design note) --
+        and never has its files rewritten or the learning generation advanced. Re-saving the
+        same answer must not look like a change to the learning job."""
         training_uid = f"{sample_row['uid']}-train"
         existing = self.conn.execute(
-            "SELECT cat FROM training WHERE uid=?", (training_uid,)
+            "SELECT cat, source, confidence, body, face FROM training WHERE uid=?", (training_uid,)
         ).fetchone()
+        if existing is not None and existing["cat"] == cat and self._training_files_present(existing):
+            if existing["source"] != source or existing["confidence"] != confidence:
+                self.conn.execute(
+                    "UPDATE training SET source=?, confidence=?, created=? WHERE uid=?",
+                    (source, confidence, _now(), training_uid),
+                )
+            return False
         if existing is not None and existing["cat"] != cat:
             self.delete_training_files(existing["cat"], training_uid)
         body_asset = None
@@ -2635,6 +3030,11 @@ class _SyncStore:
                 confidence,
             ),
         )
+        self._bump_training_generation()
+        return True
+
+    def _training_files_present(self, training_row: sqlite3.Row) -> bool:
+        return all((self.root / rel).exists() for rel in (training_row["body"], training_row["face"]) if rel)
 
     def _read_media(self, asset_id: str) -> bytes | None:
         try:
@@ -2644,22 +3044,31 @@ class _SyncStore:
 
     def _enforce_training_cap(self, cat: str) -> None:
         rows = self.conn.execute(
-            "SELECT uid, source, confidence, created, body_feat, face_feat, mode "
-            "FROM training WHERE cat=? ORDER BY created ASC",
+            "SELECT uid, source, confidence, created FROM training WHERE cat=? ORDER BY created ASC",
             (cat,),
         ).fetchall()
         if len(rows) <= TRAINING_CAP_PER_CAT:
             return
-        redundancy = _nearest_distance_ranks(
-            [
-                (r["uid"], identity.unpack(r["body_feat"]) if r["body_feat"] is not None else identity.unpack(r["face_feat"]), r["mode"])
-                for r in rows
-            ]
-        )
         candidates = [
             TrainingCandidate(uid=r["uid"], source=r["source"], confidence=r["confidence"], created=r["created"])
             for r in rows
         ]
+        auto_uids = [c.uid for c in candidates if c.source not in _PROTECTED_TRAINING_SOURCES]
+        if not auto_uids and len(candidates) <= TRAINING_HARD_CAP_PER_CAT:
+            return  # only protected rows are over the soft cap, and those go only past the hard cap
+        redundancy: dict[str, float] = {}
+        if auto_uids:
+            # Only the auto rows are ranked (most redundant first), each against the whole pool.
+            redundancy = _nearest_distance_ranks(
+                [
+                    (r["uid"], identity.unpack(r["body_feat"]) if r["body_feat"] is not None else identity.unpack(r["face_feat"]), r["mode"])
+                    for r in self.conn.execute(
+                        "SELECT uid, body_feat, face_feat, mode FROM training WHERE cat=? ORDER BY created ASC",
+                        (cat,),
+                    )
+                ],
+                only=auto_uids,
+            )
         for uid in _select_eviction_candidates(candidates, redundancy, TRAINING_CAP_PER_CAT, TRAINING_HARD_CAP_PER_CAT):
             self._delete_training_row(uid, cat)
 
@@ -2683,16 +3092,14 @@ class _SyncStore:
         combined -- see `TRAINING_CAP_TOTAL_BYTES`'s comment. Redundancy is still ranked within
         each cat's own same-mode pool: a different cat's appearance descriptors are never
         expected to be close, and the classifier never compares across cats either."""
-        rows = self.conn.execute(
-            "SELECT uid, cat, source, confidence, created, body_feat, face_feat, mode FROM training "
-            "ORDER BY created ASC"
-        ).fetchall()
-        if not rows:
-            return
         sizes = self._training_file_bytes()
         total = sum(sizes.values())
         if total <= TRAINING_CAP_TOTAL_BYTES:
             return
+        rows = self.conn.execute(
+            "SELECT uid, cat, source, confidence, created, body_feat, face_feat, mode FROM training "
+            "ORDER BY created ASC"
+        ).fetchall()
         by_cat: dict[str, list[sqlite3.Row]] = {}
         for r in rows:
             by_cat.setdefault(r["cat"], []).append(r)
@@ -2752,32 +3159,41 @@ class _SyncStore:
             ),
         )
 
-    # --- kibble/review -----------------------------------------------------------------------
+    # --- kibble/review/photos ------------------------------------------------------------------
 
-    def review_page(self, *, limit: int, cursor: str | None, retention_cutoff: int) -> dict[str, Any]:
-        bound = _decode_cursor(cursor) if cursor else None
-        rows = self._page_rows(
-            "events", "start", "identity_status='unknown' AND reviewed=0 AND hidden=0 AND start>=?",
-            (retention_cutoff,), bound, limit + 1,
+    def _review_gallery(self) -> photo_queue.Gallery | None:
+        """The training gallery's Coral centroids that rank which photos look new. Rebuilt when
+        the gallery changed, and every few minutes regardless: embeddings are cached after
+        the fact (Coral catches up) without the gallery's generation moving."""
+        generation = self._training_generation()
+        now = time.monotonic()
+        cached = self._review_gallery_cache
+        if cached is None or cached[0] != generation or now - cached[1] > 300:
+            cached = (generation, now, photo_queue.load_gallery(self.conn))
+            self._review_gallery_cache = cached
+        return cached[2]
+
+    def review_photos_page(self, *, limit: int, cursor: str | None, retention_cutoff: int) -> dict[str, Any]:
+        """One page of the photo review queue (`photo_queue.photo_page` picks the photos); read-only,
+        and independent of any learning pass -- it reads stored answers and cached embeddings,
+        never the model."""
+        page = photo_queue.photo_page(
+            self.conn, cutoff=retention_cutoff, cursor=cursor, limit=limit, gallery=self._review_gallery()
         )
-        has_more = len(rows) > limit
-        page_rows = rows[:limit]
-        items = []
-        for r in page_rows:
-            candidates = self._thumb_candidates(r["uid"])
-            items.append(
-                self._bare_event_fields(r)
-                | {
-                    "thumb": _asset(self.entry_id, thumb_asset_id(review_thumb(candidates))),
-                    "sample_count": len(candidates),
-                }
-            )
-        total = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM events WHERE identity_status='unknown' AND reviewed=0 AND hidden=0 AND start>=?",
-            (retention_cutoff,),
-        ).fetchone()["n"]
-        cursor_out = _encode_cursor(page_rows[-1]["start"], page_rows[-1]["uid"]) if has_more and page_rows else None
-        return {"items": items, "total": total, "cursor": cursor_out, "has_more": has_more}
+        items: list[dict[str, Any]] = []
+        for visit in page.visits:
+            visit_dict = {
+                "uid": visit.uid, "start": visit.start, "kind": visit.kind,
+                "scene": _asset(self.entry_id, visit.scene),
+            }
+            for pick in visit.picks:
+                items.append(
+                    {"sample": self._sample_dict(pick.uid), "visit": visit_dict | {"in_scene": pick.in_scene}}
+                )
+        return {
+            "items": items, "remaining": page.remaining, "visits": page.total_visits,
+            "cursor": page.cursor, "has_more": page.has_more,
+        }
 
     # --- kibble/cats ---------------------------------------------------------------------------
 
@@ -2846,6 +3262,26 @@ class _SyncStore:
         asset, custom, _updated = self._avatar_state(cat)
         return {"avatar": asset, "custom": custom}
 
+    def cats_overview(self, retention_days: int) -> dict[str, Any]:
+        """Everything `kibble/cats` reads from the store, in ONE store job instead of one per
+        cat per fact -- so the page costs the store thread a single short turn however long the
+        learning job's own queue is."""
+        cats = []
+        for row in self.cats():
+            name = row["name"]
+            asset, custom, _updated = self._avatar_state(name)
+            cats.append(
+                {
+                    "name": name,
+                    "color": row["color"],
+                    "avatar": asset,
+                    "avatar_custom": custom,
+                    "learning_paused": self.auto_learn_paused(name),
+                    "training": self.training_counts(name),
+                }
+            )
+        return {"cats": cats, "storage": self.storage_summary(retention_days)}
+
     def set_cat_avatar(self, cat: str, data: bytes) -> dict[str, str] | None:
         """Writes already-processed JPEG bytes (`media_processing.process_upload_image`'s
         output) as `cat`'s custom avatar: a dedicated file under `avatars/`, never a reference
@@ -2909,6 +3345,7 @@ class _SyncStore:
             """,
             (uid, cat, _now(), body_asset, identity.pack(features.body_feat), features.mode),
         )
+        self._bump_training_generation()
         self._enforce_training_cap(cat)
         self._enforce_total_training_cap()
         self.conn.commit()
@@ -2924,16 +3361,31 @@ class _SyncStore:
         if self.conn.execute("SELECT 1 FROM training WHERE uid=?", (training_uid,)).fetchone() is not None:
             return False
         row = self.conn.execute(
-            "SELECT uid, body, face, face_emb, body_feat, face_feat, mode FROM samples WHERE uid=?",
+            "SELECT uid, event_uid, review, body, face, face_emb, body_feat, face_feat, mode FROM samples WHERE uid=?",
             (sample_uid,),
         ).fetchone()
-        if row is None:
+        if row is None or self._withheld_from_training(row):
             return False
         self._upsert_training_row(cat, row, source="auto", confidence=confidence)
         self._enforce_training_cap(cat)
         self._enforce_total_training_cap()
         self.conn.commit()
         return True
+
+    def _withheld_from_training(self, sample_row: sqlite3.Row) -> bool:
+        """True for a photo a person said not to learn from: its own answer is "Don't use",
+        "Both", "Not a cat" or the legacy "Can't tell", or its visit was reviewed as "Can't
+        tell". Auto-learn (`add_auto_training`) must never put such a photo (back) into the
+        gallery -- the person's answer outranks any later confident guess."""
+        if sample_row["review"] in (LABEL_SKIP, LABEL_BOTH, LABEL_UNKNOWN, _NOT_A_CAT):
+            return True
+        owner = self.conn.execute("SELECT * FROM events WHERE uid=?", (sample_row["event_uid"],)).fetchone()
+        if owner is None:
+            return False
+        return any(
+            part["reviewed"] and part["identity_status"] == LABEL_UNKNOWN
+            for part in (owner, self._session_row(owner))
+        )
 
     def _training_row_dict(self, uid: str) -> dict[str, Any] | None:
         r = self.conn.execute(
@@ -3046,6 +3498,7 @@ class _SyncStore:
                 f"DELETE FROM coral_embeddings WHERE row_kind='training' AND row_uid IN ({placeholders})", uids
             )
             self.conn.execute(f"DELETE FROM training WHERE uid IN ({placeholders})", uids)
+            self._bump_training_generation()
             self.conn.commit()
         return len(rows)
 
@@ -3096,11 +3549,97 @@ class _SyncStore:
         self.conn.commit()
         return removed
 
+    # --- learning job state (docs/36-ai-pipeline.md, "Learning") -----------------------------------
+
+    def _training_generation(self) -> int:
+        return self.conn.execute("SELECT gen FROM learning WHERE id=1").fetchone()["gen"]
+
+    def _bump_training_generation(self) -> None:
+        """Called inside the same transaction as EVERY change to the training gallery. `gen` is
+        what the learning job compares with the generation its last pass covered (`done_gen`), so
+        "the model is out of date" survives a restart, and no caller has to remember to tell
+        anyone: `KibbleStore` reports the change after the job ends (`take_learning_mark`)."""
+        self.conn.execute("UPDATE learning SET gen = gen + 1 WHERE id = 1")
+        self._learning_dirty = True
+
+    def _count_answers(self, generation_before: int, answers: int = 1) -> None:
+        """Counts human answers that changed the gallery -- the "N answers" the learning status
+        reports. Answers that left the gallery as it was (a retry, a photo of a visit that
+        trains nothing) need no learning and are not counted."""
+        if self._training_generation() != generation_before and answers > 0:
+            self.conn.execute("UPDATE learning SET answers = answers + ? WHERE id = 1", (answers,))
+        self.conn.commit()
+
+    def take_learning_mark(self) -> tuple[int, int] | None:
+        """`(gen, answers)` once after the gallery changed, then `None` until it changes again."""
+        if not self._learning_dirty:
+            return None
+        self._learning_dirty = False
+        row = self.conn.execute("SELECT gen, answers FROM learning WHERE id=1").fetchone()
+        return row["gen"], row["answers"]
+
+    def learning_state(self) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT gen, done_gen, answers, answers_done, last_result, counts_done, last_error "
+            "FROM learning WHERE id=1"
+        ).fetchone()
+        queued = self.conn.execute("SELECT COUNT(*) FROM learning_queue").fetchone()[0]
+        return {
+            "gen": row["gen"],
+            "done_gen": row["done_gen"],
+            "answers": row["answers"],
+            "answers_done": row["answers_done"],
+            "queued": queued,
+            "last_result": json.loads(row["last_result"]) if row["last_result"] else None,
+            "counts_done": json.loads(row["counts_done"]) if row["counts_done"] else None,
+            "error": row["last_error"],
+        }
+
+    def training_counts_by_cat(self) -> dict[str, int]:
+        return {
+            row["cat"]: row["n"]
+            for row in self.conn.execute("SELECT cat, COUNT(*) AS n FROM training GROUP BY cat")
+        }
+
+    def learning_set_counts(self, counts: Mapping[str, int]) -> None:
+        """Records the per-cat training counts as the baseline "what was learned" is measured from."""
+        self.conn.execute("UPDATE learning SET counts_done=? WHERE id=1", (json.dumps(dict(counts)),))
+        self.conn.commit()
+
+    def learning_complete(
+        self, *, gen: int, answers: int, result: Mapping[str, Any], counts: Mapping[str, int]
+    ) -> None:
+        """A pass finished: it covered everything up to `gen` and `answers`."""
+        self.conn.execute(
+            "UPDATE learning SET done_gen=MAX(done_gen, ?), answers_done=MAX(answers_done, MIN(?, answers)), "
+            "last_result=?, counts_done=?, last_error=NULL WHERE id=1",
+            (gen, answers, json.dumps(dict(result)), json.dumps(dict(counts))),
+        )
+        self.conn.commit()
+
+    def learning_failed(self, error: str) -> None:
+        self.conn.execute("UPDATE learning SET last_error=? WHERE id=1", (error,))
+        self.conn.commit()
+
+    def touch_training_generation(self) -> None:
+        """Marks the gallery changed without changing a row: CoralHub embeddings the model has
+        not seen yet just landed (`CoralRecognizer.async_backfill`), so the next learning pass
+        must rebuild even though nobody answered anything."""
+        self._bump_training_generation()
+        self.conn.commit()
+
+    def enforce_training_caps(self) -> None:
+        """The per-cat and whole-store training caps, run by the learning job just before it
+        rebuilds -- label writes no longer pay for them inline."""
+        for row in self.conn.execute("SELECT DISTINCT cat FROM training").fetchall():
+            self._enforce_training_cap(row["cat"])
+        self._enforce_total_training_cap()
+        self.conn.commit()
+
     # --- storage summary ---------------------------------------------------------------------
 
     def storage_summary(self, retention_days: int) -> dict[str, Any]:
-        by_date = self._media_bytes_by_date()
-        used_bytes = sum(b for _, b in by_date)
+        used_bytes = self._media_used_bytes()
         events = self.conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
         oldest_row = self.conn.execute("SELECT MIN(start) AS m FROM events").fetchone()
         return {
@@ -3275,9 +3814,28 @@ class KibbleStore:
         self._root = Path(hass.config.path(DOMAIN, entry_id))
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"kibble-store-{entry_id[:8]}")
         self._sync: _SyncStore | None = None
+        self._learning_listener: Callable[[int, int], None] | None = None
+
+    def set_learning_listener(self, listener: Callable[[int, int], None] | None) -> None:
+        """`listener(gen, answers)` is called on the event loop after any store job that changed
+        the training gallery -- a label, an upload, auto-learn, an eviction, a removal --
+        so the learning job hears about every one of them without each caller having to say so."""
+        self._learning_listener = listener
+
+    def _job(self, fn: Any, *args: Any) -> Any:
+        """What actually runs on the store thread: `fn`, then the learning hand-off."""
+        try:
+            return fn(*args)
+        finally:
+            mark = self._sync.take_learning_mark() if self._sync is not None else None
+            if mark is not None and self._learning_listener is not None:
+                try:
+                    self._hass.loop.call_soon_threadsafe(self._learning_listener, *mark)
+                except RuntimeError:  # the loop is already closed: Home Assistant is stopping
+                    pass
 
     async def _run(self, fn: Any, *args: Any) -> Any:
-        return await self._hass.loop.run_in_executor(self._executor, fn, *args)
+        return await self._hass.loop.run_in_executor(self._executor, self._job, fn, *args)
 
     async def async_setup(self) -> None:
         def _init() -> _SyncStore:
@@ -3344,8 +3902,8 @@ class KibbleStore:
     async def async_vision_cats_for_event(self, device_event_id: int) -> dict[int, str | None]:
         return await self._run(self._sync.vision_cats_for_event, device_event_id)
 
-    async def async_set_event_classification(self, uid: str, **kwargs: Any) -> None:
-        await self._run(lambda: self._sync.set_event_classification(uid, **kwargs))
+    async def async_set_event_classification(self, uid: str, **kwargs: Any) -> bool:
+        return await self._run(lambda: self._sync.set_event_classification(uid, **kwargs))
 
     async def async_upsert_feed(self, **kwargs: Any) -> None:
         await self._run(lambda: self._sync.upsert_feed(**kwargs))
@@ -3370,10 +3928,10 @@ class KibbleStore:
     ) -> bytes | None:
         return await self._run(self._sync.coral_embedding, row_kind, row_uid, crop_kind, model_id)
 
-    async def async_set_coral_embedding(
-        self, row_kind: str, row_uid: str, crop_kind: str, model_id: str, embedding: bytes
+    async def async_set_coral_embeddings(
+        self, row_kind: str, items: Sequence[tuple[str, str, str, bytes]]
     ) -> None:
-        await self._run(self._sync.set_coral_embedding, row_kind, row_uid, crop_kind, model_id, embedding)
+        await self._run(self._sync.set_coral_embeddings, row_kind, list(items))
 
     async def async_training_rows_needing_coral(
         self, body_model: str, face_model: str, limit: int
@@ -3413,14 +3971,34 @@ class KibbleStore:
     async def async_event_detail(self, uid: str) -> dict[str, Any] | None:
         return await self._run(self._sync.event_detail, uid)
 
-    async def async_label_events(self, uids: Sequence[str], label: str) -> tuple[list[dict[str, Any]], bool]:
+    async def async_label_events(self, uids: Sequence[str], label: str) -> list[dict[str, Any]]:
         return await self._run(self._sync.label_events, list(uids), label)
 
-    async def async_reconcile_event_training(self, uids: Sequence[str], label: str) -> None:
-        await self._run(self._sync.reconcile_event_training, list(uids), label)
+    async def async_reconcile_queued_sessions(self) -> int:
+        return await self._run(self._sync.reconcile_queued_sessions)
 
-    async def async_reconcile_session_training(self, uid: str) -> None:
-        await self._run(self._sync.reconcile_session_training, uid)
+    async def async_enforce_training_caps(self) -> None:
+        await self._run(self._sync.enforce_training_caps)
+
+    async def async_learning_state(self) -> dict[str, Any]:
+        return await self._run(self._sync.learning_state)
+
+    async def async_training_counts_by_cat(self) -> dict[str, int]:
+        return await self._run(self._sync.training_counts_by_cat)
+
+    async def async_learning_set_counts(self, counts: Mapping[str, int]) -> None:
+        await self._run(self._sync.learning_set_counts, counts)
+
+    async def async_learning_complete(
+        self, *, gen: int, answers: int, result: Mapping[str, Any], counts: Mapping[str, int]
+    ) -> None:
+        await self._run(lambda: self._sync.learning_complete(gen=gen, answers=answers, result=result, counts=counts))
+
+    async def async_learning_failed(self, error: str) -> None:
+        await self._run(self._sync.learning_failed, error)
+
+    async def async_touch_training_generation(self) -> None:
+        await self._run(self._sync.touch_training_generation)
 
     async def async_replan_session(
         self, uid: str, scores: Mapping[int, sessions.IdentityScores] | None = None
@@ -3441,6 +4019,9 @@ class KibbleStore:
     ) -> dict[str, Any] | None:
         return await self._run(self._sync.set_session_subject, uid, sid, label, scores)
 
+    async def async_session_ate(self, uid: str, ate: Sequence[str]) -> dict[str, Any] | None:
+        return await self._run(self._sync.set_session_ate, uid, list(ate))
+
     async def async_label_sample(
         self,
         sample_uid: str,
@@ -3449,13 +4030,18 @@ class KibbleStore:
     ) -> dict[str, Any] | None:
         return await self._run(self._sync.label_sample, sample_uid, label, scores)
 
-    async def async_review_page(self, *, limit: int, cursor: str | None, retention_cutoff: int) -> dict[str, Any]:
+    async def async_review_photos_page(
+        self, *, limit: int, cursor: str | None, retention_cutoff: int
+    ) -> dict[str, Any]:
         return await self._run(
-            lambda: self._sync.review_page(limit=limit, cursor=cursor, retention_cutoff=retention_cutoff)
+            lambda: self._sync.review_photos_page(limit=limit, cursor=cursor, retention_cutoff=retention_cutoff)
         )
 
     async def async_cats(self) -> list[dict[str, Any]]:
         return await self._run(self._sync.cats)
+
+    async def async_cats_overview(self, retention_days: int) -> dict[str, Any]:
+        return await self._run(self._sync.cats_overview, retention_days)
 
     async def async_add_cat(self, name: str) -> None:
         await self._run(self._sync.add_cat, name)

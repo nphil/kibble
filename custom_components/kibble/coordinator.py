@@ -141,7 +141,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from homeassistant.components.ffmpeg import HAFFmpeg, get_ffmpeg_manager
 from homeassistant.components.media_player import async_process_play_media_url
@@ -197,7 +197,15 @@ from .store import DeviceIdentitySummary, KibbleStore
 from .push import Frame, KibblePush, KibblePushClosed, KibblePushUnsupported, merge_frame
 from .stacks import Stack, detect_stack
 
+if TYPE_CHECKING:
+    from .learning import LearningManager
+
 _LOGGER = logging.getLogger(__name__)
+
+# `async_device_spool`: the longest `kibble/cats` waits for the feeder's own spool numbers. The
+# feeder client serialises its requests, so the read can queue behind a whole poll cycle; the
+# cats list is worth more than a fresh spool figure, and the last one read is shown instead.
+SPOOL_READ_TIMEOUT_S = 0.75
 
 # Bounds one whole `_fetch_all` batch (a dozen-ish sequential calls), regardless of how many of
 # them there are or what each one's own `api.TIMEOUT` allows individually -- see the module
@@ -457,6 +465,15 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         # Ingest (docs/36-ai-pipeline.md): one pass in flight at a time, same guard shape as
         # the poll/push paths' own single-in-flight discipline.
         self._ingest_task: asyncio.Task[None] | None = None
+        # The debounced learning job (`learning.py`): `__init__.py` attaches it right after this
+        # coordinator exists and `async_cancel_startup` stops it before the store closes.
+        self.learning: LearningManager | None = None
+        # `async_schedule_identity_refresh`'s single flight: the task running snapshots, and
+        # whether one more was asked for while it ran.
+        self._snapshot_task: asyncio.Task[None] | None = None
+        self._snapshot_dirty = False
+        # The feeder's spool figures as `async_device_spool` last read them.
+        self._spool_last: dict[str, int] | None = None
         # Bowl-fill estimate (bowl_fill.py): the last real (non-estimated) camera reading, each
         # hopper's learned fill-per-portion rate (seeded from the store below), before/after
         # brackets still waiting on the camera to confirm, the estimate currently overriding
@@ -527,13 +544,21 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
                 )
 
     async def async_cancel_startup(self) -> None:
-        """Stops the background first-poll task, then the CoralHub task it starts, and forgets any
-        entity creation still waiting for data. First thing on unload: left running, the poll
-        task could land its poll between the platforms being unloaded and Home Assistant
-        cancelling it, and add entities to a platform that no longer exists; and CoralHub's
-        task would still be using the store when `async_unload_entry` closes it. Order matters:
-        the poll task is awaited to its end first, so it can no longer start a CoralHub task
-        after we have looked for one."""
+        """Stops the learning job, the identity-snapshot task, the background first-poll task,
+        then the CoralHub task it starts, and forgets any entity creation still waiting for data.
+        First thing on unload: left running, the poll task could land its poll between the
+        platforms being unloaded and Home Assistant cancelling it, and add entities to a platform
+        that no longer exists; and the learning job and CoralHub's task would still be using the
+        store when `async_unload_entry` closes it (what the learning job had not finished is
+        durable -- the next start resumes it). Order matters: the poll task is awaited to its end
+        first, so it can no longer start a CoralHub task after we have looked for one."""
+        if self.learning is not None:
+            await self.learning.async_stop()
+        refresh, self._snapshot_task = self._snapshot_task, None
+        self._snapshot_dirty = False
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+            await asyncio.wait({refresh})
         task, self.startup_task = self.startup_task, None
         self._first_data_callbacks.clear()
         if task is not None and not task.done():
@@ -712,6 +737,39 @@ class KibbleCoordinator(DataUpdateCoordinator[KibbleData]):
         summary = await self.store.async_identity_summary()
         if self.data is not None:
             self.async_set_updated_data(replace(self.data, identity=summary))
+
+    def async_schedule_identity_refresh(self) -> None:
+        """Asks for a fresh identity snapshot without waiting for it -- what a label, a training
+        removal or an upload does after its write. One refresh runs at a time; a request that
+        arrives while one runs makes it run once more afterwards, so a burst of labels costs one
+        or two snapshots, not one each."""
+        self._snapshot_dirty = True
+        if self._snapshot_task is None or self._snapshot_task.done():
+            self._snapshot_task = self.hass.async_create_background_task(
+                self._async_refresh_identity_snapshots(), "kibble identity snapshot"
+            )
+
+    async def _async_refresh_identity_snapshots(self) -> None:
+        while self._snapshot_dirty:
+            self._snapshot_dirty = False
+            try:
+                await self.async_refresh_identity_snapshot()
+            except Exception:  # noqa: BLE001 -- the next request refreshes again
+                _LOGGER.exception("Refreshing the identity snapshot failed")
+
+    async def async_device_spool(self) -> dict[str, int] | None:
+        """The feeder's own clip-spool usage for `kibble/cats`: `{used_bytes, cap_bytes}`, `None`
+        while the feeder is unreachable. Bounded by `SPOOL_READ_TIMEOUT_S` -- a read that has to
+        wait for a poll cycle (the client's lock) answers with the last figure instead."""
+        try:
+            async with asyncio.timeout(SPOOL_READ_TIMEOUT_S):
+                spool = await self.client.spool_stats()
+        except TimeoutError:
+            return dict(self._spool_last) if self._spool_last is not None else None
+        except KibbleError:
+            return None
+        self._spool_last = {"used_bytes": spool.used_bytes, "cap_bytes": spool.cap_bytes}
+        return dict(self._spool_last)
 
     def _check_stack_change(self, data: KibbleData) -> None:
         """Reloads the config entry the first time a poll confirms a DIFFERENT stack than the

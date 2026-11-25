@@ -11,9 +11,12 @@ docstring describe, never on plumbing:
 - Cursor pagination is stable across equal-timestamp ties and immune to a concurrent insert
   landing between two page fetches.
 - A `not_a_cat` verdict and a `visit` with no usable thumb are both hidden from
-  `kibble/timeline` but remain reachable through `kibble/event`/`kibble/review`.
-- `label_events` (fast: one DB write) and `reconcile_event_training` (slow: real file I/O) are
-  a distinct, later step, not two names for the same work.
+  `kibble/timeline` but remain reachable through `kibble/event`; the review queue is photo-first,
+  so it still lists a `not_a_cat` guess's photos and has nothing to list for a photo-less visit.
+- A label saves its answer AND brings the training photos in line with it in the same call
+  (`reconcile_session_training`; `reconcile_queued_sessions` finishes one that was interrupted).
+  The slow part -- a model rebuild -- belongs to the learning job and is only signalled by the
+  `learning.gen` counter.
 - A per-photo `kibble/sample/label` override survives an event relabel; a skip removes any
   training row it had; a schema migration adds `samples.review` to an existing database
   without losing rows.
@@ -100,12 +103,13 @@ def test_retention_purge_keeps_training_rows_and_files_while_deleting_aged_event
     tmp_path: Path,
 ) -> None:
     store = _SyncStore(tmp_path, "entry1")
+    store.add_cat("Kitty")
     old_ts = int(time.time()) - 30 * 86400
     date = _utc_date(old_ts)
     body_asset = store.write_media(date, "e1-s1-body.jpg", b"body-bytes")
     _insert_event(store, "e1", old_ts)
     _insert_sample(store, "e1-s1", "e1", old_ts, body=body_asset)
-    store.reconcile_event_training(["e1"], "Kitty")
+    store.label_events(["e1"], "Kitty")  # reviews the visit and copies its photo into training
     training_body = store.conn.execute("SELECT body FROM training WHERE uid='e1-s1-train'").fetchone()["body"]
     training_path = store.root / training_body
     assert training_path.exists()  # sanity: the copy really landed before purging
@@ -159,7 +163,9 @@ def test_cursor_pagination_is_immune_to_a_concurrent_insert_between_pages(tmp_pa
 # --- hidden from timeline, still reachable via event_detail/review ------------------------------
 
 
-def test_not_a_cat_verdict_is_hidden_from_timeline_but_reachable_via_event_detail(tmp_path: Path) -> None:
+def test_not_a_cat_verdict_is_hidden_from_timeline_but_reachable_via_event_detail_and_the_review_queue(
+    tmp_path: Path,
+) -> None:
     store = _SyncStore(tmp_path, "entry1")
     _insert_event(store, "e1", 100)
     _insert_sample(store, "e1-s1", "e1", 100)
@@ -174,8 +180,13 @@ def test_not_a_cat_verdict_is_hidden_from_timeline_but_reachable_via_event_detai
     assert detail is not None
     assert detail["event"]["identity"] == "not_a_cat"
 
+    # Hidden from the timeline is not hidden from review: the engine's own "not a cat" guess is
+    # exactly what a person should be able to confirm or overturn, photo by photo.
+    queue = store.review_photos_page(limit=10, cursor=None, retention_cutoff=0)
+    assert [item["sample"]["uid"] for item in queue["items"]] == ["e1-s1"]
 
-def test_visit_with_no_usable_thumb_is_hidden_from_timeline_but_reachable_via_event_detail_and_review(
+
+def test_visit_with_no_usable_thumb_is_hidden_from_timeline_but_reachable_via_event_detail(
     tmp_path: Path,
 ) -> None:
     store = _SyncStore(tmp_path, "entry1")
@@ -190,73 +201,96 @@ def test_visit_with_no_usable_thumb_is_hidden_from_timeline_but_reachable_via_ev
     assert detail is not None
     assert detail["event"]["uid"] == "e1" and detail["event"]["thumb"] is None
 
-    review = store.review_page(limit=10, cursor=None, retention_cutoff=0)
-    assert [i["uid"] for i in review["items"]] == ["e1"]
+    # The review queue is photo-first: a visit with no photo has nothing to answer, so it is
+    # neither listed nor able to wedge the queue -- `kibble/event` is its only way in.
+    review = store.review_photos_page(limit=10, cursor=None, retention_cutoff=0)
+    assert (review["items"], review["remaining"], review["visits"]) == ([], 0, 0)
 
 
-# --- label_events (fast, no I/O) vs copy_samples_to_training (slow, real file copy) -------------
+# --- label_events: the answer and its training photos land together, the model rebuild comes later --
 
 
-def test_label_events_updates_reviewed_state_immediately_with_zero_file_io(tmp_path: Path) -> None:
+def test_label_events_updates_reviewed_state_and_copies_the_training_photo_in_the_same_call(
+    tmp_path: Path,
+) -> None:
     store = _SyncStore(tmp_path, "entry1")
     store.add_cat("Kitty")
     _insert_event(store, "e1", 100)
     body_asset = store.write_media(_utc_date(100), "e1-s1-body.jpg", b"body-bytes")
     _insert_sample(store, "e1-s1", "e1", 100, body=body_asset)
 
-    events, training_changed = store.label_events(["e1"], "Kitty")
+    events = store.label_events(["e1"], "Kitty")
 
-    assert training_changed is True
     assert events[0]["cat"] == "Kitty" and events[0]["identity"] == "reviewed"
     row = store.conn.execute(
         "SELECT cat, identity_status, confidence, reviewed FROM events WHERE uid='e1'"
     ).fetchone()
     assert (row["cat"], row["identity_status"], row["confidence"], row["reviewed"]) == ("Kitty", "reviewed", None, 1)
-    # No training row and no file exists yet -- copying samples is a distinct, later step.
-    assert store.conn.execute("SELECT 1 FROM training").fetchone() is None
-    assert not any(store.training_root.rglob("*"))
+    # The photo is already in the training set when the call returns -- that is what lets "Can't
+    # tell" and "Don't use" take effect at once. Only the model rebuild is left for the learning
+    # job, and the generation counter is what tells it.
+    trained = store.conn.execute("SELECT cat, source, body FROM training WHERE uid='e1-s1-train'").fetchone()
+    assert (trained["cat"], trained["source"]) == ("Kitty", "label")
+    assert (store.root / trained["body"]).read_bytes() == b"body-bytes"
+    assert store.conn.execute("SELECT COUNT(*) AS n FROM learning_queue").fetchone()["n"] == 0
+    state = store.learning_state()
+    assert (state["gen"], state["done_gen"]) == (1, 0)
 
 
-def test_label_events_of_unknown_label_never_reports_training_changed(tmp_path: Path) -> None:
+def test_label_events_of_unknown_label_leaves_the_gallery_and_its_generation_alone(tmp_path: Path) -> None:
     store = _SyncStore(tmp_path, "entry1")
     _insert_event(store, "e1", 100)
     _insert_sample(store, "e1-s1", "e1", 100)
 
-    events, training_changed = store.label_events(["e1"], "unknown")
+    events = store.label_events(["e1"], "unknown")
 
-    assert training_changed is False
     assert events[0]["identity"] == "unknown" and events[0]["cat"] is None
+    assert store.conn.execute("SELECT COUNT(*) AS n FROM training").fetchone()["n"] == 0
+    assert store.learning_state()["gen"] == 0, "nothing was added to or removed from the gallery"
 
 
-def test_label_events_of_not_a_cat_also_reports_training_changed(tmp_path: Path) -> None:
+def test_label_events_of_not_a_cat_trains_the_not_a_cat_class(tmp_path: Path) -> None:
     """`not_a_cat` is itself a trainable class (`identity.py`: "every enrolled cat plus
     not_a_cat") -- docs/36-ai-pipeline.md's `kibble/label` contract adds its chosen samples to
     training for a cat OR `not_a_cat` label, never for `unknown` only."""
     store = _SyncStore(tmp_path, "entry1")
     _insert_event(store, "e1", 100)
-    _insert_sample(store, "e1-s1", "e1", 100)
+    body_asset = store.write_media(_utc_date(100), "e1-s1-body.jpg", b"body-bytes")
+    _insert_sample(store, "e1-s1", "e1", 100, body=body_asset)
 
-    events, training_changed = store.label_events(["e1"], "not_a_cat")
+    events = store.label_events(["e1"], "not_a_cat")
 
-    assert training_changed is True
     assert events[0]["identity"] == "not_a_cat" and events[0]["cat"] is None
+    row = store.conn.execute("SELECT cat, source FROM training WHERE uid='e1-s1-train'").fetchone()
+    assert (row["cat"], row["source"]) == (identity.NOT_A_CAT, "label")
+    assert store.learning_state()["gen"] == 1
 
 
-def test_reconcile_event_training_is_the_distinct_later_step_that_actually_copies_files(tmp_path: Path) -> None:
+def test_a_label_saved_before_its_training_photos_were_copied_is_finished_from_the_queue(tmp_path: Path) -> None:
+    """The write-ahead `learning_queue` row is committed WITH the answer, so a crash (or a failed
+    copy) between "answer saved" and "photos copied" is repaired by the learning job's first
+    step -- the same file copy the label itself does inline."""
     store = _SyncStore(tmp_path, "entry1")
     store.add_cat("Kitty")
     _insert_event(store, "e1", 100)
     body_asset = store.write_media(_utc_date(100), "e1-s1-body.jpg", b"body-bytes")
     _insert_sample(store, "e1-s1", "e1", 100, body=body_asset)
-    store.label_events(["e1"], "Kitty")
+    # What a crash leaves behind: the answer is durable and queued, the photos were never copied.
+    store.conn.execute("UPDATE events SET cat='Kitty', identity_status='reviewed', reviewed=1 WHERE uid='e1'")
+    store.conn.execute("INSERT INTO learning_queue(session_uid) VALUES ('e1')")
+    store.conn.commit()
+    assert store.conn.execute("SELECT 1 FROM training").fetchone() is None
 
-    store.reconcile_event_training(["e1"], "Kitty")
+    assert store.reconcile_queued_sessions() == 1
 
     row = store.conn.execute("SELECT cat, body FROM training WHERE uid='e1-s1-train'").fetchone()
     assert row["cat"] == "Kitty"
     training_path = store.root / row["body"]
     assert training_path.exists()
     assert training_path.read_bytes() == b"body-bytes"
+    assert store.conn.execute("SELECT COUNT(*) AS n FROM learning_queue").fetchone()["n"] == 0
+    assert store.reconcile_queued_sessions() == 0
+    assert store.reconcile_session_training("e1") is False, "a second reconcile finds nothing left to change"
 
 
 # --- kibble/sample/label: per-photo override, independent of the event's own label -------------
@@ -273,7 +307,7 @@ def test_label_sample_persists_a_per_photo_override_across_reads(tmp_path: Path)
     saved = store.label_sample("e1-s1", "Pancake")
 
     assert saved is not None
-    assert (saved["review"], saved["label"]) == ("Pancake", "Pancake")
+    assert (saved["sample"]["review"], saved["sample"]["label"]) == ("Pancake", "Pancake")
     detail = store.event_detail("e1")
     sample = detail["samples"][0]
     assert (sample["review"], sample["label"]) == ("Pancake", "Pancake")
@@ -288,7 +322,6 @@ def test_label_sample_skip_removes_an_existing_training_row_and_its_files(tmp_pa
     _insert_sample(store, "e1-s1", "e1", 100, body=body_asset)
     store.add_cat("Kitty")
     store.label_events(["e1"], "Kitty")
-    store.reconcile_event_training(["e1"], "Kitty")
     training_path = store.root / store.conn.execute(
         "SELECT body FROM training WHERE uid='e1-s1-train'"
     ).fetchone()["body"]
@@ -296,7 +329,7 @@ def test_label_sample_skip_removes_an_existing_training_row_and_its_files(tmp_pa
 
     saved = store.label_sample("e1-s1", "skip")
 
-    assert (saved["review"], saved["label"]) == ("skip", "skip")
+    assert (saved["sample"]["review"], saved["sample"]["label"]) == ("skip", "skip")
     assert store.conn.execute("SELECT 1 FROM training WHERE uid='e1-s1-train'").fetchone() is None
     assert not training_path.exists()
 
@@ -325,30 +358,36 @@ def test_label_sample_follow_trains_as_the_events_own_reviewed_label(tmp_path: P
 
     saved = store.label_sample("e1-s1", "follow")
 
-    assert (saved["review"], saved["label"]) == (None, "Kitty")
+    assert (saved["sample"]["review"], saved["sample"]["label"]) == (None, "Kitty")
     row = store.conn.execute("SELECT cat FROM training WHERE uid='e1-s1-train'").fetchone()
     assert row["cat"] == "Kitty"
 
 
-def test_follow_clears_a_photo_override_but_keeps_its_new_session_cat(tmp_path: Path) -> None:
-    """Choosing a new cat for one photo adds that cat to the session; following later clears
-    only the photo-specific answer and keeps the session answer the person just established."""
+def test_follow_clears_a_photo_answer_and_the_visit_keeps_a_cat_another_photo_still_names(tmp_path: Path) -> None:
+    """A photo-driven visit's cats are derived from its photo answers: following one photo clears
+    only ITS answer, and the visit keeps the cat while another answered photo still names it. A
+    photo with no answer of its own is no longer trained (only answered photos are)."""
     store = _SyncStore(tmp_path, "entry1")
     _insert_event(store, "e1", 100)
     _insert_sample(store, "e1-s1", "e1", 100)
+    _insert_sample(store, "e1-s2", "e1", 101)
     store.add_cat("Kitty")
     store.label_sample("e1-s1", "Kitty")
+    store.label_sample("e1-s2", "Kitty")
 
     saved = store.label_sample("e1-s1", "follow")
 
-    assert (saved["review"], saved["label"]) == (None, "Kitty")
+    # `label` is what the photo currently TEACHES: with no answer of its own it teaches nothing,
+    # yet the visit still names Kitty because the other photo does.
+    assert (saved["sample"]["review"], saved["sample"]["label"]) == (None, None)
+    assert [item["cat"] for item in saved["visit"]["cats"]] == ["Kitty"]
     event = store.conn.execute("SELECT cat, reviewed FROM events WHERE uid='e1'").fetchone()
     assert (event["cat"], event["reviewed"]) == ("Kitty", 1)
-    row = store.conn.execute("SELECT cat FROM training WHERE uid='e1-s1-train'").fetchone()
-    assert row["cat"] == "Kitty"
+    trained = {row["uid"]: row["cat"] for row in store.conn.execute("SELECT uid, cat FROM training")}
+    assert trained == {"e1-s2-train": "Kitty"}
 
 
-def test_reconcile_event_training_leaves_an_override_alone_and_removes_a_skip(tmp_path: Path) -> None:
+def test_relabelling_the_whole_visit_leaves_an_override_alone_and_keeps_a_skip_untrained(tmp_path: Path) -> None:
     """Relabelling the whole event must never move a per-photo override, and a skipped photo
     must stay untrained even though the rest of the event just got a fresh cat name."""
     store = _SyncStore(tmp_path, "entry1")
@@ -362,7 +401,6 @@ def test_reconcile_event_training_leaves_an_override_alone_and_removes_a_skip(tm
     store.label_sample("e1-s3", "skip")
 
     store.label_events(["e1"], "Kitty")
-    store.reconcile_event_training(["e1"], "Kitty")
 
     cats = {
         r["uid"]: r["cat"]
@@ -588,7 +626,6 @@ def _trained_photo(store: _SyncStore, cat: str, event_uid: str, ts: int) -> None
         features=_features(), box=None, score=0.9,
     )
     store.label_events([event_uid], cat)
-    store.reconcile_event_training([event_uid], cat)
 
 
 def test_cat_avatar_falls_back_to_the_newest_trained_photo_when_no_custom_one_is_set(tmp_path: Path) -> None:
@@ -790,8 +827,8 @@ def test_a_human_label_promotes_a_previously_auto_sourced_sample_to_label(tmp_pa
         box=None, score=0.9,
     )
     store.add_auto_training(cat="Pancake", sample_uid="e2-s1", confidence=0.95)
-    store.conn.execute("UPDATE events SET reviewed=1, identity_status='reviewed', cat='Pancake' WHERE uid='e2'")
-    store.reconcile_event_training(["e2"], "Pancake")
+    assert store.conn.execute("SELECT source FROM training WHERE uid='e2-s1-train'").fetchone()["source"] == "auto"
+    store.label_events(["e2"], "Pancake")
     row = store.conn.execute("SELECT source FROM training WHERE uid='e2-s1-train'").fetchone()
     assert row["source"] == "label"
 
@@ -1085,8 +1122,8 @@ def test_subject_review_preserves_photo_review_and_event_detail_labels_scene_box
     store.set_session_cats("e1", [("Kitty", True), ("Pancake", True)])
 
     store.set_session_subject("e1", 1, "Pancake", _subject_scores())
-    sample = store.label_sample("e1-s0", "Kitty", _subject_scores())
-    assert sample is not None and sample["review"] == "Kitty"
+    saved = store.label_sample("e1-s0", "Kitty", _subject_scores())
+    assert saved is not None and saved["sample"]["review"] == "Kitty"
     rows = {
         row["uid"]: row for row in store.conn.execute(
             "SELECT uid, review, review_src FROM samples WHERE uid IN ('e1-s0', 'e1-s1')"
@@ -1682,7 +1719,7 @@ def test_event_detail_keeps_every_photo_but_marks_untrustworthy_crops_unavailabl
     assert detail["event"]["scene"] == {"id": "d/e1-scene.jpg", "url": "/api/kibble/entry1/media/d/e1-scene.jpg"}
     assert detail["event"]["thumb"] == detail["event"]["scene"]
     store.add_cat("Kitty")
-    events, _training_changed = store.label_events(["e1"], "Kitty")
+    events = store.label_events(["e1"], "Kitty")
     assert len(events) == 1 and events[0]["uid"] == "e1" and events[0]["identity"] == "reviewed"
     row = store.conn.execute("SELECT cat, reviewed FROM events WHERE uid='e1'").fetchone()
     assert row["cat"] == "Kitty" and row["reviewed"] == 1
@@ -2001,10 +2038,10 @@ def test_relabelling_a_training_row_to_a_different_cat_keeps_its_cached_embeddin
     body = store.write_media(_utc_date(100), "e1-s1-body.jpg", b"photo")
     _insert_sample(store, "e1-s1", "e1", 100, body=body)
     store.conn.commit()
-    store.reconcile_event_training(["e1"], "Kitty")
+    store.label_events(["e1"], "Kitty")
     store.set_coral_embedding("training", "e1-s1-train", "body", "model-a", b"cached")
 
-    store.reconcile_event_training(["e1"], "Pancake")
+    store.label_events(["e1"], "Pancake")
 
     assert store.coral_embedding("training", "e1-s1-train", "body", "model-a") == b"cached"
     row = store.conn.execute("SELECT cat FROM training WHERE uid='e1-s1-train'").fetchone()

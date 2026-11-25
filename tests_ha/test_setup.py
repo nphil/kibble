@@ -22,6 +22,7 @@ import io
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
@@ -29,7 +30,7 @@ from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import async_get_platforms
@@ -61,7 +62,9 @@ from custom_components.kibble.const import (
 )
 from custom_components.kibble.coral_client import CoralHubClient
 from custom_components.kibble.ingest import IdentityEngine
+from custom_components.kibble.learning import LearningManager
 from custom_components.kibble.push import KibblePushUnsupported
+from custom_components.kibble.store import KibbleStore
 
 # The real production entry id this will eventually run against (per the assignment).
 ENTRY_ID = "01M2HWYNKK5HMBR0J4J62XP5S2"
@@ -337,6 +340,37 @@ def vendor_fake_agent(monkeypatch: pytest.MonkeyPatch, hass: HomeAssistant) -> F
     return vendor_feeder
 
 
+@pytest.fixture
+def real_learning_worker() -> None:
+    """Opts a test out of `_idle_learning_worker` below: it runs the learning job's real worker."""
+
+
+@pytest.fixture(autouse=True)
+def _idle_learning_worker(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`LearningManager` runs one never-ending worker as a Home Assistant background task, and
+    this file waits for start-up with `hass.async_block_till_done(wait_background_tasks=True)`,
+    which would wait for that worker forever. These tests are about set-up wiring, not about the
+    learning passes (`tests/test_learning.py` drives the real worker), so every test but the ones
+    that request `real_learning_worker` runs with a worker that returns at once; the manager
+    itself -- `notify`, `status`, `subscribe`, `async_start`/`async_stop` -- is the real one."""
+    if "real_learning_worker" in request.fixturenames:
+        return
+
+    async def _no_worker(self: LearningManager) -> None:
+        return
+
+    monkeypatch.setattr(LearningManager, "_worker", _no_worker)
+
+
+async def _async_wait_until(predicate, *, timeout: float = 5.0) -> None:
+    """Polls `predicate` on the loop until it holds. For effects of Home Assistant *background*
+    tasks (`async_create_background_task`), which `hass.async_block_till_done()` deliberately
+    does not wait for -- the identity-snapshot refresh a label schedules is one."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
 def _make_entry(
     entry_id: str = ENTRY_ID, *, unique_id: str = SERIAL, options: dict[str, Any] | None = None
 ) -> MockConfigEntry:
@@ -582,9 +616,10 @@ async def test_cat_labeling_workflow_through_websocket_and_entities(
 ) -> None:
     """`kibble/cats/add` creates the per-cat binary_sensor/sensor entities dynamically
     (binary_sensor.py/sensor.py's `_add_new_cats` listener); `kibble/label` marks both
-    ingested events reviewed, copies their samples into training, and the presence/last-seen/
-    last-meal/meals-today entities reflect exactly that afterward -- consumer-observable state,
-    not internals."""
+    ingested events reviewed, copies their samples into training, answers at once, and the
+    presence/last-seen/last-meal/meals-today entities reflect exactly that once the background
+    identity-snapshot refresh (`async_schedule_identity_refresh`) has run -- consumer-observable
+    state, not internals."""
     entry_id = configured_entry.entry_id
     client = await hass_ws_client(hass)
     registry = er.async_get(hass)
@@ -638,9 +673,9 @@ async def test_cat_labeling_workflow_through_websocket_and_entities(
     assert len(labeled_events) == 2
     assert {e["cat"] for e in labeled_events} == {CAT_NAME}
     assert {e["identity"] for e in labeled_events} == {"reviewed"}
-    await hass.async_block_till_done()  # background: training copy, rebuild, identity refresh
-
-    assert hass.states.get(present_id).state == "on"  # the open "visit" is now Kitty's
+    # The reply never waited for the entities: the snapshot refresh is a background task of its
+    # own (`async_block_till_done` does not wait for those), so wait for the entity to move.
+    await _async_wait_until(lambda: hass.states.get(present_id).state == "on")  # the open "visit" is now Kitty's
     present_attrs = hass.states.get(present_id).attributes
     assert present_attrs["last_seen"] is not None
     assert present_attrs["last_ate"] is not None
@@ -648,6 +683,11 @@ async def test_cat_labeling_workflow_through_websocket_and_entities(
     assert hass.states.get(last_seen_id).state not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
     assert hass.states.get(last_meal_id).state not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
     assert hass.states.get(meals_today_id).state == "1"  # exactly one labelled eat, today
+
+    # The store told the learning job the gallery changed (no caller did); it is queued, not run.
+    learning = configured_entry.runtime_data.learning
+    await _async_wait_until(lambda: learning.status()["pending"] > 0)
+    assert learning.status()["state"] == "waiting"
 
     # kibble/cats: the same roster, with real training/presence numbers behind it
     await client.send_json_auto_id({"type": "kibble/cats", "entry_id": entry_id})
@@ -661,12 +701,13 @@ async def test_cat_labeling_workflow_through_websocket_and_entities(
         "used_bytes": 4096, "cap_bytes": 8 * 1024 * 1024,
     }
 
-    # kibble/review: both events are now reviewed -> nothing left to review
-    await client.send_json_auto_id({"type": "kibble/review", "entry_id": entry_id})
+    # kibble/review/photos: both events are now reviewed -> nothing left to review
+    await client.send_json_auto_id({"type": "kibble/review/photos", "entry_id": entry_id})
     review_resp = await client.receive_json()
     assert review_resp["success"]
     assert review_resp["result"]["items"] == []
-    assert review_resp["result"]["total"] == 0
+    assert review_resp["result"]["remaining"] == 0
+    assert review_resp["result"]["has_more"] is False
 
     # kibble/event: full detail for one labelled event -- its sample now teaches CAT_NAME,
     # having followed the event's own label with no override of its own
@@ -680,6 +721,131 @@ async def test_cat_labeling_workflow_through_websocket_and_entities(
     assert sample["review"] is None
     assert sample["label"] == CAT_NAME
     assert sample["body"] is not None and sample["face"] is not None
+
+
+async def _async_enrol_and_label_every_visit(client, entry_id: str) -> list[str]:
+    """Adds `CAT_NAME` and labels both ingested visits with it, through the websocket API a
+    card uses; returns their uids. Leaves two training photos behind."""
+    await client.send_json_auto_id({"type": "kibble/cats/add", "entry_id": entry_id, "name": CAT_NAME})
+    assert (await client.receive_json())["success"]
+    await client.send_json_auto_id({"type": "kibble/timeline", "entry_id": entry_id})
+    items = (await client.receive_json())["result"]["items"]
+    uids = [item["uid"] for item in items if item["kind"] in ("visit", "eat")]
+    await client.send_json_auto_id(
+        {"type": "kibble/label", "entry_id": entry_id, "uids": uids, "label": CAT_NAME}
+    )
+    assert (await client.receive_json())["success"]
+    return uids
+
+
+async def test_clear_training_service_clears_the_gallery_then_asks_for_a_refresh_and_never_rebuilds_inline(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    hass_ws_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`kibble.clear_training` writes through the store and then only schedules the identity
+    snapshot refresh; the relearn is the learning job's (it hears about the change from the
+    store), so the service itself never rebuilds or reclassifies on the call."""
+    entry_id = configured_entry.entry_id
+    client = await hass_ws_client(hass)
+    await _async_enrol_and_label_every_visit(client, entry_id)
+    await client.send_json_auto_id({"type": "kibble/cats", "entry_id": entry_id})
+    [cat] = (await client.receive_json())["result"]["cats"]
+    assert cat["training"]["total"] == 2
+
+    coordinator = configured_entry.runtime_data
+    refresh = Mock()
+    monkeypatch.setattr(coordinator, "async_schedule_identity_refresh", refresh)
+    rebuild = AsyncMock()
+    reclassify = AsyncMock()
+    monkeypatch.setattr(coordinator.engine, "async_rebuild", rebuild)
+    monkeypatch.setattr(coordinator.engine, "async_reclassify_unreviewed", reclassify)
+
+    await hass.services.async_call(DOMAIN, "clear_training", {"cat": CAT_NAME}, blocking=True)
+
+    refresh.assert_called_once_with()
+    rebuild.assert_not_called()
+    reclassify.assert_not_called()
+    await client.send_json_auto_id({"type": "kibble/cats", "entry_id": entry_id})
+    [cat] = (await client.receive_json())["result"]["cats"]
+    assert cat["training"] == {"total": 0, "face": 0, "body": 0}
+
+
+async def test_clear_training_service_refuses_an_unknown_cat_without_touching_anything(
+    hass: HomeAssistant,
+    configured_entry: MockConfigEntry,
+    fake_agent: FakeFeeder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = configured_entry.runtime_data
+    refresh = Mock()
+    monkeypatch.setattr(coordinator, "async_schedule_identity_refresh", refresh)
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "clear_training", {"cat": "Ghost"}, blocking=True)
+
+    refresh.assert_not_called()
+
+
+async def test_setup_wires_the_learning_job_to_the_store_and_unload_stops_it(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    fake_agent: FakeFeeder,
+    real_learning_worker: None,
+    hass_ws_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`async_setup_entry` attaches a `LearningManager` as `coordinator.learning`, hands the
+    store its `notify` (how a training change reaches it), starts it (`kibble/learning` then
+    answers from memory, and `kibble/learning/subscribe` pushes the status at once), and unload
+    stops it before the store closes."""
+    listeners: list[Any] = []
+    real_set_listener = KibbleStore.set_learning_listener
+
+    def spy_set_listener(self: KibbleStore, listener: Any) -> None:
+        listeners.append(listener)
+        real_set_listener(self, listener)
+
+    monkeypatch.setattr(KibbleStore, "set_learning_listener", spy_set_listener)
+    stopped: list[LearningManager] = []
+    real_stop = LearningManager.async_stop
+
+    async def spy_stop(self: LearningManager) -> None:
+        stopped.append(self)
+        await real_stop(self)
+
+    monkeypatch.setattr(LearningManager, "async_stop", spy_stop)
+
+    entry = _make_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    learning = entry.runtime_data.learning
+    assert isinstance(learning, LearningManager)
+    assert listeners == [learning.notify]
+
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": "kibble/learning", "entry_id": entry.entry_id})
+    resp = await client.receive_json()
+    assert resp["success"]
+    assert resp["result"] == learning.status()
+    assert resp["result"]["state"] == "idle" and resp["result"]["pending"] == 0
+
+    await client.send_json_auto_id({"type": "kibble/learning/subscribe", "entry_id": entry.entry_id})
+    result = await client.receive_json()
+    assert result["success"]
+    event = await client.receive_json()
+    assert event["type"] == "event" and event["id"] == result["id"]
+    assert event["event"] == {"learning": learning.status()}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    assert stopped and all(manager is learning for manager in stopped)
 
 
 # --- HTTP media view -------------------------------------------------------------------------

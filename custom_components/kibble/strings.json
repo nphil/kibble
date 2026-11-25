@@ -279,6 +279,42 @@
       },
       "recognition": {
         "name": "Recognition"
+      },
+      "learning": {
+        "name": "Learning",
+        "state": {
+          "idle": "Idle",
+          "waiting": "Waiting for more answers",
+          "learning": "Learning",
+          "rechecking": "Rechecking visits",
+          "retrying": "Waiting to retry"
+        },
+        "state_attributes": {
+          "pending": {
+            "name": "Answers waiting"
+          },
+          "done": {
+            "name": "Visits rechecked"
+          },
+          "total": {
+            "name": "Visits to recheck"
+          },
+          "starts_at": {
+            "name": "Starts at"
+          },
+          "retry_at": {
+            "name": "Retries at"
+          },
+          "started": {
+            "name": "Started"
+          },
+          "last": {
+            "name": "Last result"
+          },
+          "error": {
+            "name": "Error"
+          }
+        }
       }
     },
     "switch": {

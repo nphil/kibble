@@ -64,13 +64,13 @@ rows are always kept, same as today.
 training row's and every still-reclassifiable (unreviewed-event) sample's cached embedding,
 newest first, in 32-row batches, pacing itself faster while healthy and slower after any failed
 batch. Never gives up outright -- an unreachable CoralHub just means slower polling, forever,
-until it catches up or the entry unloads. Calls back into `IdentityEngine.async_rebuild` after
+until it catches up or the entry unloads. Tells the learning job (`on_progress`) after
 each training batch that actually embeds something, so freshly caught-up centroids reach
 production without waiting for an unrelated training mutation.
 
 `CoralRecognizer.async_rebuild`'s own bounded (64-row) "ensure embedded" catch-up runs inline on
-every ordinary rebuild too (a label, an upload, auto-learn, or the periodic reclassify pass) --
-cheap, since a rebuild follows one training action so at most a handful of rows are ever newly
+every rebuild too (the learning job's pass after a label, an upload or auto-learn) --
+cheap, since a rebuild follows a handful of training actions so at most a few rows are ever newly
 missing an embedding at that moment.
 
 ## Recognition (`coral_identity.py`)
@@ -125,6 +125,29 @@ code changes at all to keep working under either backend: they already read only
 identity.NOT_A_CAT`, and the benchmark found essentially no body-crop not-a-cat training data for
 EITHER recognizer (one photo in the whole corpus) -- switching this one gate's backend would not
 change its practical behaviour.
+
+## Rebuild cost and the learning job (0.29.7)
+
+A rebuild is no longer started by each label; the debounced learning job runs it (`docs/36-ai-pipeline.md`,
+"Learning"). What changed on the recognition side to make a rebuild cheap:
+
+- **Exact incremental leave-one-out.** The Coral accuracy figure is computed incrementally
+  (each row is taken out of its own class centroid instead of rebuilding a model per row) with the
+  same result: 4.78 s -> 0.08 s at 1,000 rows.
+- **Histogram leave-one-out only without Coral.** The O(n^2) histogram leave-one-out is computed
+  only when CoralHub is not configured; with Coral, `loo_accuracy` comes from the Coral model.
+- **An empty gallery clears the model.** With no embedded training rows left, the Coral model is
+  set to none (instead of keeping stale centroids) and the histogram recognizer answers.
+- **Batched embedding writes.** New embeddings are stored in one transaction
+  (`store.async_set_coral_embeddings`) instead of one per row.
+- **`rebuild_error`.** When CoralHub cannot be reached, the rebuild records why
+  (`CoralRecognizer.rebuild_error`, `None` when it could) and `IdentityEngine.async_rebuild`
+  returns it as an error string, which puts the learning job into `retrying` with backoff.
+- **`on_progress`.** The backfill's callback after a batch that embedded new training rows now
+  notifies the learning job that the centroids are out of date, rather than rebuilding itself.
+- **Timings in the result.** `last.stages` of the learning status carries the milliseconds per
+  stage (`histogram_ms`, then the Coral stages `coral_embed_ms`, `coral_load_ms`, `coral_build_ms`,
+  `coral_loo_ms`) and the Coral embed stats of the pass (`calls`, `crops`, `ms`, `reused`).
 
 ## Calibration
 

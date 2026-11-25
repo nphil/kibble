@@ -166,6 +166,16 @@
       "clips": {
         "default": "mdi:folder-music-outline"
       },
+      "learning": {
+        "default": "mdi:school-outline",
+        "state": {
+          "idle": "mdi:check-circle-outline",
+          "waiting": "mdi:timer-sand",
+          "learning": "mdi:brain",
+          "rechecking": "mdi:text-search",
+          "retrying": "mdi:alert-circle-outline"
+        }
+      },
       "last_detection": {
         "default": "mdi:motion-sensor"
       },

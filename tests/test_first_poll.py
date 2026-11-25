@@ -29,6 +29,8 @@ def _bare_coordinator(*, data=None) -> KibbleCoordinator:
     coord.last_error = None
     coord.startup_task = None
     coord.coral_task = None
+    coord.learning = None
+    coord._snapshot_task = None
     coord._first_data_callbacks = []
     return coord
 

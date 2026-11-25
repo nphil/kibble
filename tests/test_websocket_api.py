@@ -1,8 +1,8 @@
 """`websocket.py`: every `kibble/*` command handler driven directly with stub
 `connection`/`hass`/`msg` objects, covering entry_id resolution, the WS-level input validation
 each command's own schema declares, and response shapes for `kibble/timeline`,
-`kibble/timeline/subscribe`, `kibble/event`, `kibble/label`, `kibble/review`, `kibble/cats`
-(+`add`/`delete`), `kibble/training`(+`remove`), and the pre-existing vision/calibration
+`kibble/timeline/subscribe`, `kibble/event`, `kibble/label`, `kibble/review/photos`,
+`kibble/learning`(+`subscribe`), `kibble/cats` (+`add`/`delete`), `kibble/training`(+`remove`), and the pre-existing vision/calibration
 commands (unrelated to the AI pipeline, unchanged).
 
 Every command reads/writes through `coordinator.store`/`coordinator.engine` -- stubbed here as
@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from homeassistant.components import websocket_api
@@ -49,10 +49,13 @@ from kibble.websocket import (
     ws_calibration_action,
     ws_event,
     ws_label,
+    ws_learning,
+    ws_learning_subscribe,
+    ws_session_ate,
     ws_session_label,
     ws_session_subject,
     ws_sample_label,
-    ws_review,
+    ws_review_photos,
     ws_timeline,
     ws_timeline_subscribe,
     ws_training,
@@ -94,10 +97,14 @@ def _fake_coordinator(
     async_calibration_action=None,
     single_hopper: bool = False,
     hopper_food=None,
+    learning=None,
+    device_spool=None,
 ) -> SimpleNamespace:
     """A duck-typed `KibbleCoordinator` with only what `websocket.py` ever reads: a store, an
     identity engine, a device client, the retention window, `data.identity`, the hopper
-    divider mode, and each hopper's current food name (`_feed_view`)."""
+    divider mode, each hopper's current food name (`_feed_view`), the learning job
+    (`coordinator.learning`, None = not set up), the single-flight identity-refresh scheduler
+    every labelling command ends with, and the bounded live `async_device_spool` read."""
     coordinator = SimpleNamespace(
         store=store if store is not None else AsyncMock(),
         engine=engine if engine is not None else Mock(loo_accuracy=Mock(return_value=None)),
@@ -107,6 +114,9 @@ def _fake_coordinator(
             calibration=None,
         ),
         async_refresh_identity_snapshot=AsyncMock(),
+        async_schedule_identity_refresh=Mock(),
+        async_device_spool=AsyncMock(return_value=device_spool),
+        learning=learning,
         async_calibration_action=async_calibration_action if async_calibration_action is not None else AsyncMock(),
         retention_cutoff=Mock(return_value=1_700_000_000),
         retention_days=Mock(return_value=retention_days),
@@ -114,19 +124,6 @@ def _fake_coordinator(
         hopper_food=hopper_food if hopper_food is not None else Mock(return_value=None),
     )
     return coordinator
-
-
-def _capturing_async_create_task() -> tuple[Mock, list]:
-    """A `hass.async_create_task` stand-in that records the coroutine it was handed instead of
-    running it -- the test decides whether to `await` it (to drive a background follow-up) or
-    `.close()` it (when the follow-up itself is not under test)."""
-    captured: list = []
-
-    def _capture(coro):
-        captured.append(coro)
-        return Mock()
-
-    return Mock(side_effect=_capture), captured
 
 
 # --- kibble/timeline -----------------------------------------------------------------------
@@ -375,47 +372,39 @@ async def test_ws_event_sends_the_stores_detail_shape_unchanged() -> None:
 # --- kibble/label ------------------------------------------------------------------------------
 
 
-async def test_ws_label_sends_events_immediately_and_only_refreshes_identity_when_unknown() -> None:
-    """`label="unknown"` never touches training -- the response is immediate and the only
-    follow-up is the identity-snapshot refresh, never `_async_label_followup`."""
-    events = [{"uid": "e1", "identity": "unknown"}]
-    store = AsyncMock(async_label_events=AsyncMock(return_value=(events, False)))
-    coordinator = _fake_coordinator(store=store)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
-    connection = _fake_connection()
-
-    await ws_label.__wrapped__(hass, connection, {"id": 11, "entry_id": "e1", "uids": ["e1"], "label": "unknown"})
-
-    store.async_label_events.assert_awaited_once_with(["e1"], "unknown")
-    connection.send_result.assert_called_once_with(11, {"events": events})
-    assert len(captured) == 1
-    await captured[0]
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
-
-
-async def test_ws_label_a_cat_label_schedules_the_training_followup_which_reconciles_rebuilds_and_reclassifies() -> None:
-    events = [{"uid": "e1", "identity": "reviewed", "cat": "Kitty"}]
-    store = AsyncMock(
-        async_label_events=AsyncMock(return_value=(events, True)),
-        async_reconcile_event_training=AsyncMock(),
-    )
+@pytest.mark.parametrize("label", ["unknown", "Kitty"])
+async def test_ws_label_saves_answers_at_once_and_schedules_one_identity_refresh(label: str) -> None:
+    """Whatever the label, the store writes and the handler answers; nothing relearns on the
+    request (that is `learning.py`'s job) -- the only follow-up is the single-flight identity
+    snapshot refresh."""
+    events = [{"uid": "e1", "identity": "reviewed", "cat": label}]
+    store = AsyncMock(async_label_events=AsyncMock(return_value=events))
     engine = Mock(async_rebuild=AsyncMock(), async_reclassify_unreviewed=AsyncMock())
     coordinator = _fake_coordinator(store=store, engine=engine)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
-    await ws_label.__wrapped__(hass, connection, {"id": 12, "entry_id": "e1", "uids": ["e1"], "label": "Kitty"})
+    await ws_label.__wrapped__(hass, connection, {"id": 11, "entry_id": "e1", "uids": ["e1"], "label": label})
 
-    connection.send_result.assert_called_once_with(12, {"events": events})
-    assert len(captured) == 1
-    await captured[0]
+    store.async_label_events.assert_awaited_once_with(["e1"], label)
+    connection.send_result.assert_called_once_with(11, {"events": events})
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    engine.async_rebuild.assert_not_called()
+    engine.async_reclassify_unreviewed.assert_not_called()
+    hass.async_create_task.assert_not_called()
 
-    store.async_reconcile_event_training.assert_awaited_once_with(["e1"], "Kitty")
-    engine.async_rebuild.assert_awaited_once()
-    engine.async_reclassify_unreviewed.assert_awaited_once_with(coordinator.retention_cutoff())
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
+
+async def test_ws_label_maps_a_rejected_label_to_agent_rejected_without_refreshing() -> None:
+    store = AsyncMock(async_label_events=AsyncMock(side_effect=ValueError("unknown cat: Ghost")))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_label.__wrapped__(hass, connection, {"id": 12, "entry_id": "e1", "uids": ["e1"], "label": "Ghost"})
+
+    connection.send_error.assert_called_once_with(12, ERR_AGENT_REJECTED, "unknown cat: Ghost")
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
 
 
 def test_ws_label_schema_rejects_an_empty_uids_list() -> None:
@@ -435,25 +424,20 @@ def test_ws_label_schema_rejects_sample_uids_now_that_labelling_is_per_photo() -
         )
 
 
-# --- kibble/sample/label -------------------------------------------------------------------------
+# --- kibble/session/label, kibble/session/subject, kibble/session/ate ----------------------------
 
 
-
-async def test_ws_session_label_returns_whole_event_detail_and_reconciles_training() -> None:
+async def test_ws_session_label_cats_returns_the_whole_event_detail_and_schedules_the_refresh() -> None:
     detail = {
         "event": {"uid": "e1", "multiple_cats": True},
         "samples": [{"uid": "e1-s1", "cat": "Kitty"}],
         "scene_subjects": [],
         "cats": [{"name": "Kitty", "ate": True}, {"name": "Pancake", "ate": False}],
     }
-    store = AsyncMock(
-        async_session_cats=AsyncMock(return_value=detail),
-        async_reconcile_session_training=AsyncMock(),
-    )
-    engine = Mock(async_subject_scores=AsyncMock(), async_rebuild=AsyncMock(), async_reclassify_unreviewed=AsyncMock())
+    store = AsyncMock(async_session_cats=AsyncMock(return_value=detail))
+    engine = Mock(async_rebuild=AsyncMock(), async_reclassify_unreviewed=AsyncMock())
     coordinator = _fake_coordinator(store=store, engine=engine)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_session_label.__wrapped__(
@@ -471,12 +455,79 @@ async def test_ws_session_label_returns_whole_event_detail_and_reconciles_traini
         "e1-cat-kitty", [("Kitty", True), ("Pancake", False)]
     )
     connection.send_result.assert_called_once_with(43, detail)
-    assert len(captured) == 1
-    await captured[0]
-    store.async_reconcile_session_training.assert_awaited_once_with("e1")
-    engine.async_rebuild.assert_awaited_once()
-    engine.async_reclassify_unreviewed.assert_awaited_once_with(coordinator.retention_cutoff())
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    engine.async_rebuild.assert_not_called()
+    hass.async_create_task.assert_not_called()
+
+
+async def test_ws_session_label_cats_maps_a_rejected_answer_and_an_unknown_session_without_refreshing() -> None:
+    store = AsyncMock(
+        async_session_cats=AsyncMock(side_effect=[ValueError("unknown cat: Ghost"), None]),
+    )
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+    msg = {"entry_id": "e1", "uid": "e1", "cats": [{"cat": "Ghost", "ate": True}]}
+
+    await ws_session_label.__wrapped__(hass, connection, {"id": 47, **msg})
+    await ws_session_label.__wrapped__(hass, connection, {"id": 48, **msg})
+
+    assert connection.send_error.call_args_list == [
+        call(47, ERR_AGENT_REJECTED, "unknown cat: Ghost"),
+        call(48, ERR_NOT_FOUND, "Unknown session"),
+    ]
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+
+
+async def test_ws_session_label_verdict_labels_the_visit_and_returns_its_fresh_detail() -> None:
+    detail = {"event": {"uid": "e1", "identity": "unknown"}, "samples": [], "scene_subjects": [], "cats": []}
+    store = AsyncMock(
+        async_label_events=AsyncMock(return_value=[{"uid": "e1", "identity": "unknown"}]),
+        async_event_detail=AsyncMock(return_value=detail),
+    )
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_session_label.__wrapped__(
+        hass, connection, {"id": 49, "entry_id": "e1", "uid": "e1", "verdict": "unknown"}
+    )
+
+    store.async_label_events.assert_awaited_once_with(["e1"], "unknown")
+    store.async_event_detail.assert_awaited_once_with("e1")
+    connection.send_result.assert_called_once_with(49, detail)
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    store.async_session_cats.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("label_result", "detail", "error"),
+    [
+        (ValueError("bad verdict"), None, (ERR_AGENT_REJECTED, "bad verdict")),
+        ([], None, (ERR_NOT_FOUND, "Unknown session")),
+        ([{"uid": "e1"}], None, (ERR_NOT_FOUND, "Unknown session")),
+    ],
+)
+async def test_ws_session_label_verdict_failures_send_an_error_and_never_refresh(
+    label_result, detail, error
+) -> None:
+    if isinstance(label_result, Exception):
+        label = AsyncMock(side_effect=label_result)
+    else:
+        label = AsyncMock(return_value=label_result)
+    store = AsyncMock(async_label_events=label, async_event_detail=AsyncMock(return_value=detail))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_session_label.__wrapped__(
+        hass, connection, {"id": 50, "entry_id": "e1", "uid": "e1", "verdict": "not_a_cat"}
+    )
+
+    connection.send_error.assert_called_once_with(50, *error)
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
 
 
 async def test_ws_session_label_requires_exactly_one_answer_form() -> None:
@@ -501,9 +552,19 @@ async def test_ws_session_label_requires_exactly_one_answer_form() -> None:
     connection.send_error.assert_any_call(45, ERR_AGENT_REJECTED, "Send cats or verdict")
     coordinator.store.async_session_cats.assert_not_awaited()
     coordinator.store.async_label_events.assert_not_awaited()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
 
 
-async def test_ws_session_subject_uses_event_uid_and_returns_detail_with_followup() -> None:
+@pytest.mark.parametrize(
+    "extra",
+    [{"cats": []}, {"verdict": "Kitty"}, {"cats": [{"cat": "Kitty"}]}],
+)
+def test_ws_session_label_schema_rejects_an_empty_cats_list_a_cat_verdict_and_a_cat_without_ate(extra) -> None:
+    with pytest.raises(vol.Invalid):
+        ws_session_label._ws_schema({"id": 1, "type": "kibble/session/label", "entry_id": "e1", "uid": "e1", **extra})
+
+
+async def test_ws_session_subject_uses_event_uid_returns_detail_and_schedules_the_refresh() -> None:
     detail = {
         "event": {"uid": "e1", "multiple_cats": False},
         "samples": [{"uid": "e1-s1", "cat": "Pancake"}],
@@ -511,18 +572,14 @@ async def test_ws_session_subject_uses_event_uid_and_returns_detail_with_followu
         "cats": [{"name": "Pancake", "ate": True}],
     }
     scores = object()
-    store = AsyncMock(
-        async_session_subject=AsyncMock(return_value=detail),
-        async_reconcile_session_training=AsyncMock(),
-    )
+    store = AsyncMock(async_session_subject=AsyncMock(return_value=detail))
     engine = Mock(
         async_subject_scores=AsyncMock(return_value=scores),
         async_rebuild=AsyncMock(),
         async_reclassify_unreviewed=AsyncMock(),
     )
     coordinator = _fake_coordinator(store=store, engine=engine)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_session_subject.__wrapped__(
@@ -534,23 +591,105 @@ async def test_ws_session_subject_uses_event_uid_and_returns_detail_with_followu
     engine.async_subject_scores.assert_awaited_once_with("e1")
     store.async_session_subject.assert_awaited_once_with("e1", 2, "Pancake", scores)
     connection.send_result.assert_called_once_with(46, detail)
-    assert len(captured) == 1
-    await captured[0]
-    store.async_reconcile_session_training.assert_awaited_once_with("e1")
-    engine.async_rebuild.assert_awaited_once()
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    engine.async_rebuild.assert_not_called()
+    hass.async_create_task.assert_not_called()
 
 
-async def test_ws_sample_label_sends_the_saved_sample_and_schedules_the_background_followup() -> None:
+async def test_ws_session_subject_maps_a_rejected_label_and_an_unknown_session_without_refreshing() -> None:
+    scores = object()
+    store = AsyncMock(
+        async_session_subject=AsyncMock(side_effect=[ValueError("unknown cat: Ghost"), None]),
+    )
+    engine = Mock(async_subject_scores=AsyncMock(return_value=scores))
+    coordinator = _fake_coordinator(store=store, engine=engine)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+    msg = {"entry_id": "e1", "uid": "e1", "sid": 2, "label": "Ghost"}
+
+    await ws_session_subject.__wrapped__(hass, connection, {"id": 51, **msg})
+    await ws_session_subject.__wrapped__(hass, connection, {"id": 52, **msg})
+
+    assert connection.send_error.call_args_list == [
+        call(51, ERR_AGENT_REJECTED, "unknown cat: Ghost"),
+        call(52, ERR_NOT_FOUND, "Unknown session"),
+    ]
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+
+
+async def test_ws_session_ate_returns_the_visit_and_schedules_the_refresh() -> None:
+    visit = {
+        "uid": "e1",
+        "kind": "feed",
+        "cats": [{"cat": "Kitty", "ate": True}, {"cat": "Pancake", "ate": False}],
+        "needs_ate": False,
+    }
+    store = AsyncMock(async_session_ate=AsyncMock(return_value=visit))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_session_ate.__wrapped__(hass, connection, {"id": 53, "entry_id": "e1", "uid": "e1", "ate": ["Kitty"]})
+
+    store.async_session_ate.assert_awaited_once_with("e1", ["Kitty"])
+    connection.send_result.assert_called_once_with(53, visit)
+    connection.send_error.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+
+
+async def test_ws_session_ate_sends_not_found_for_an_unknown_visit() -> None:
+    store = AsyncMock(async_session_ate=AsyncMock(return_value=None))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_session_ate.__wrapped__(hass, connection, {"id": 54, "entry_id": "e1", "uid": "gone", "ate": ["Kitty"]})
+
+    connection.send_error.assert_called_once_with(54, ERR_NOT_FOUND, "Unknown session")
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+
+
+async def test_ws_session_ate_maps_a_rejected_answer_to_agent_rejected() -> None:
+    store = AsyncMock(async_session_ate=AsyncMock(side_effect=ValueError("cat not in this visit: Ghost")))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_session_ate.__wrapped__(hass, connection, {"id": 55, "entry_id": "e1", "uid": "e1", "ate": ["Ghost"]})
+
+    connection.send_error.assert_called_once_with(55, ERR_AGENT_REJECTED, "cat not in this visit: Ghost")
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        {"id": 1, "type": "kibble/session/ate", "entry_id": "e1", "ate": ["Kitty"]},
+        {"id": 1, "type": "kibble/session/ate", "entry_id": "e1", "uid": "e1"},
+        {"id": 1, "type": "kibble/session/ate", "entry_id": "e1", "uid": "e1", "ate": "Kitty"},
+    ],
+)
+def test_ws_session_ate_schema_requires_a_uid_and_an_ate_list(msg: dict) -> None:
+    with pytest.raises(vol.Invalid):
+        ws_session_ate._ws_schema(msg)
+
+
+# --- kibble/sample/label -------------------------------------------------------------------------
+
+
+async def test_ws_sample_label_sends_the_saved_sample_and_visit_and_schedules_the_refresh() -> None:
     sample = {
         "uid": "e1-s1", "t": 100, "body": None, "face": None, "guess": None,
         "guess_confidence": None, "review": "Kitty", "label": "Kitty",
     }
+    visit = {"uid": "e1", "kind": "feed", "cats": [{"cat": "Kitty", "ate": True}], "needs_ate": False}
     scores = object()
     store = AsyncMock(
         async_session_uid_for_sample=AsyncMock(return_value="e1"),
-        async_label_sample=AsyncMock(return_value=sample),
-        async_reconcile_session_training=AsyncMock(),
+        async_label_sample=AsyncMock(return_value={"sample": sample, "visit": visit}),
     )
     engine = Mock(
         async_subject_scores=AsyncMock(return_value=scores),
@@ -558,8 +697,7 @@ async def test_ws_sample_label_sends_the_saved_sample_and_schedules_the_backgrou
         async_reclassify_unreviewed=AsyncMock(),
     )
     coordinator = _fake_coordinator(store=store, engine=engine)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_sample_label.__wrapped__(
@@ -569,14 +707,10 @@ async def test_ws_sample_label_sends_the_saved_sample_and_schedules_the_backgrou
     store.async_session_uid_for_sample.assert_awaited_once_with("e1-s1")
     engine.async_subject_scores.assert_awaited_once_with("e1")
     store.async_label_sample.assert_awaited_once_with("e1-s1", "Kitty", scores)
-    connection.send_result.assert_called_once_with(40, {"sample": sample})
-    assert len(captured) == 1
-    await captured[0]
-
-    store.async_reconcile_session_training.assert_awaited_once_with("e1")
-    engine.async_rebuild.assert_awaited_once()
-    engine.async_reclassify_unreviewed.assert_awaited_once_with(coordinator.retention_cutoff())
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
+    connection.send_result.assert_called_once_with(40, {"sample": sample, "visit": visit})
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    engine.async_rebuild.assert_not_called()
+    hass.async_create_task.assert_not_called()
 
 
 async def test_ws_sample_label_sends_not_found_for_an_unknown_sample() -> None:
@@ -591,6 +725,27 @@ async def test_ws_sample_label_sends_not_found_for_an_unknown_sample() -> None:
 
     connection.send_error.assert_called_once_with(41, ERR_NOT_FOUND, "Unknown sample")
     connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+
+
+async def test_ws_sample_label_sends_not_found_when_the_sample_vanishes_before_the_save() -> None:
+    """The store returns None when the photo was purged between the uid lookup and the write."""
+    store = AsyncMock(
+        async_session_uid_for_sample=AsyncMock(return_value="e1"),
+        async_label_sample=AsyncMock(return_value=None),
+    )
+    engine = Mock(async_subject_scores=AsyncMock(return_value=object()))
+    coordinator = _fake_coordinator(store=store, engine=engine)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_sample_label.__wrapped__(
+        hass, connection, {"id": 56, "entry_id": "e1", "sample_uid": "e1-s1", "label": "Kitty"}
+    )
+
+    connection.send_error.assert_called_once_with(56, ERR_NOT_FOUND, "Unknown sample")
+    connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
 
 
 async def test_ws_sample_label_maps_an_unknown_cat_to_agent_rejected() -> None:
@@ -610,6 +765,7 @@ async def test_ws_sample_label_maps_an_unknown_cat_to_agent_rejected() -> None:
 
     connection.send_error.assert_called_once_with(42, ERR_AGENT_REJECTED, "unknown cat: Ghost")
     connection.send_result.assert_not_called()
+    coordinator.async_schedule_identity_refresh.assert_not_called()
 
 
 def test_ws_sample_label_schema_requires_a_sample_uid() -> None:
@@ -622,78 +778,249 @@ def test_ws_sample_label_schema_requires_a_label() -> None:
         ws_sample_label._ws_schema({"id": 1, "type": "kibble/sample/label", "entry_id": "e1", "sample_uid": "e1-s1"})
 
 
-# --- kibble/review -----------------------------------------------------------------------------
+# --- kibble/review/photos ----------------------------------------------------------------------
 
 
-async def test_ws_review_forwards_limit_cursor_and_the_retention_cutoff() -> None:
-    page = {"items": [{"uid": "e1"}], "total": 1, "cursor": None, "has_more": False}
-    store = AsyncMock(async_review_page=AsyncMock(return_value=page))
+async def test_ws_review_photos_forwards_limit_cursor_and_the_retention_cutoff() -> None:
+    page = {
+        "items": [{"sample": {"uid": "e1-s1"}, "visit": {"uid": "e1", "start": 10, "kind": "feed", "scene": None, "in_scene": 1}}],
+        "remaining": 1,
+        "visits": 1,
+        "cursor": "next",
+        "has_more": True,
+    }
+    store = AsyncMock(async_review_photos_page=AsyncMock(return_value=page))
     coordinator = _fake_coordinator(store=store)
     hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
-    await ws_review.__wrapped__(hass, connection, {"id": 13, "entry_id": "e1", "limit": 24})
+    await ws_review_photos.__wrapped__(
+        hass, connection, {"id": 13, "entry_id": "e1", "limit": 24, "cursor": "prev"}
+    )
 
-    store.async_review_page.assert_awaited_once_with(
-        limit=24, cursor=None, retention_cutoff=coordinator.retention_cutoff()
+    store.async_review_photos_page.assert_awaited_once_with(
+        limit=24, cursor="prev", retention_cutoff=coordinator.retention_cutoff()
     )
     connection.send_result.assert_called_once_with(13, page)
+    connection.send_error.assert_not_called()
 
 
-async def test_ws_review_maps_a_malformed_cursor_to_invalid_cursor() -> None:
-    store = AsyncMock(async_review_page=AsyncMock(side_effect=ValueError("invalid timeline cursor")))
+async def test_ws_review_photos_passes_no_cursor_for_the_first_page() -> None:
+    store = AsyncMock(async_review_photos_page=AsyncMock(return_value={"items": []}))
     coordinator = _fake_coordinator(store=store)
     hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
-    await ws_review.__wrapped__(hass, connection, {"id": 14, "entry_id": "e1", "limit": 24, "cursor": "garbage"})
+    await ws_review_photos.__wrapped__(hass, connection, {"id": 57, "entry_id": "e1", "limit": 5})
 
-    connection.send_error.assert_called_once_with(14, "invalid_cursor", "invalid timeline cursor")
+    store.async_review_photos_page.assert_awaited_once_with(
+        limit=5, cursor=None, retention_cutoff=coordinator.retention_cutoff()
+    )
+
+
+async def test_ws_review_photos_maps_a_malformed_cursor_to_agent_rejected() -> None:
+    """The contract: a cursor the command did not issue is terminal `agent_rejected`, not the
+    timeline's `invalid_cursor`."""
+    store = AsyncMock(async_review_photos_page=AsyncMock(side_effect=ValueError("invalid review cursor")))
+    coordinator = _fake_coordinator(store=store)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    await ws_review_photos.__wrapped__(hass, connection, {"id": 14, "entry_id": "e1", "limit": 24, "cursor": "garbage"})
+
+    connection.send_error.assert_called_once_with(14, ERR_AGENT_REJECTED, "invalid review cursor")
     connection.send_result.assert_not_called()
 
 
+def test_ws_review_photos_schema_defaults_limit_to_24_when_omitted() -> None:
+    validated = ws_review_photos._ws_schema({"id": 1, "type": "kibble/review/photos", "entry_id": "e1"})
+    assert validated["limit"] == 24
+    assert "cursor" not in validated
+
+
 @pytest.mark.parametrize("limit", [0, 61])
-def test_ws_review_schema_rejects_limit_outside_1_to_60(limit: int) -> None:
+def test_ws_review_photos_schema_rejects_limit_outside_1_to_60(limit: int) -> None:
     with pytest.raises(vol.Invalid):
-        ws_review._ws_schema({"id": 1, "type": "kibble/review", "entry_id": "e1", "limit": limit})
+        ws_review_photos._ws_schema({"id": 1, "type": "kibble/review/photos", "entry_id": "e1", "limit": limit})
+
+
+@pytest.mark.parametrize("limit", [1, 60])
+def test_ws_review_photos_schema_accepts_the_limit_bounds(limit: int) -> None:
+    validated = ws_review_photos._ws_schema(
+        {"id": 1, "type": "kibble/review/photos", "entry_id": "e1", "limit": limit}
+    )
+    assert validated["limit"] == limit
+
+
+# --- kibble/learning / kibble/learning/subscribe -------------------------------------------------
+
+
+_LEARNING_STATUS = {
+    "state": "waiting",
+    "pending": 3,
+    "done": None,
+    "total": None,
+    "starts_at": 1_700_000_020.0,
+    "retry_at": None,
+    "started": None,
+    "last": None,
+    "error": None,
+}
+
+
+def _fake_learning(status: dict | None = None) -> Mock:
+    """A duck-typed `LearningManager`: `status()` and a `subscribe(listener)` that records the
+    listener and hands back an unsubscribe callback."""
+    learning = Mock()
+    learning.status = Mock(return_value=status if status is not None else dict(_LEARNING_STATUS))
+    learning.unsubscribe = Mock()
+    learning.listeners = []
+
+    def _subscribe(listener):
+        learning.listeners.append(listener)
+        return learning.unsubscribe
+
+    learning.subscribe = Mock(side_effect=_subscribe)
+    return learning
+
+
+def test_ws_learning_sends_the_learning_managers_status_from_memory() -> None:
+    learning = _fake_learning()
+    coordinator = _fake_coordinator(learning=learning)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    ws_learning(hass, connection, {"id": 60, "entry_id": "e1"})
+
+    connection.send_result.assert_called_once_with(60, _LEARNING_STATUS)
+    connection.send_error.assert_not_called()
+    assert coordinator.store.method_calls == []  # served from memory, never a store hop
+
+
+def test_ws_learning_sends_not_found_when_the_learning_job_is_not_running() -> None:
+    coordinator = _fake_coordinator(learning=None)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    ws_learning(hass, connection, {"id": 61, "entry_id": "e1"})
+
+    connection.send_error.assert_called_once_with(61, ERR_NOT_FOUND, "Learning is not running")
+    connection.send_result.assert_not_called()
+
+
+def test_ws_learning_sends_not_found_for_an_unknown_entry() -> None:
+    hass = _fake_hass(None)
+    connection = _fake_connection()
+
+    ws_learning(hass, connection, {"id": 62, "entry_id": "nope"})
+
+    assert connection.send_error.call_args.args[:2] == (62, ERR_NOT_FOUND)
+    connection.send_result.assert_not_called()
+
+
+def test_ws_learning_subscribe_sends_the_result_then_an_immediate_event_then_one_per_change() -> None:
+    learning = _fake_learning()
+    coordinator = _fake_coordinator(learning=learning)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    ws_learning_subscribe(hass, connection, {"id": 63, "entry_id": "e1"})
+
+    assert [c[0] for c in connection.mock_calls] == ["send_result", "send_message"]
+    connection.send_result.assert_called_once_with(63)
+    connection.send_message.assert_called_once_with(
+        websocket_api.event_message(63, {"learning": _LEARNING_STATUS})
+    )
+
+    changed = {**_LEARNING_STATUS, "state": "learning", "starts_at": None, "started": 1_700_000_030.0}
+    assert len(learning.listeners) == 1
+    learning.listeners[0](changed)
+
+    assert connection.send_message.call_count == 2
+    assert connection.send_message.call_args == call(websocket_api.event_message(63, {"learning": changed}))
+
+
+def test_ws_learning_subscribe_unsubscribe_is_wired_to_the_connection_close() -> None:
+    learning = _fake_learning()
+    coordinator = _fake_coordinator(learning=learning)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    ws_learning_subscribe(hass, connection, {"id": 64, "entry_id": "e1"})
+
+    unsubscribe = connection.subscriptions[64]
+    learning.unsubscribe.assert_not_called()
+    unsubscribe()  # what HA does for each entry of `connection.subscriptions` on close
+    learning.unsubscribe.assert_called_once_with()
+
+
+def test_ws_learning_subscribe_sends_not_found_and_subscribes_to_nothing_without_a_learning_job() -> None:
+    coordinator = _fake_coordinator(learning=None)
+    hass = _fake_hass(_fake_entry(coordinator))
+    connection = _fake_connection()
+
+    ws_learning_subscribe(hass, connection, {"id": 65, "entry_id": "e1"})
+
+    connection.send_error.assert_called_once_with(65, ERR_NOT_FOUND, "Learning is not running")
+    connection.send_result.assert_not_called()
+    connection.send_message.assert_not_called()
+    assert connection.subscriptions == {}
 
 
 # --- kibble/cats / kibble/cats/add / kibble/cats/delete -----------------------------------------
 
 
-async def test_ws_cats_assembles_training_accuracy_identity_and_storage_per_cat() -> None:
-    store = AsyncMock(
-        async_cats=AsyncMock(return_value=[{"name": "Kitty", "color": 0, "created": 1}]),
-        async_training_counts=AsyncMock(return_value={"total": 12, "face": 8, "body": 4}),
-        async_cat_avatar=AsyncMock(return_value={"id": "training/kitty/a.jpg", "url": "/x"}),
-        async_storage_summary=AsyncMock(return_value={"used_bytes": 1, "events": 2, "retention_days": 14, "oldest": 1}),
-    )
+def _cat_row(name: str, **overrides) -> dict:
+    return {
+        "name": name,
+        "color": 0,
+        "avatar": {"id": "training/kitty/a.jpg", "url": "/x"},
+        "avatar_custom": False,
+        "learning_paused": False,
+        "training": {"total": 12, "face": 8, "body": 4},
+        **overrides,
+    }
+
+
+_STORAGE = {"used_bytes": 1, "events": 2, "retention_days": 14, "oldest": 1}
+
+
+async def test_ws_cats_assembles_one_store_hop_accuracy_identity_and_storage_per_cat() -> None:
+    row = _cat_row("Kitty")
+    store = AsyncMock(async_cats_overview=AsyncMock(return_value={"cats": [row], "storage": dict(_STORAGE)}))
     engine = Mock(loo_accuracy=Mock(return_value=0.9))
     now = 1_700_000_000
     identity = DeviceIdentitySummary(cats={"Kitty": CatStats(last_seen=now, last_meal=now, recent_meals=(now,), present=True)})
-    client = AsyncMock(spool_stats=AsyncMock(return_value=SimpleNamespace(used_bytes=10, cap_bytes=100)))
-    coordinator = _fake_coordinator(store=store, engine=engine, identity=identity, client=client)
+    coordinator = _fake_coordinator(
+        store=store, engine=engine, identity=identity, retention_days=21,
+        device_spool={"used_bytes": 10, "cap_bytes": 100},
+    )
     hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_cats.__wrapped__(hass, connection, {"id": 15, "entry_id": "e1"})
 
+    # ONE store hop: the overview, keyed on the retention window -- no per-cat store calls.
+    assert store.method_calls == [call.async_cats_overview(21)]
+    engine.loo_accuracy.assert_called_once_with("Kitty")
+    coordinator.async_device_spool.assert_awaited_once_with()
     payload = connection.send_result.call_args.args[1]
     cat = payload["cats"][0]
-    assert cat["name"] == "Kitty"
-    assert cat["training"] == {"total": 12, "face": 8, "body": 4}
+    assert {k: cat[k] for k in row} == row  # the overview row passes through untouched
     assert cat["accuracy"] == 0.9
     assert cat["last_seen"] == now and cat["last_meal"] == now
     assert cat["present"] is True
-    assert payload["storage"]["device_spool"] == {"used_bytes": 10, "cap_bytes": 100}
+    assert payload["storage"] == {**_STORAGE, "device_spool": {"used_bytes": 10, "cap_bytes": 100}}
 
 
 async def test_ws_cats_a_cat_with_no_identity_stats_gets_null_seen_and_zero_meals() -> None:
     store = AsyncMock(
-        async_cats=AsyncMock(return_value=[{"name": "Ghost", "color": 1, "created": 1}]),
-        async_training_counts=AsyncMock(return_value={"total": 0, "face": 0, "body": 0}),
-        async_cat_avatar=AsyncMock(return_value=None),
-        async_storage_summary=AsyncMock(return_value={"used_bytes": 0, "events": 0, "retention_days": 14, "oldest": None}),
+        async_cats_overview=AsyncMock(
+            return_value={
+                "cats": [_cat_row("Ghost", color=1, avatar=None, training={"total": 0, "face": 0, "body": 0})],
+                "storage": {"used_bytes": 0, "events": 0, "retention_days": 14, "oldest": None},
+            }
+        ),
     )
     coordinator = _fake_coordinator(store=store)
     hass = _fake_hass(_fake_entry(coordinator))
@@ -702,26 +1029,26 @@ async def test_ws_cats_a_cat_with_no_identity_stats_gets_null_seen_and_zero_meal
     await ws_cats.__wrapped__(hass, connection, {"id": 16, "entry_id": "e1"})
 
     cat = connection.send_result.call_args.args[1]["cats"][0]
+    assert cat["accuracy"] is None
     assert cat["last_seen"] is None and cat["last_meal"] is None
     assert cat["meals_today"] == 0
     assert cat["present"] is False
 
 
 async def test_ws_cats_device_spool_is_null_not_a_failure_when_the_feeder_is_unreachable() -> None:
-    store = AsyncMock(
-        async_cats=AsyncMock(return_value=[]),
-        async_storage_summary=AsyncMock(return_value={"used_bytes": 0, "events": 0, "retention_days": 14, "oldest": None}),
-    )
-    client = AsyncMock(spool_stats=AsyncMock(side_effect=KibbleConnectionError("down")))
-    coordinator = _fake_coordinator(store=store, client=client)
+    """`coordinator.async_device_spool()` answers None on a failed/unreachable/slow feeder
+    read; the card still gets its cats and storage."""
+    store = AsyncMock(async_cats_overview=AsyncMock(return_value={"cats": [], "storage": dict(_STORAGE)}))
+    coordinator = _fake_coordinator(store=store, device_spool=None)
     hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_cats.__wrapped__(hass, connection, {"id": 17, "entry_id": "e1"})
 
+    coordinator.async_device_spool.assert_awaited_once_with()
     payload = connection.send_result.call_args.args[1]
     assert payload["cats"] == []
-    assert payload["storage"]["device_spool"] is None
+    assert payload["storage"] == {**_STORAGE, "device_spool": None}
     connection.send_error.assert_not_called()
 
 
@@ -780,37 +1107,35 @@ async def test_ws_training_maps_a_malformed_cursor_to_invalid_cursor() -> None:
     connection.send_error.assert_called_once_with(21, "invalid_cursor", "invalid timeline cursor")
 
 
-async def test_ws_training_remove_with_nothing_removed_never_schedules_a_rebuild() -> None:
+async def test_ws_training_remove_with_nothing_removed_never_schedules_a_refresh() -> None:
     store = AsyncMock(async_training_remove=AsyncMock(return_value=0))
     coordinator = _fake_coordinator(store=store)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_training_remove.__wrapped__(hass, connection, {"id": 22, "entry_id": "e1", "uids": ["t1"]})
 
     connection.send_result.assert_called_once_with(22, {"removed": 0})
-    create_task.assert_not_called()
-    assert captured == []
+    coordinator.async_schedule_identity_refresh.assert_not_called()
+    hass.async_create_task.assert_not_called()
 
 
-async def test_ws_training_remove_with_a_real_removal_schedules_rebuild_reclassify_and_refresh() -> None:
+async def test_ws_training_remove_with_a_real_removal_answers_and_schedules_one_identity_refresh() -> None:
+    """No inline rebuild/reclassify any more: the store bumps the learning generation and the
+    learning job does that later."""
     store = AsyncMock(async_training_remove=AsyncMock(return_value=2))
     engine = Mock(async_rebuild=AsyncMock(), async_reclassify_unreviewed=AsyncMock())
     coordinator = _fake_coordinator(store=store, engine=engine)
-    create_task, captured = _capturing_async_create_task()
-    hass = _fake_hass(_fake_entry(coordinator), async_create_task=create_task)
+    hass = _fake_hass(_fake_entry(coordinator))
     connection = _fake_connection()
 
     await ws_training_remove.__wrapped__(hass, connection, {"id": 23, "entry_id": "e1", "uids": ["t1", "t2"]})
 
+    store.async_training_remove.assert_awaited_once_with(["t1", "t2"])
     connection.send_result.assert_called_once_with(23, {"removed": 2})
-    assert len(captured) == 1
-    await captured[0]
-
-    engine.async_rebuild.assert_awaited_once()
-    engine.async_reclassify_unreviewed.assert_awaited_once_with(coordinator.retention_cutoff())
-    coordinator.async_refresh_identity_snapshot.assert_awaited_once()
+    coordinator.async_schedule_identity_refresh.assert_called_once_with()
+    engine.async_rebuild.assert_not_called()
+    engine.async_reclassify_unreviewed.assert_not_called()
 
 
 # --- kibble/vision/last, kibble/vision/areas(/set), kibble/calibration(/action) -----------------

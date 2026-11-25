@@ -189,7 +189,7 @@ class KibbleUploadTrainingView(HomeAssistantView):
             return web.json_response(
                 {"status": "error", "reason": "not_found", "message": "Unknown cat."}, status=HTTPStatus.NOT_FOUND
             )
-        hass.async_create_task(_async_training_added_followup(coordinator))
+        coordinator.async_schedule_identity_refresh()
         return web.json_response({"status": "added", "message": "Added.", "sample": sample})
 
 
@@ -225,20 +225,8 @@ class KibbleUploadAvatarView(HomeAssistantView):
         avatar = await coordinator.store.async_set_cat_avatar(cat, processed)
         if avatar is None:
             return web.json_response({"error": "Unknown cat."}, status=HTTPStatus.NOT_FOUND)
-        hass.async_create_task(coordinator.async_refresh_identity_snapshot())
+        coordinator.async_schedule_identity_refresh()
         return web.json_response({"avatar": avatar})
-
-
-async def _async_training_added_followup(coordinator: KibbleCoordinator) -> None:
-    """The slow half of a successful training upload: rebuild the model, re-classify
-    unreviewed events, then push the identity snapshot -- the same fast/slow split
-    `websocket.py`'s `kibble/label`/`kibble/sample/label` already use."""
-    try:
-        await coordinator.engine.async_rebuild()
-        await coordinator.engine.async_reclassify_unreviewed(coordinator.retention_cutoff())
-    except Exception:  # noqa: BLE001 -- must never leave the identity snapshot un-refreshed
-        _LOGGER.exception("Upload training background rebuild failed")
-    await coordinator.async_refresh_identity_snapshot()
 
 
 # --- eating clips (docs/39-eating-clips.md) ----------------------------------------------------
